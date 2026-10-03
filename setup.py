@@ -22,6 +22,7 @@ from scripts.generate_pyi import generate_pyi_file
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
+IS_ROCM = getattr(torch.version, 'hip', None) is not None
 
 # Compiler flags
 cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
@@ -43,6 +44,18 @@ third_party_include_dirs = [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
 ]
+
+if IS_ROCM:
+    rocm_home = os.getenv('ROCM_HOME') or os.getenv('ROCM_PATH') or '/opt/rocm'
+    sources = ['csrc/hip_python_api.cpp']
+    build_include_dirs = [
+        f'{rocm_home}/include',
+        'csrc',
+        'deep_gemm/include',
+        'csrc/cdna4',
+    ]
+    build_libraries = ['amdhip64']
+    build_library_dirs = [f'{rocm_home}/lib']
 
 # Release
 base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag_name}/{wheel_name}'

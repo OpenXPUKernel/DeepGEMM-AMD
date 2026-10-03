@@ -39,7 +39,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ```bash
 # Submodule must be cloned
-git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
+git clone --recursive git@github.com:OpenXPUKernel/DeepGEMM-AMD.git
 cd DeepGEMM
 
 # Link some essential includes and build the C++ extension
@@ -72,6 +72,11 @@ Please note that operations like input transposition or FP8 casting must be hand
 #### Normal dense GEMMs (non-grouped)
 
 To perform a basic non-grouped FP8 GEMM, call the `fp8_gemm_{nt, nn, tn, tt}` function. For more details, please refer to the function documentation.
+
+#### CDNA4 HIP FP8 GEMM
+
+For CDNA4 architecture GPUs running ROCm, the HIP backend provides the same dense FP8 entry points: `fp8_gemm_nt`, `fp8_gemm_nn`, `fp8_gemm_tn`, and `fp8_gemm_tt`. Build it with the normal `./develop.sh` or `python setup.py build` flow; the pybind extension uses a shape cost model to JIT and cache the selected HIP template specialization, and importing `deep_gemm` on a ROCm installation selects this backend automatically. The implementation supports OCP FP8 E4M3 operands with UE8M0 scales at 32-element K granularity, BF16 or FP32 output, accumulation, `alpha`, packed scales, and the dense layout aliases. Grouped GEMMs and custom epilogues are outside this backend. See [the CDNA4 FP8 GEMM guide](docs/cdna4-fp8-gemm.md) for correctness and relative PyTorch performance scripts.
+
 
 #### Grouped GEMMs (contiguous layout)
 
