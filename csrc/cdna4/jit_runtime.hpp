@@ -53,7 +53,9 @@ public:
         const auto jit = get_module(config, out_dtype);
         const int tile_m = config.block_m;
         const int tile_n = config.block_n;
-        const int tiles = (args.M + tile_m - 1) / tile_m * (args.N + tile_n - 1) / tile_n;
+        const int tiles_m = ceil_div(args.M, tile_m);
+        const int tiles_n = ceil_div(args.N, tile_n);
+        const int tiles = tiles_m * tiles_n;
         unsigned int grid = tiles;
         unsigned int block = 256;
         unsigned int shared = shared_bytes(config);

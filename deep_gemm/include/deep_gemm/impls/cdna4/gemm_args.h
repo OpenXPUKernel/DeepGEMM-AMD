@@ -3,7 +3,6 @@
 // agree on layout without pulling in a runtime or compiler specific header.
 #pragma once
 #include <cstdint>
-#include <cstddef>
 
 namespace deep_gemm::cdna4 {
 struct GemmArgs {

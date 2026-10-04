@@ -60,6 +60,21 @@ def test_fp8_gemm_fp32_output():
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
+def test_fp32_multi_tile_launch():
+    # Exact products expose extra blocks overwriting the first output tile.
+    # These dimensions exercise several rows and columns of full output tiles.
+    m, n, k = 4096, 4096, 256
+    a = torch.ones((m, k), device="cuda", dtype=torch.float8_e4m3fn)
+    b = torch.ones((n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    sa = torch.ones((m, k // 32), device="cuda", dtype=torch.float32)
+    sb = torch.ones((n, k // 32), device="cuda", dtype=torch.float32)
+    out = torch.empty((m, n), device="cuda", dtype=torch.float32)
+    for _ in range(2):
+        out.fill_(float('nan'))
+        deep_gemm.fp8_gemm_nt((a, sa), (b, sb), out, recipe=(1, 1, 32))
+        assert bool((out == k).all()), 'incorrect output from a multi-tile FP32 launch'
+
+
 def test_fp8_gemm_aliases_and_empty_shapes():
     m, n, k = 17, 65, 96
     a, b = _inputs(m, n, k)

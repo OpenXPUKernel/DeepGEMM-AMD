@@ -1,7 +1,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/hip/HIPGuard.h>
+#include <c10/hip/HIPStream.h>
 
 #include "cdna4/jit_runtime.hpp"
 #include "deep_gemm/impls/cdna4/gemm_args.h"
@@ -72,6 +73,7 @@ void cdna4_fp8_gemm_nt(const torch::Tensor& a, const torch::Tensor& sfa,
     const int m = static_cast<int>(a.size(0));
     const int n = static_cast<int>(b.size(0));
     const int k = static_cast<int>(a.size(1));
+    const c10::hip::HIPGuard device_guard(d.get_device());
     const int out_dtype = d.scalar_type() == torch::kFloat ? MXFP8_OUT_FP32 : MXFP8_OUT_BF16;
     const auto config = get_best_config(m, n, k, out_dtype, c.has_value());
 
@@ -95,15 +97,15 @@ void cdna4_fp8_gemm_nt(const torch::Tensor& a, const torch::Tensor& sfa,
         static_cast<float>(alpha), config.split_k,
         workspace.defined() ? workspace.data_ptr<float>() : nullptr,
         n > 0 ? (n + 3) / 4 * 4 : 0};
-    const auto stream = reinterpret_cast<hipStream_t>(
-        at::cuda::getCurrentCUDAStream(d.device().index()).stream());
+    const auto stream = c10::hip::getCurrentHIPStream(d.get_device()).stream();
     const int error = jit_runtime.launch(args, config, out_dtype, stream, current_num_compute_units());
     TORCH_CHECK(error == 0, "CDNA4 FP8 GEMM JIT launch failed with code ", error);
 }
 
 std::tuple<int, int> cdna4_fp8_gemm_plan(int m, int n, int k) {
     const auto config = get_best_config(m, n, k, MXFP8_OUT_BF16, false);
-    const int tiles = (m + config.block_m - 1) / config.block_m * (n + config.block_n - 1) / config.block_n;
+    const int tiles = deep_gemm::cdna4::ceil_div(m, config.block_m) *
+                      deep_gemm::cdna4::ceil_div(n, config.block_n);
     return {tiles, config.split_k};
 }
 

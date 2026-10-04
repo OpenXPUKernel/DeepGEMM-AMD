@@ -2,7 +2,6 @@
 #pragma once
 #include <hip/hip_runtime.h>
 #include <cstdint>
-#include <cstddef>
 #include "gemm_args.h"
 using deep_gemm::cdna4::GemmArgs;
 
