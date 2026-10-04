@@ -1,3 +1,6 @@
+// CDNA4 FP8 GEMM using 32x32x64 scaled MFMA instructions.
+// Operands travel through registers into LDS; output tiles and stage counts
+// are described by the template configuration.
 #pragma once
 #include "device_common.h"
 #include "tile_scheduler.cuh"
@@ -37,7 +40,7 @@ __device__ __forceinline__ void store_tile32(const GemmArgs &p, const v16f &acc,
 // Block tile BM x BN, BK = 128 (one packed scale word per row), WM x WN waves, each wave computes
 // (BM/WM) x (BN/WN) = TM x TN MFMA tiles of 32 x 32. LDS holds STAGES copies of the A and B tiles,
 // row-major, 128 B per row; the 16 B chunk c of row r is stored at chunk c ^ (r & 7).
-template <int BM_, int BN_, int WM_, int WN_, int STAGES_, int GROUP_M_ = 8> struct TileCfg {
+template <int BM_, int BN_, int WM_, int WN_, int STAGES_, int GROUP_M_ = 8> struct Mfma32x32x64GemmConfig {
   static constexpr int BM = BM_, BN = BN_, BK = 128, WM = WM_, WN = WN_, NW = WM_ * WN_, NT = 64 * NW;
   static constexpr int TM = BM / WM / 32, TN = BN / WN / 32;
   static constexpr int STAGES = STAGES_, GROUP_M = GROUP_M_;
@@ -51,7 +54,7 @@ template <int BM_, int BN_, int WM_, int WN_, int STAGES_, int GROUP_M_ = 8> str
 
 __device__ __forceinline__ int lds_chunk(int row, int c) { return c ^ (row & 7); }
 
-template <class Cfg, class OutT> __device__ __forceinline__ void gemm_tiled_impl(GemmArgs p) {
+template <class Cfg, class OutT> __device__ __forceinline__ void fp8_gemm_mfma_32x32x64_impl(GemmArgs p) {
   constexpr int BM = Cfg::BM, BN = Cfg::BN, BK = Cfg::BK, TM = Cfg::TM, TN = Cfg::TN;
   constexpr int NT = Cfg::NT, STAGES = Cfg::STAGES;
   extern __shared__ __attribute__((aligned(1024))) uint8_t smem[];
@@ -216,11 +219,11 @@ template <class Cfg, class OutT> __device__ __forceinline__ void gemm_tiled_impl
 
 // JIT candidate families.  The generated wrapper supplies launch bounds and
 // dynamic LDS size; these aliases only describe legal tile geometry.
-using Tiled128x128S2 = TileCfg<128, 128, 2, 2, 2>;
+using Mfma32x32x64Tile128x128S2 = Mfma32x32x64GemmConfig<128, 128, 2, 2, 2>;
 // A full 256x256 stage consumes 128 KiB of LDS, so only the one-stage
 // variant fits the device LDS budget.
-using Tiled256x256S1 = TileCfg<256, 256, 4, 4, 1>;
+using Mfma32x32x64Tile256x256S1 = Mfma32x32x64GemmConfig<256, 256, 4, 4, 1>;
 namespace deep_gemm::cdna4 {
-using ::Tiled128x128S2;
-using ::Tiled256x256S1;
+using ::Mfma32x32x64Tile128x128S2;
+using ::Mfma32x32x64Tile256x256S1;
 } // namespace deep_gemm::cdna4

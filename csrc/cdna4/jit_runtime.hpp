@@ -42,7 +42,7 @@ public:
     }
 
     size_t workspace_size(const KernelConfig& config, const int m, const int n) const {
-        if (config.variant != KernelVariant::split_k || config.split_k <= 1)
+        if (config.variant != KernelVariant::mfma_16x16x128_split_k || config.split_k <= 1)
             return 0;
         const size_t row = static_cast<size_t>((n + 3) / 4 * 4) * sizeof(float);
         return static_cast<size_t>(config.split_k) * static_cast<size_t>(m) * row;
@@ -57,20 +57,20 @@ public:
         unsigned int grid = tiles;
         unsigned int block = 256;
         unsigned int shared = shared_bytes(config);
-        if (config.variant == KernelVariant::persistent)
+        if (config.variant == KernelVariant::mfma_16x16x128_persistent)
             grid = std::min(tiles, std::max(num_cus, 1));
-        else if (config.variant == KernelVariant::split_k)
+        else if (config.variant == KernelVariant::mfma_16x16x128_split_k)
             grid = tiles * std::max(config.split_k, 1);
-        else if (config.variant == KernelVariant::tiled_128)
+        else if (config.variant == KernelVariant::mfma_32x32x64_tile_128x128)
             block = 256;
-        else if (config.variant == KernelVariant::tiled_256)
+        else if (config.variant == KernelVariant::mfma_32x32x64_tile_256x256)
             block = 1024;
 
         void* params[] = {&args};
         auto error = hipModuleLaunchKernel(jit->gemm, grid, 1, 1, block, 1, 1, shared, stream, params, nullptr);
         if (error != hipSuccess)
             return static_cast<int>(error);
-        if (config.variant == KernelVariant::split_k) {
+        if (config.variant == KernelVariant::mfma_16x16x128_split_k) {
             const unsigned int bx = (args.N + 1023) / 1024;
             const unsigned int by = std::min(args.M, std::max(1, 4096 / static_cast<int>(std::max(bx, 1u))));
             void* reduce_params[] = {&args};
@@ -90,23 +90,24 @@ private:
 
     static const char* variant_name(const KernelVariant variant) {
         switch (variant) {
-        case KernelVariant::tiled_128: return "tiled128";
-        case KernelVariant::tiled_256: return "tiled256";
-        case KernelVariant::data_parallel: return "data";
-        case KernelVariant::persistent: return "persistent";
-        case KernelVariant::split_k: return "splitk";
+        case KernelVariant::mfma_32x32x64_tile_128x128: return "mfma_32x32x64_tile_128x128_s2";
+        case KernelVariant::mfma_32x32x64_tile_256x256: return "mfma_32x32x64_tile_256x256_s1";
+        case KernelVariant::mfma_16x16x128_data_parallel: return "mfma_16x16x128_data_parallel";
+        case KernelVariant::mfma_16x16x128_persistent: return "mfma_16x16x128_persistent";
+        case KernelVariant::mfma_16x16x128_split_k: return "mfma_16x16x128_split_k";
         }
         return "unknown";
     }
 
     static unsigned int shared_bytes(const KernelConfig& config) {
-        if (config.variant == KernelVariant::tiled_128)
+        if (config.variant == KernelVariant::mfma_32x32x64_tile_128x128)
             return 2 * (128 * 128 * 2);
-        if (config.variant == KernelVariant::tiled_256)
+        if (config.variant == KernelVariant::mfma_32x32x64_tile_256x256)
             return 256 * 256 * 2;
-        // FP8 pipeline: two operand stages, plus the persistent BF16 epilogue buffer.
+        // MFMA 16x16x128 pipeline: two operand stages, plus the persistent BF16 epilogue buffer.
         const unsigned int stage = 256 * 128 + 256 * 128 + 256 * 4 + 256 * 4;
-        const unsigned int epilogue = config.variant == KernelVariant::persistent ? 32 * (2 * 256 + 16) : 0;
+        const unsigned int epilogue = config.variant == KernelVariant::mfma_16x16x128_persistent
+            ? 32 * (2 * 256 + 16) : 0;
         return 2 * stage + epilogue;
     }
 
@@ -114,29 +115,35 @@ private:
         const char* output = out_dtype == MXFP8_OUT_FP32 ? "float" : "std::uint16_t";
         std::ostringstream source;
         source << "#include <cstdint>\n";
-        const bool tiled = config.variant == KernelVariant::tiled_128 ||
-                           config.variant == KernelVariant::tiled_256;
-        source << (tiled ? "#include <deep_gemm/impls/cdna4/gemm_tiled.h>\n"
-                         : "#include <deep_gemm/impls/cdna4/fp8_gemm.cuh>\n");
-        if (config.variant == KernelVariant::split_k)
+        const bool uses_mfma32 = config.variant == KernelVariant::mfma_32x32x64_tile_128x128 ||
+                                 config.variant == KernelVariant::mfma_32x32x64_tile_256x256;
+        source << (uses_mfma32 ? "#include <deep_gemm/impls/cdna4/fp8_gemm_mfma_32x32x64.cuh>\n"
+                              : "#include <deep_gemm/impls/cdna4/fp8_gemm_mfma_16x16x128.cuh>\n");
+        if (config.variant == KernelVariant::mfma_16x16x128_split_k)
             source << "#include <deep_gemm/impls/cdna4/split_k_reduce.cuh>\n";
-        if (config.variant == KernelVariant::tiled_128) {
+        if (config.variant == KernelVariant::mfma_32x32x64_tile_128x128) {
             source << "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_gemm(GemmArgs p) {"
-                   << " gemm_tiled_impl<Tiled128x128S2, " << output << ">(p); }\n";
-        } else if (config.variant == KernelVariant::tiled_256) {
+                   << " fp8_gemm_mfma_32x32x64_impl<Mfma32x32x64Tile128x128S2, " << output << ">(p); }\n";
+        } else if (config.variant == KernelVariant::mfma_32x32x64_tile_256x256) {
             source << "extern \"C\" __global__ __launch_bounds__(1024) void dg_cdna4_gemm(GemmArgs p) {"
-                   << " gemm_tiled_impl<Tiled256x256S1, " << output << ">(p); }\n";
-        } else if (config.variant == KernelVariant::persistent) {
+                   << " fp8_gemm_mfma_32x32x64_impl<Mfma32x32x64Tile256x256S1, " << output << ">(p); }\n";
+        } else if (config.variant == KernelVariant::mfma_16x16x128_persistent) {
             source << "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_gemm(GemmArgs p) {"
-                   << " fp8_gemm_impl<Fp8GemmConfig<Fp8GemmMode::Persistent>, " << output << ">(p); }\n";
-        } else if (config.variant == KernelVariant::split_k) {
+                   << " fp8_gemm_mfma_16x16x128_impl<"
+                      "Mfma16x16x128GemmConfig<Mfma16x16x128GemmMode::Persistent>, "
+                   << output << ">(p); }\n";
+        } else if (config.variant == KernelVariant::mfma_16x16x128_split_k) {
             source << "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_gemm(GemmArgs p) {"
-                   << " fp8_gemm_impl<Fp8GemmConfig<Fp8GemmMode::SplitK>, " << output << ">(p); }\n";
+                   << " fp8_gemm_mfma_16x16x128_impl<"
+                      "Mfma16x16x128GemmConfig<Mfma16x16x128GemmMode::SplitK>, "
+                   << output << ">(p); }\n";
             source << "extern \"C\" __global__ void dg_cdna4_reduce(GemmArgs p) {"
                    << " splitk_reduce_impl<" << output << ">(p); }\n";
         } else {
             source << "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_gemm(GemmArgs p) {"
-                   << " fp8_gemm_impl<Fp8GemmConfig<Fp8GemmMode::DataParallel>, " << output << ">(p); }\n";
+                   << " fp8_gemm_mfma_16x16x128_impl<"
+                      "Mfma16x16x128GemmConfig<Mfma16x16x128GemmMode::DataParallel>, "
+                   << output << ">(p); }\n";
         }
         return source.str();
     }
@@ -184,7 +191,7 @@ private:
         if (hipModuleLoadData(&module->module, code.data()) != hipSuccess ||
             hipModuleGetFunction(&module->gemm, module->module, "dg_cdna4_gemm") != hipSuccess)
             throw std::runtime_error("loading HIPRTC code object failed");
-        if (config.variant == KernelVariant::split_k &&
+        if (config.variant == KernelVariant::mfma_16x16x128_split_k &&
             hipModuleGetFunction(&module->reduce, module->module, "dg_cdna4_reduce") != hipSuccess)
             throw std::runtime_error("loading HIPRTC reduction kernel failed");
         modules_.emplace(key, module);

@@ -12,21 +12,21 @@ The packaged headers are organized by responsibility:
 
 | Header | Responsibility |
 | --- | --- |
-| `fp8_gemm.cuh` | Pipeline using 16×16×128 scaled MFMA; data-parallel, persistent, and split-K execution |
-| `gemm_tiled.h` | The two tiled configurations selected by the cost model |
+| `fp8_gemm_mfma_16x16x128.cuh` | 16×16×128 scaled MFMA, direct global-to-LDS DMA, and interleaved instruction scheduling; data-parallel, persistent, and split-K execution |
+| `fp8_gemm_mfma_32x32x64.cuh` | 32×32×64 scaled MFMA, global-to-register-to-LDS copies; 128×128 and 256×256 output tiles |
 | `epilogue.cuh` | Output stores, accumulation, and boundary handling |
 | `split_k_reduce.cuh` | Deterministic reduction of split-K partials |
 | `tile_scheduler.cuh` | Output-tile ordering shared by both GEMM families |
 | `device_common.h` | Vector types, numeric conversions, and memory primitives |
 | `gemm_args.h` | Argument layout shared by the host and generated device code |
 
-The JIT includes the selected GEMM header and adds the reduction header for split-K. Public layout aliases normalize inputs to K-major before launching these kernels.
+The dimensions in each GEMM filename describe a single MFMA instruction: output rows × output columns × reduction depth. The workgroup output tile is a separate configuration. Both headers implement FP8 GEMM; the JIT selects one family and adds the reduction header for split-K. Public layout aliases normalize inputs to K-major before launching these kernels.
 
 For one output tile, the device code follows this data path:
 
 ```text
 A/B and scales in global memory
-        │ DMA
+        │ direct DMA (16×16×128) or register staging (32×32×64)
         ▼
       LDS stage 0/1
         │ LDS reads

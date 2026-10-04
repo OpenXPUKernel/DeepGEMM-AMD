@@ -1,4 +1,5 @@
 // CDNA4 FP8 GEMM using 16x16x128 scaled MFMA instructions.
+// Operands use direct global-to-LDS DMA with an interleaved MFMA schedule.
 // The host normalizes operands to K-major and JIT-selects one execution mode.
 #pragma once
 #include <type_traits>
@@ -22,13 +23,13 @@ template <int B, int E, class F> __device__ __forceinline__ void static_for(F &&
 // -----------------------------------------------------------------------------
 // Modes emitted by the JIT. Persistent execution uses an LDS epilogue and
 // spreads the final round of tiles; split-K writes FP32 partials for reduction.
-enum class Fp8GemmMode { DataParallel, Persistent, SplitK };
+enum class Mfma16x16x128GemmMode { DataParallel, Persistent, SplitK };
 
-template <Fp8GemmMode Mode> struct Fp8GemmConfig {
+template <Mfma16x16x128GemmMode Mode> struct Mfma16x16x128GemmConfig {
   static constexpr int BM = 256, BN = 256, BK = 128, NW = 4, NT = 256;
   static constexpr int GROUP_M = 8;
-  static constexpr bool PERSIST = Mode == Fp8GemmMode::Persistent;
-  static constexpr bool SPLITK = Mode == Fp8GemmMode::SplitK;
+  static constexpr bool PERSIST = Mode == Mfma16x16x128GemmMode::Persistent;
+  static constexpr bool SPLITK = Mode == Mfma16x16x128GemmMode::SplitK;
   // Pair B fragments in persistent mode so each lane owns contiguous columns.
   static constexpr bool BPAIR = PERSIST;
   static constexpr int A_OFF = 0, B_OFF = BM * BK;
@@ -111,7 +112,7 @@ __device__ __forceinline__ void buffer_store16(v4u v, __amdgpu_buffer_rsrc_t r, 
 // -----------------------------------------------------------------------------
 // Main pipelined GEMM kernel
 // -----------------------------------------------------------------------------
-template <class Cfg, class OutT> __device__ __forceinline__ void fp8_gemm_impl(GemmArgs p) {
+template <class Cfg, class OutT> __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
 #if defined(__HIP_DEVICE_COMPILE__)
   constexpr int BM = Cfg::BM, BN = Cfg::BN, BK = Cfg::BK, NW = Cfg::NW;
   extern __shared__ __attribute__((aligned(1024))) uint8_t smem[];
