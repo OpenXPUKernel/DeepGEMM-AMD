@@ -104,7 +104,7 @@ private:
             return 2 * (128 * 128 * 2);
         if (config.variant == KernelVariant::tiled_256)
             return 256 * 256 * 2;
-        // Pipe16: two operand stages, plus the persistent BF16 epilogue buffer.
+        // FP8 pipeline: two operand stages, plus the persistent BF16 epilogue buffer.
         const unsigned int stage = 256 * 128 + 256 * 128 + 256 * 4 + 256 * 4;
         const unsigned int epilogue = config.variant == KernelVariant::persistent ? 32 * (2 * 256 + 16) : 0;
         return 2 * stage + epilogue;
@@ -113,9 +113,13 @@ private:
     std::string source_for(const KernelConfig& config, const int out_dtype) const {
         const char* output = out_dtype == MXFP8_OUT_FP32 ? "float" : "std::uint16_t";
         std::ostringstream source;
-        source << "#include <cstdint>\n"
-               << "#include <deep_gemm/impls/cdna4/gemm_pipe16.h>\n"
-               << "using deep_gemm::cdna4::GemmArgs;\n";
+        source << "#include <cstdint>\n";
+        const bool tiled = config.variant == KernelVariant::tiled_128 ||
+                           config.variant == KernelVariant::tiled_256;
+        source << (tiled ? "#include <deep_gemm/impls/cdna4/gemm_tiled.h>\n"
+                         : "#include <deep_gemm/impls/cdna4/fp8_gemm.cuh>\n");
+        if (config.variant == KernelVariant::split_k)
+            source << "#include <deep_gemm/impls/cdna4/split_k_reduce.cuh>\n";
         if (config.variant == KernelVariant::tiled_128) {
             source << "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_gemm(GemmArgs p) {"
                    << " gemm_tiled_impl<Tiled128x128S2, " << output << ">(p); }\n";
@@ -124,15 +128,15 @@ private:
                    << " gemm_tiled_impl<Tiled256x256S1, " << output << ">(p); }\n";
         } else if (config.variant == KernelVariant::persistent) {
             source << "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_gemm(GemmArgs p) {"
-                   << " gemm_pipe16_impl<Pipe16Cfg<8,true,false,0,16,48,true,true,false,false,0,true>, " << output << ">(p); }\n";
+                   << " fp8_gemm_impl<Fp8GemmConfig<Fp8GemmMode::Persistent>, " << output << ">(p); }\n";
         } else if (config.variant == KernelVariant::split_k) {
             source << "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_gemm(GemmArgs p) {"
-                   << " gemm_pipe16_impl<Pipe16Cfg<8,true,true>, " << output << ">(p); }\n";
+                   << " fp8_gemm_impl<Fp8GemmConfig<Fp8GemmMode::SplitK>, " << output << ">(p); }\n";
             source << "extern \"C\" __global__ void dg_cdna4_reduce(GemmArgs p) {"
                    << " splitk_reduce_impl<" << output << ">(p); }\n";
         } else {
             source << "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_gemm(GemmArgs p) {"
-                   << " gemm_pipe16_impl<Pipe16Cfg<8,true,false>, " << output << ">(p); }\n";
+                   << " fp8_gemm_impl<Fp8GemmConfig<Fp8GemmMode::DataParallel>, " << output << ">(p); }\n";
         }
         return source.str();
     }

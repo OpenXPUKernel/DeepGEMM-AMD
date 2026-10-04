@@ -15,12 +15,6 @@ def _inputs(m, n, k):
             deep_gemm.per_token_cast_to_fp8(xb, use_ue8m0=True, gran_k=32))
 
 
-def _reference(a, b):
-    aq = a[0].float() * a[1].repeat_interleave(32, dim=1)[:, :a[0].size(1)]
-    bq = b[0].float() * b[1].repeat_interleave(32, dim=1)[:, :b[0].size(1)]
-    return aq @ bq.transpose(0, 1)
-
-
 def _time(fn, warmup, rounds):
     for _ in range(warmup):
         fn()

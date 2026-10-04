@@ -21,6 +21,5 @@ struct GemmArgs {
   int splits;
   float* ws;
   int ldw;
-  int* tile_ctr;
 };
 } // namespace deep_gemm::cdna4

@@ -94,7 +94,7 @@ void cdna4_fp8_gemm_nt(const torch::Tensor& a, const torch::Tensor& sfa,
         m, n, k, lda, ldb, lda_sf, ldb_sf, ldd,
         static_cast<float>(alpha), config.split_k,
         workspace.defined() ? workspace.data_ptr<float>() : nullptr,
-        n > 0 ? (n + 3) / 4 * 4 : 0, nullptr};
+        n > 0 ? (n + 3) / 4 * 4 : 0};
     const auto stream = reinterpret_cast<hipStream_t>(
         at::cuda::getCurrentCUDAStream(d.device().index()).stream());
     const int error = jit_runtime.launch(args, config, out_dtype, stream, current_num_compute_units());
