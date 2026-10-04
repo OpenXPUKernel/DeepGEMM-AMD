@@ -6,7 +6,7 @@ The HIP backend has one pybind extension and a small runtime JIT layer:
 - `csrc/cdna4/cost_model.hpp` maps a GEMM shape to a tile, pipeline, and split-K specialization.
 - `csrc/cdna4/jit_runtime.hpp` generates the wrapper source, compiles it with HIPRTC on first use, caches the code object, and launches it through the current PyTorch stream.
 - `deep_gemm/include/deep_gemm/impls/cdna4/` contains the packaged device templates: the active FP8 pipeline, tiled kernels, shared device helpers, and the plain `GemmArgs` ABI.
-- `deep_gemm/cdna4_fp8_gemm.py` keeps quantization, scale packing, layout aliases, and the public Python interface aligned with the CUDA backend.
+- `deep_gemm/_hip_api.py` keeps quantization, scale packing, layout aliases, and the public Python interface aligned with the CUDA backend.
 
 The packaged headers are organized by responsibility:
 

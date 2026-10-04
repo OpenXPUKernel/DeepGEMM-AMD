@@ -7,6 +7,6 @@ __version__ = '2.8.1'
 # The CUDA module remains the default for NVIDIA builds.
 if getattr(torch.version, "hip", None) is not None:
     from . import _C
-    from .cdna4_fp8_gemm import *
+    from ._hip_api import *
 else:
     from ._cuda_api import *
