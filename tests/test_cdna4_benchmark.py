@@ -51,7 +51,7 @@ class BenchmarkCatalogTests(unittest.TestCase):
                       for n, k in TUTORIAL_NK for layout in ('KK', 'MM')},
         }
         cases = bench.select_cases(bench.parse_args(['--suite', 'tutorial']))
-        self.assertEqual(len(cases), 49)
+        self.assertEqual(len(cases), 52)
         for suite, contract in expected.items():
             with self.subTest(suite=suite):
                 self.assertEqual({workload(c) for c in cases if c.suite == suite}, contract)
@@ -61,11 +61,11 @@ class BenchmarkCatalogTests(unittest.TestCase):
     def test_default_expands_tutorial_without_duplicate_workloads(self):
         cases = bench.select_cases(bench.parse_args([]))
         tutorial = bench.select_cases(bench.parse_args(['--suite', 'tutorial']))
-        self.assertGreaterEqual(len(cases), 117)
+        self.assertGreaterEqual(len(cases), 129)
         self.assertGreaterEqual(len({(c.m, c.n, c.k) for c in cases}), 93)
         self.assertTrue({workload(c) for c in tutorial} <= {workload(c) for c in cases})
         self.assertEqual(len(cases), len(set(cases)))
-        self.assertEqual(len(cases), len({workload(c) for c in cases}))
+        self.assertEqual(len(cases), len({(*workload(c), c.gran_k_a, c.gran_k_b) for c in cases}))
 
     def test_all_edge_shapes_cover_bf16_and_fp32_accumulation(self):
         cases = bench.select_cases(bench.parse_args(['--suite', 'edge']))
@@ -73,6 +73,15 @@ class BenchmarkCatalogTests(unittest.TestCase):
             with self.subTest(dtype=dtype):
                 expected = {(*shape, dtype, accumulate, 'KK') for shape in TUTORIAL_EDGES}
                 self.assertTrue(expected <= {workload(c) for c in cases})
+
+    def test_native_scale_recipe_coverage(self):
+        cases = bench.select_cases(bench.parse_args(['--suite', 'recipe']))
+        self.assertEqual({(c.layout, c.gran_k_a, c.gran_k_b) for c in cases},
+                         {(layout, ga, gb) for layout in ('KK', 'KM', 'MK', 'MM')
+                          for ga, gb in ((128, 128), (32, 128), (128, 32))})
+        custom = bench.select_cases(bench.parse_args(
+            ['--shape', '17,33,96', '--gran-k-a', '128', '--gran-k-b', '32']))
+        self.assertEqual((custom[0].gran_k_a, custom[0].gran_k_b), (128, 32))
 
     def test_custom_shapes_select_dtype_layout_and_accumulation(self):
         shapes = ['--shape', '17,33,96', '--shape', '64x64x16']
@@ -122,7 +131,7 @@ class BenchmarkCatalogTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.splitlines()
         self.assertIn('Cases:', lines[0])
-        self.assertGreaterEqual(len(lines) - 1, 117)
+        self.assertGreaterEqual(len(lines) - 1, 129)
         self.assertTrue(any('wgrad' in line and 'fp32' in line and 'acc=1 layout=MM' in line
                             for line in lines))
 
@@ -139,7 +148,7 @@ class BenchmarkResultTests(unittest.TestCase):
     def test_csv_and_console_honor_relative_only(self):
         absolute_fields = {'deepgemm_us', 'pytorch_us', 'deepgemm_tflops', 'pytorch_tflops'}
         relative_fields = {'suite', 'm', 'n', 'k', 'dtype', 'accumulate', 'layout',
-                           'baseline', 'status', 'relative_l2', 'speedup'}
+                           'gran_k_a', 'gran_k_b', 'baseline', 'status', 'relative_l2', 'speedup'}
         result = dict(status='ok', relative_l2=0.002,
                       **bench.performance_metrics(100, 200, 300, op_us=4, pytorch_us=12))
         # Replace only the GPU execution boundary; exercise the real CLI result

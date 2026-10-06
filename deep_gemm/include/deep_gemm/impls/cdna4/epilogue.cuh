@@ -1,13 +1,12 @@
 // Vectorized output stores with optional accumulation and edge handling.
 #pragma once
-#include <type_traits>
 #include "device_common.h"
+#include <type_traits>
 
-// Out[row][col .. col + 7] = v (+ C[row][col .. col + 7]) for the columns < N; v is already scaled
-// by alpha. Out and C share the row stride ldo (elements).
+// Out[row][col .. col + 7] = v (+ C[row][col .. col + 7]) for the columns < N
 template <class OutT>
-__device__ __forceinline__ void store8(void *out, const void *C, int ldo, int M, int N, int row, int col,
-                                       v4f lo, v4f hi, bool vec_ok) {
+__device__ __forceinline__ void store8(void *out, const void *C, int ldo, int M, int N, int row,
+                                       int col, v4f lo, v4f hi, bool vec_ok) {
   if (row >= M || col >= N)
     return;
   const size_t off = (size_t)row * ldo + col;
@@ -46,6 +45,44 @@ __device__ __forceinline__ void store8(void *out, const void *C, int ldo, int M,
       if (C)
         v += load_out((const OutT *)C + off + e);
       store_out((OutT *)out + off + e, v);
+    }
+  }
+}
+
+// store8 for 4 consecutive outputs of a row (persistent kernel with an MN-major B)
+template <class OutT>
+__device__ __forceinline__ void store4(void *out, const void *C, int ldo, int M, int N, int row,
+                                       int col, v4f v, bool vec_ok) {
+  if (row >= M || col >= N)
+    return;
+  const size_t off = (size_t)row * ldo + col;
+  if (vec_ok && col + 4 <= N) {
+    if constexpr (std::is_same<OutT, uint16_t>::value) {
+      if (C) {
+        const v2i c = *(const v2i *)((const uint16_t *)C + off);
+        float c0, c1;
+        unpack_bf16x2(c[0], c0, c1);
+        v[0] += c0;
+        v[1] += c1;
+        unpack_bf16x2(c[1], c0, c1);
+        v[2] += c0;
+        v[3] += c1;
+      }
+      *(v2u *)((uint16_t *)out + off) = v2u{pack_bf16x2(v[0], v[1]), pack_bf16x2(v[2], v[3])};
+    } else {
+      if (C)
+        v += *(const v4f *)((const float *)C + off);
+      *(v4f *)((float *)out + off) = v;
+    }
+  } else {
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      if (col + e >= N)
+        break;
+      float x = v[e];
+      if (C)
+        x += load_out((const OutT *)C + off + e);
+      store_out((OutT *)out + off + e, x);
     }
   }
 }

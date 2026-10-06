@@ -2,7 +2,8 @@
 
 This module provides the same dense FP8 GEMM entry points as DeepGEMM's CUDA
 backend.  The HIP kernel accepts OCP FP8 E4M3 operands and UE8M0 scales with
-32-element K granularity. The HIP implementation is compiled into
+32- or 128-element K granularity and native K/MN-major operands.
+The HIP implementation is compiled into
 ``deep_gemm._C`` by the normal DeepGEMM build flow.
 
 KnowingNothing implementation.
@@ -144,11 +145,12 @@ def transform_sf_into_required_layout(
         gran_mn, gran_k = recipe
     else:
         raise ValueError("recipe must contain two or three elements")
+    if not isinstance(gran_mn, int) or gran_mn < 1:
+        raise ValueError("MN scale granularity must be a positive integer")
     if gran_k not in (32, 128):
         raise NotImplementedError("CDNA4 FP8 GEMM supports K scale granularity 32 or 128")
     if sf.dim() != 2 or sf.size(0) != ceil_div(mn, gran_mn):
         raise ValueError(f"invalid scale shape {tuple(sf.shape)} for mn={mn}, recipe={recipe}")
-    blocks = ceil_div(k, 32)
     if sf.dtype == torch.float32:
         if sf.size(1) != ceil_div(k, gran_k):
             raise ValueError(f"invalid scale shape {tuple(sf.shape)} for k={k}, recipe={recipe}")
@@ -157,21 +159,17 @@ def transform_sf_into_required_layout(
         if gran_mn != 1:
             sf = sf.index_select(0, torch.arange(mn, device=sf.device) // gran_mn)
         codes = (sf.contiguous().view(torch.int32) >> 23).to(torch.uint8)
-        if gran_k == 128:
-            codes = codes.repeat_interleave(4, dim=1)[:, :blocks]
         return _pack_codes_mn_major(codes)
     if sf.dtype == torch.int32:
         if gran_mn != 1:
             raise ValueError("packed scales require granularity one along MN")
         if sf.size(1) != ceil_div(k, gran_k * 4):
             raise ValueError(f"invalid packed scale shape {tuple(sf.shape)} for k={k}, recipe={recipe}")
-        if gran_k == 128:
-            codes = sf.contiguous().view(torch.uint8).view(mn, -1).repeat_interleave(4, dim=1)[:, :blocks]
-            return _pack_codes_mn_major(codes)
-        if (sf.stride(0) == 1 and sf.stride(1) >= mn) or mn == 1:
-            return sf
-        out = torch.empty_strided(sf.shape, (1, align(mn, 4)), dtype=torch.int32, device=sf.device)
-        return out.copy_(sf)
+        if not ((sf.stride(0) == 1 or mn == 1) and
+                sf.stride(1) >= align(mn, 4) and sf.stride(1) % 4 == 0):
+            raise ValueError("packed scales must be MN-major with a column stride "
+                             "aligned to four elements and at least align(mn, 4)")
+        return sf
     raise TypeError(f"unsupported scale dtype {sf.dtype}")
 
 
@@ -186,19 +184,24 @@ def _check_fp8(x: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must be K-major or MN-major")
 
 
-def _k_major(x: torch.Tensor) -> torch.Tensor:
-    if x.stride(1) == 1 or x.size(1) == 1 or x.stride(0) != 1:
-        return x
-    # An MN-major view is copied into the row-major layout consumed by the HIP kernel.
-    return x.contiguous()
-
-
-def _aligned_operand(x: torch.Tensor) -> torch.Tensor:
-    if (x.size(0) == 1 or x.stride(0) % 16 == 0) and x.data_ptr() % 16 == 0:
-        return x
-    y = torch.zeros((x.size(0), align(x.size(1), 16)), dtype=x.dtype, device=x.device)
-    y[:, :x.size(1)] = x
-    return y
+def _operand_layout(x: torch.Tensor, name: str) -> Tuple[bool, int]:
+    """Validate native storage; the GEMM reads this tensor without a copy."""
+    mn, k = x.shape
+    if mn == 1 and (x.stride(1) == 1 or k == 1):
+        mn_major, ld = False, align(k, 4)
+    elif k == 1 and x.stride(0) == 1:
+        mn_major, ld = True, align(mn, 4)
+    else:
+        mn_major = mn == 1 or (k != 1 and x.stride(1) != 1)
+        ld = x.stride(1) if mn_major else x.stride(0)
+        row = mn if mn_major else k
+        if ld % 4 or ld < row or ld >= 1 << 24:
+            raise ValueError(f"{name}: physical row stride must cover the row, "
+                             "be divisible by four and be below 1 << 24")
+    row = mn if mn_major else k
+    if row % 4 and x.data_ptr() % 4:
+        raise ValueError(f"{name}: ragged rows require a four-byte aligned base")
+    return mn_major, ld
 
 
 def fp8_gemm_nt(
@@ -231,6 +234,9 @@ def fp8_gemm_nt(
             raise ValueError("c must match d in shape, dtype and layout")
         if c.data_ptr() == d.data_ptr() and c.stride() != d.stride():
             raise ValueError("c aliases d with different strides")
+    tensors = (a_fp8, b_fp8, sfa, sfb, d) + ((c,) if c is not None else ())
+    if not d.is_cuda or any(t.device != d.device for t in tensors):
+        raise ValueError("all GEMM tensors must be on the same accelerator device")
     if m == 0 or n == 0:
         return
     if k == 0:
@@ -247,16 +253,19 @@ def fp8_gemm_nt(
     if recipe is not None:
         sfa = transform_sf_into_required_layout(sfa, m, k, recipe, is_sfa=True, disable_ue8m0_cast=disable_ue8m0_cast)
         sfb = transform_sf_into_required_layout(sfb, n, k, recipe, is_sfa=False, disable_ue8m0_cast=disable_ue8m0_cast)
+        gran_k_a = gran_k_b = recipe[2]
     else:
         sfa = transform_sf_into_required_layout(sfa, m, k, recipe_a, disable_ue8m0_cast=disable_ue8m0_cast)
         sfb = transform_sf_into_required_layout(sfb, n, k, recipe_b, disable_ue8m0_cast=disable_ue8m0_cast)
+        gran_k_a, gran_k_b = recipe_a[1], recipe_b[1]
 
-    a_fp8, b_fp8 = _aligned_operand(_k_major(a_fp8)), _aligned_operand(_k_major(b_fp8))
+    _operand_layout(a_fp8, "a")
+    _operand_layout(b_fp8, "b")
     if c is not None and c.data_ptr() != d.data_ptr() and c.stride() != d.stride():
         d.copy_(c)
         c = d
     _backend().cdna4_fp8_gemm_nt(
-        a_fp8, sfa, b_fp8, sfb, d, c, 1.0 if alpha is None else float(alpha)
+        a_fp8, sfa, b_fp8, sfb, d, c, 1.0 if alpha is None else float(alpha), gran_k_a, gran_k_b
     )
 
 

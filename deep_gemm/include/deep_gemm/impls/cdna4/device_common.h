@@ -1,16 +1,17 @@
 // Device types, conversions and memory primitives shared by the CDNA4 kernels.
 #pragma once
-#include <hip/hip_runtime.h>
-#include <cstdint>
 #include "gemm_args.h"
+#include <cstdint>
+#include <hip/hip_runtime.h>
 using deep_gemm::cdna4::GemmArgs;
 
+typedef int v2i __attribute__((ext_vector_type(2)));
+typedef unsigned v2u __attribute__((ext_vector_type(2)));
 typedef float v2f __attribute__((ext_vector_type(2)));
 typedef int v4i __attribute__((ext_vector_type(4)));
 typedef int v8i __attribute__((ext_vector_type(8)));
 typedef float v4f __attribute__((ext_vector_type(4)));
 typedef unsigned v4u __attribute__((ext_vector_type(4)));
-typedef float v16f __attribute__((ext_vector_type(16)));
 
 // OCP E4M3 operand format for scaled MFMA.
 constexpr int kFmtFp8 = 0;
@@ -58,8 +59,27 @@ __device__ __forceinline__ void unpack_bf16x2(uint32_t x, float &a, float &b) {
 
 #if defined(__HIP_DEVICE_COMPILE__)
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t make_rsrc(const void *base, uint32_t bytes) {
-  return __builtin_amdgcn_make_buffer_rsrc(const_cast<void *>(base), (short)0, (int)bytes, 0x00020000);
+  return __builtin_amdgcn_make_buffer_rsrc(const_cast<void *>(base), (short)0, (int)bytes,
+                                           0x00020000);
 }
+
+// An explicit restricted LDS pointer prevents the compiler from inserting
+// global-load waits before a read from the other pipeline stage.
+__device__ __forceinline__ v2i ds_read_tr8(const __attribute__((address_space(3)))
+                                           v2i *__restrict__ p) {
+  return __builtin_amdgcn_ds_read_tr8_b64_v2i32(
+      const_cast<__attribute__((address_space(3))) v2i *>(p));
+}
+
+// The second half of a 16-byte buffer store is read one cycle after issue.
+__device__ __forceinline__ void buffer_store16(v4u v, __amdgpu_buffer_rsrc_t r, uint32_t voff,
+                                               int soff) {
+  __builtin_amdgcn_raw_buffer_store_b128(v, r, voff, soff, 0);
+  __builtin_amdgcn_sched_barrier(0);
+  asm volatile("s_nop 0");
+  __builtin_amdgcn_sched_barrier(0);
+}
+
 #endif
 
 // Join the two halves of a scaled MFMA operand.

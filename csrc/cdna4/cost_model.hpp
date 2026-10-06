@@ -1,8 +1,7 @@
 #pragma once
 
+#include <hip/hip_runtime.h>
 #include <algorithm>
-#include <cstdlib>
-
 #include <cstdint>
 
 constexpr int MXFP8_OUT_BF16 = 0;
@@ -11,8 +10,6 @@ constexpr int MXFP8_OUT_FP32 = 1;
 namespace deep_gemm::cdna4 {
 
 enum class KernelVariant {
-    mfma_32x32x64_tile_128x128,
-    mfma_32x32x64_tile_256x256,
     mfma_16x16x128_data_parallel,
     mfma_16x16x128_persistent,
     mfma_16x16x128_split_k,
@@ -20,44 +17,57 @@ enum class KernelVariant {
 
 struct KernelConfig {
     KernelVariant variant;
-    int block_m;
-    int block_n;
-    int block_k;
-    int split_k;
+    int block_m = 256;
+    int block_n = 256;
+    int block_k = 128;
+    int split_k = 1;
+    // Bit 0 describes A, bit 1 describes B.
+    int mn_major = 0;
+    int scale_gran_128 = 0;
 };
 
-inline int ceil_div(const int x, const int y) { return (x + y - 1) / y; }
+inline int ceil_div(const int x, const int y) { return x / y + (x % y != 0); }
 
 inline int num_compute_units() {
     int device = 0;
-    if (hipGetDevice(&device) != hipSuccess)
-        return 256;
-    hipDeviceProp_t properties;
-    return hipGetDeviceProperties(&properties, device) == hipSuccess ? properties.multiProcessorCount : 256;
+    hipDeviceProp_t properties{};
+    if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&properties, device) != hipSuccess)
+        return 1;
+    return std::max(properties.multiProcessorCount, 1);
 }
 
-// Shape heuristics select an MFMA family, tile and execution mode.
-// The runtime JIT compiles the selected device template on first use.
-inline KernelConfig get_best_config(const int m, const int n, const int k,
-                                  const int out_dtype, const bool has_c) {
-    const int cus = num_compute_units();
-    const int tiles_128 = ceil_div(m, 128) * ceil_div(n, 128);
-    const int tiles_256 = ceil_div(m, 256) * ceil_div(n, 256);
+// Balance additional parallelism against partial-output traffic and reduction
+// overhead. These empirical coefficients match the production tutorial planner.
+inline int plan_splits(const int m, const int n, const int k, const int compute_units) {
+    if (m <= 0 || n <= 0 || k <= 0)
+        return 0;
+    const auto tiles = int64_t(ceil_div(m, 256)) * ceil_div(n, 256);
     const int k_tiles = ceil_div(k, 128);
-    const bool full_k = k % 128 == 0;
-    const bool persistent = out_dtype == MXFP8_OUT_BF16 && !has_c && full_k && k >= 256;
+    int splits = 2 * tiles > compute_units ? 1 :
+        std::min(static_cast<int>(compute_units / tiles), k_tiles / 2);
+    while (splits > 1 && splits * double(m) * n * 8 / 5e12 + 5e-6 >
+                         10.5e-9 * k * (1 - 1.0 / splits))
+        --splits;
+    splits = std::clamp(splits, 1, k_tiles);
+    // Equal-sized K ranges must never create an empty final workgroup.
+    return ceil_div(k_tiles, ceil_div(k_tiles, splits));
+}
 
-    if (full_k && m <= 128 && n <= 128)
-        return {KernelVariant::mfma_32x32x64_tile_128x128, 128, 128, 128, 1};
-    if (full_k && (m < 256 || n < 256) && tiles_128 >= 2)
-        return {KernelVariant::mfma_32x32x64_tile_256x256, 256, 256, 128, 1};
-    if (persistent && tiles_256 >= cus)
-        return {KernelVariant::mfma_16x16x128_persistent, 256, 256, 128, 1};
-
-    const int suggested_splits = std::max(1, std::min(cus / std::max(tiles_256, 1), k_tiles / 2));
-    if (suggested_splits > 1 && tiles_256 * 2 < cus)
-        return {KernelVariant::mfma_16x16x128_split_k, 256, 256, 128, suggested_splits};
-    return {KernelVariant::mfma_16x16x128_data_parallel, 256, 256, 128, 1};
+inline KernelConfig get_best_config(const int m, const int n, const int k,
+                                    const int out_dtype, const bool has_c,
+                                    const int ldd, const bool d_aligned16,
+                                    const int mn_major = 0, const int scale_gran_128 = 0) {
+    KernelConfig config{KernelVariant::mfma_16x16x128_data_parallel};
+    config.mn_major = mn_major;
+    config.scale_gran_128 = scale_gran_128;
+    config.split_k = plan_splits(m, n, k, num_compute_units());
+    if (config.split_k > 1) {
+        config.variant = KernelVariant::mfma_16x16x128_split_k;
+    } else if (out_dtype == MXFP8_OUT_BF16 && !has_c && k >= 256 && k % 128 == 0 &&
+               d_aligned16 && ldd % 8 == 0 && ldd < (1 << 23)) {
+        config.variant = KernelVariant::mfma_16x16x128_persistent;
+    }
+    return config;
 }
 
 }  // namespace deep_gemm::cdna4

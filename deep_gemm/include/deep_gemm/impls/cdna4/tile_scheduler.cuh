@@ -1,4 +1,4 @@
-// Shared output-tile ordering for the tiled and pipelined GEMMs.
+// Output-tile ordering shared by the GEMM execution modes.
 #pragma once
 #include <hip/hip_runtime.h>
 

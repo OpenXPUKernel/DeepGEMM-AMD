@@ -1,7 +1,7 @@
 """Benchmark CDNA4 FP8 GEMM against PyTorch with a full shape/layout catalog.
 
 Run --list-shapes without PyTorch or a GPU to inspect the catalog. Timings are
-GPU events around the public APIs, including launch gaps and layout conversion.
+GPU events around the public APIs, including launch gaps. Native input layouts require no conversion inside the API.
 Quantization, scale packing, baseline preparation and JIT warmup are excluded.
 """
 import argparse
@@ -36,10 +36,12 @@ class Case:
     dtype: str = 'bf16'
     accumulate: bool = False
     layout: str = 'KK'
+    gran_k_a: int = 32
+    gran_k_b: int = 32
 
 
 def enumerate_cases(suite='all'):
-    """49 tutorial performance configurations plus 68 additional configurations."""
+    """Current tutorial production cases plus decode, shape and scale extensions."""
     cases = []
     if suite in ('all', 'tutorial', 'forward'):
         cases += [Case('forward', m, n, k) for m in (1, 128, 4096) for n, k in FORWARD_NK]
@@ -54,6 +56,13 @@ def enumerate_cases(suite='all'):
                   for n, k in FORWARD_NK]
     if suite in ('all', 'square'):
         cases += [Case('square', *shape) for shape in SQUARE_SHAPES]
+    elif suite == 'tutorial':
+        cases += [Case('square', size, size, size) for size in (4096, 8192)]
+    if suite in ('all', 'recipe'):
+        cases += [Case('recipe', 4096, 7168, 2048, layout=layout, gran_k_a=ga, gran_k_b=gb)
+                  for layout in ('KK', 'KM', 'MK', 'MM') for ga, gb in ((128, 128), (32, 128), (128, 32))]
+    elif suite == 'tutorial':
+        cases += [Case('recipe', 4096, 7168, 2048, gran_k_a=128, gran_k_b=128)]
     if suite in ('all', 'edge'):
         cases += [Case('edge', *shape, dtype=dtype, accumulate=dtype == 'fp32')
                   for shape in EDGE_SHAPES for dtype in ('bf16', 'fp32')]
@@ -80,12 +89,14 @@ def shape_arg(value):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--suite', choices=('all', 'tutorial', 'forward', 'dgrad', 'wgrad',
-                                           'extended', 'square', 'edge'), default='all')
+                                           'extended', 'square', 'edge', 'recipe'), default='all')
     parser.add_argument('--shape', type=shape_arg, action='append', help='custom M,N,K; repeat to add shapes')
     parser.add_argument('--dtype', choices=('bf16', 'fp32', 'both'),
                         help='filter the catalog, or select types for custom shapes (default: BF16)')
     parser.add_argument('--layout', choices=('KK', 'KM', 'MK', 'MM'), default='KK',
                         help='custom shapes: K means K-major, M means MN-major')
+    parser.add_argument('--gran-k-a', type=int, choices=(32, 128), default=32, help='custom shapes: A scale block')
+    parser.add_argument('--gran-k-b', type=int, choices=(32, 128), default=32, help='custom shapes: B scale block')
     parser.add_argument('--accumulate', action='store_true', help='custom shapes: accumulate into D')
     parser.add_argument('--rounds', type=positive_int, default=30, help='timed event samples per API')
     parser.add_argument('--warmup', type=positive_int, default=5, help='minimum warmup calls per API')
@@ -97,15 +108,15 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if not math.isfinite(args.warmup_ms) or args.warmup_ms < 0:
         parser.error('--warmup-ms must be finite and nonnegative')
-    if not args.shape and (args.layout != 'KK' or args.accumulate):
-        parser.error('--layout and --accumulate require --shape')
+    if not args.shape and (args.layout != 'KK' or args.accumulate or args.gran_k_a != 32 or args.gran_k_b != 32):
+        parser.error('--layout, --accumulate and custom scale blocks require --shape')
     return args
 
 
 def select_cases(args):
     if args.shape:
         dtypes = ('bf16', 'fp32') if args.dtype == 'both' else (args.dtype or 'bf16',)
-        return [Case('custom', *shape, dtype, args.accumulate, args.layout)
+        return [Case('custom', *shape, dtype, args.accumulate, args.layout, args.gran_k_a, args.gran_k_b)
                 for shape in args.shape for dtype in dtypes]
     cases = enumerate_cases(args.suite)
     if args.dtype and args.dtype != 'both':
@@ -114,7 +125,7 @@ def select_cases(args):
 
 
 def metric_fields(relative_only):
-    fields = ['suite', 'm', 'n', 'k', 'dtype', 'accumulate', 'layout', 'baseline', 'status', 'relative_l2']
+    fields = ['suite', 'm', 'n', 'k', 'dtype', 'accumulate', 'layout', 'gran_k_a', 'gran_k_b', 'baseline', 'status', 'relative_l2']
     if not relative_only:
         fields += ['deepgemm_us', 'pytorch_us', 'deepgemm_tflops', 'pytorch_tflops']
     return fields + ['speedup']
@@ -153,23 +164,31 @@ def time_call(torch, fn, rounds, warmup, warmup_ms, flush_buffer):
 def run_case(torch, deep_gemm, case, args, flush_buffer):
     dtype = torch.bfloat16 if case.dtype == 'bf16' else torch.float32
 
-    def operand(rows, major):
-        x = torch.randn((rows, case.k), device='cuda', dtype=torch.bfloat16)
-        q, sf = deep_gemm.per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32)
-        reference = (q.float() * sf.repeat_interleave(32, dim=1)[:, :case.k]).to(dtype)
-        packed = deep_gemm.transform_sf_into_required_layout(sf, rows, case.k, (1, 32))
-        if major == 'M':
-            q = q.T.contiguous().T
-            reference = reference.T.contiguous().T
-        return (q, packed), reference
+    def place(tensor, major):
+        physical = tensor.T if major == 'M' else tensor
+        if physical.stride(1) == 1 and physical.stride(0) % 4 == 0:
+            return tensor
+        rows, columns = physical.shape
+        storage = torch.empty((rows, (columns + 3) // 4 * 4), device='cuda', dtype=tensor.dtype)
+        view = storage[:, :columns]
+        view.copy_(physical)
+        return view.T if major == 'M' else view
 
-    a, a_ref = operand(case.m, case.layout[0])
-    b, b_ref = operand(case.n, case.layout[1])
+    def operand(rows, major, gran_k):
+        x = torch.randn((rows, case.k), device='cuda', dtype=torch.bfloat16)
+        q, sf = deep_gemm.per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=gran_k)
+        reference = (q.float() * sf.repeat_interleave(gran_k, dim=1)[:, :case.k]).to(dtype)
+        packed = deep_gemm.transform_sf_into_required_layout(sf, rows, case.k, (1, gran_k))
+        return (place(q, major), packed), place(reference, major)
+
+    a, a_ref = operand(case.m, case.layout[0], case.gran_k_a)
+    b, b_ref = operand(case.n, case.layout[1], case.gran_k_b)
     out = torch.zeros((case.m, case.n), device='cuda', dtype=dtype)
     ref_out = torch.zeros_like(out)
 
     def op():
-        deep_gemm.fp8_gemm_nt(a, b, out, c=out if case.accumulate else None, recipe=(1, 1, 32))
+        deep_gemm.fp8_gemm_nt(a, b, out, c=out if case.accumulate else None,
+                              recipe_a=(1, case.gran_k_a), recipe_b=(1, case.gran_k_b))
 
     def pytorch():
         if case.accumulate:
@@ -207,7 +226,7 @@ def main(argv=None):
     if args.list_shapes:
         for case in cases:
             print(f'{case.suite:8} {case.m:6} {case.n:6} {case.k:6} '
-                  f'{case.dtype:4} acc={int(case.accumulate)} layout={case.layout}')
+                  f'{case.dtype:4} acc={int(case.accumulate)} layout={case.layout} sf={case.gran_k_a}/{case.gran_k_b}')
         return 0
 
     import torch
@@ -245,7 +264,8 @@ def main(argv=None):
                 print(f'Case {index}: {type(exc).__name__}', flush=True)
             results.append(row)
             prefix = (f'[{index:3}/{len(cases)}] {case.suite:8} '
-                      f'({case.m},{case.n},{case.k}) {case.dtype} acc={int(case.accumulate)} {case.layout}')
+                      f'({case.m},{case.n},{case.k}) {case.dtype} acc={int(case.accumulate)} {case.layout} '
+                      f'sf={case.gran_k_a}/{case.gran_k_b}')
             if row['status'] == 'ok':
                 absolute = '' if args.relative_only else (
                     f' DG={row["deepgemm_us"]:.2f} us / {row["deepgemm_tflops"]:.2f} TFLOPS'
