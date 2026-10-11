@@ -15,9 +15,9 @@ The packaged headers are organized by responsibility:
 | `fp8_gemm_mfma_16x16x128.cuh` | 16×16×128 scaled MFMA, direct global-to-LDS DMA, and interleaved instruction scheduling; data-parallel, persistent, and split-K execution |
 | `epilogue.cuh` | Output stores, accumulation, and boundary handling |
 | `split_k_reduce.cuh` | Deterministic reduction of split-K partials |
-| `tile_scheduler.cuh` | Output-tile ordering for the production execution modes |
+| `tile_scheduler.cuh` | Output-tile ordering for the execution modes, and the mapping of tiles onto the groups (and K ranges) of grouped GEMMs |
 | `device_common.h` | Vector types, numeric conversions, and memory primitives |
-| `gemm_args.h` | Argument layout shared by the host and generated device code |
+| `gemm_args.h` | Argument layout and grouped GEMM types shared by the host and generated device code |
 
 The MFMA dimensions describe one instruction, not the workgroup tile. The
 current production implementation uses 256×256 output tiles and three execution
@@ -26,8 +26,8 @@ overhead and available parallelism; split counts are normalized so every
 workgroup gets a nonempty K range. Persistent mode additionally checks output
 alignment, row stride, dtype and accumulation.
 
-The generated wrapper specializes the execution mode, output dtype, both operand
-layouts, and both scale granularities. All these choices appear in the in-process
+The generated wrapper specializes the execution mode, grouped GEMM type, output dtype,
+both operand layouts, and both scale granularities. All these choices appear in the in-process
 JIT cache key. Kernels directly consume K-major or MN-major operands and packed
 32-/128-wide scale blocks. Each DMA constructs a bounded descriptor with a
 64-bit base, so tensors can span more than 4 GiB. MN-major fragments use

@@ -8,7 +8,47 @@ The supported operation is
 D = alpha * (A @ B.T) + C
 ```
 
-`A` and `B` contain OCP FP8 E4M3 values. Their scale tensors use UE8M0 values with 32 or 128 elements per K block. `recipe_a=(1, 32)` and `recipe_b=(1, 32)` are the direct MXFP8 form; 128-element and mixed A/B recipes are read directly by the kernel. Scales can be passed as float32 tensors or as the packed int32 layout returned by `transform_sf_into_required_layout`. `D` and `C` can be BF16 or FP32. Dense GEMMs and the `nn`/`tn`/`tt` aliases are supported; grouped GEMMs and custom epilogues are not part of this backend.
+`A` and `B` contain OCP FP8 E4M3 values. Their scale tensors use UE8M0 values with 32 or 128 elements per K block. `recipe_a=(1, 32)` and `recipe_b=(1, 32)` are the direct MXFP8 form; 128-element and mixed A/B recipes are read directly by the kernel. Scales can be passed as float32 tensors or as the packed int32 layout returned by `transform_sf_into_required_layout`. `D` and `C` can be BF16 or FP32. Dense GEMMs, the `nn`/`tn`/`tt` aliases and the grouped GEMMs below are supported; custom epilogues are not part of this backend.
+
+## Grouped GEMMs
+
+The grouped entry points keep the CUDA signatures and layouts:
+
+| API | Operands | Groups |
+| --- | --- | --- |
+| `m_grouped_fp8_gemm_nt_contiguous` | A `[M, K]`, B `[G, N, K]` (K- or MN-major), D `[M, N]` BF16 | `grouped_layout[m]` is the group of row m (-1 for padding), or with `use_psum_layout=True` `grouped_layout[g]` is the end row of group g |
+| `m_grouped_fp8_gemm_nn_contiguous` | B passed as `[G, K, N]` | as above |
+| `m_grouped_fp8_gemm_nt_masked` | A `[G, max_m, K]`, B `[G, N, K]`, D `[G, max_m, N]` BF16 | rows below `masked_m[g]`; other rows of D are not written |
+| `k_grouped_fp8_gemm_tn_contiguous` | A `[sum_k, M]`, B `[sum_k, N]`, D `[G, M, N]` BF16/FP32, optional C | `grouped_layout[g]` is the padded K of group g, or with the PSUM layout its end K |
+| `k_grouped_fp8_gemm_nt_contiguous` | per-group K-major `[M, k_g]` / `[N, k_g]` blocks stored back to back | padded K per group |
+
+Group starts of contiguous layouts are multiples of `get_mk_alignment_for_contiguous_layout()`.
+The kernels use 256-row output tiles, so m-grouped layouts need an alignment that is a multiple
+of 256 (the default and `get_theoretical_mk_alignment_for_contiguous_layout()`); other values
+raise an error. K-grouped layouts take any multiple of 128. With the PSUM layout and
+`ensure_zero_padding=True` (the default) the last tile of a group is stored whole, so zero A
+padding rows produce zero D padding rows. K-grouped groups with K = 0 write C (or zero), and a
+PSUM group whose K is not a multiple of 128 stops reading at its end.
+
+Scales follow the CUDA SM100 forms: FP32 UE8M0 values (B of m-grouped GEMMs typically as
+128x128 blocks) are packed per group; packed int32 scales are `[G, rows, words]` MN-major per
+group for m-grouped operands, and `[sum of per-group words, rows]` for K-grouped operands, where
+each group starts a new word.
+
+All grouped GEMMs run the same 256x256 MFMA pipeline as the dense GEMM. m-grouped GEMMs use the
+persistent kernel when K is a multiple of 128 and at least 256; the PSUM and masked layouts count
+and locate their tiles on the device, so no host synchronization is needed. K-grouped GEMMs run
+one data-parallel tile per workgroup with the K range of its group.
+
+```bash
+pytest -q tests/test_cdna4_grouped_fp8_gemm.py                  # reduced shapes
+DG_TEST_FULL=1 pytest -q tests/test_cdna4_grouped_fp8_gemm.py   # shapes of tests/test_fp8_fp4.py
+python tests/bench_cdna4_grouped_fp8.py --csv results/cdna4-grouped.csv
+```
+
+The benchmark times kernels with the profiler on the shapes of `tests/test_fp8_fp4.py` and, for
+contiguous layouts, the dense FP8 GEMM on the same total problem. On the contiguous shapes the
+grouped kernel reaches 0.93-1.02x of the dense kernel's speed.
 
 The production kernels were refreshed from the current tutorial implementation
 on 2026-10-06. Inputs remain in their native K-major or MN-major storage. Physical

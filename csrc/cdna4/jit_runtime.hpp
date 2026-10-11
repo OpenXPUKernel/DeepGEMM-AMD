@@ -48,14 +48,15 @@ public:
         return static_cast<size_t>(config.split_k) * static_cast<size_t>(m) * row;
     }
 
+    // tiles: output tiles of the launch (normal GEMMs: 0, derived from the shape). Persistent
+    // kernels take at most one workgroup per compute unit.
     int launch(GemmArgs& args, const KernelConfig& config, const int out_dtype,
-               hipStream_t stream, const int num_cus) {
+               hipStream_t stream, const int num_cus, int tiles = 0) {
         const auto jit = get_module(config, out_dtype);
-        const int tile_m = config.block_m;
-        const int tile_n = config.block_n;
-        const int tiles_m = ceil_div(args.M, tile_m);
-        const int tiles_n = ceil_div(args.N, tile_n);
-        const int tiles = tiles_m * tiles_n;
+        if (tiles == 0)
+            tiles = ceil_div(args.M, config.block_m) * ceil_div(args.N, config.block_n);
+        if (tiles == 0)
+            return 0;
         unsigned int grid = tiles;
         unsigned int block = 256;
         unsigned int shared = shared_bytes(config);
@@ -63,6 +64,8 @@ public:
             grid = std::min(tiles, std::max(num_cus, 1));
         else if (config.variant == KernelVariant::mfma_16x16x128_split_k)
             grid = tiles * std::max(config.split_k, 1);
+        else if (config.type == GemmType::MGroupedContiguousPsum || config.type == GemmType::MGroupedMasked)
+            grid = std::min(tiles, std::max(num_cus, 1));
 
         void* params[] = {&args};
         auto error = hipModuleLaunchKernel(jit->gemm, grid, 1, 1, block, 1, 1, shared, stream, params, nullptr);
@@ -103,6 +106,18 @@ private:
         return 2 * stage + epilogue;
     }
 
+    static const char* type_name(const GemmType type) {
+        switch (type) {
+        case GemmType::Normal: return "Normal";
+        case GemmType::MGroupedContiguous: return "MGroupedContiguous";
+        case GemmType::MGroupedContiguousPsum: return "MGroupedContiguousPsum";
+        case GemmType::MGroupedMasked: return "MGroupedMasked";
+        case GemmType::KGroupedContiguous: return "KGroupedContiguous";
+        case GemmType::KGroupedContiguousPsum: return "KGroupedContiguousPsum";
+        }
+        return "unknown";
+    }
+
     std::string source_for(const KernelConfig& config, const int out_dtype) const {
         const char* output = out_dtype == MXFP8_OUT_FP32 ? "float" : "std::uint16_t";
         const char* mode = config.variant == KernelVariant::mfma_16x16x128_persistent ? "Persistent" :
@@ -115,8 +130,8 @@ private:
                   "__attribute__((amdgpu_flat_work_group_size(256,256), amdgpu_waves_per_eu(1,1))) "
                   "void dg_cdna4_gemm(GemmArgs p) { "
                   "fp8_gemm_mfma_16x16x128_impl<Mfma16x16x128GemmConfig<Mfma16x16x128GemmMode::"
-               << mode << "," << config.mn_major << "," << config.scale_gran_128 << ">,"
-               << output << ">(p); }\n";
+               << mode << "," << config.mn_major << "," << config.scale_gran_128
+               << ",GemmType::" << type_name(config.type) << ">," << output << ">(p); }\n";
         if (config.variant == KernelVariant::mfma_16x16x128_split_k)
             source << "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_reduce(GemmArgs p) {"
                    << " splitk_reduce_impl<" << output << ">(p); }\n";
@@ -128,7 +143,8 @@ private:
         const auto [device, arch] = device_arch();
         const std::string key = std::to_string(device) + ":" + arch + ":" +
                                 variant_name(config.variant) + ":" + std::to_string(out_dtype) + ":" +
-                                std::to_string(config.mn_major) + ":" + std::to_string(config.scale_gran_128);
+                                std::to_string(config.mn_major) + ":" + std::to_string(config.scale_gran_128) +
+                                ":" + type_name(config.type);
         auto found = modules_.find(key);
         if (found != modules_.end())
             return found->second;

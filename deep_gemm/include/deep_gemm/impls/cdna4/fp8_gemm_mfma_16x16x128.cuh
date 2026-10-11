@@ -20,12 +20,22 @@ enum class Mfma16x16x128GemmMode { DataParallel, Persistent, SplitK };
 
 // The masks use bit 0 for A and bit 1 for B. MN_MAJOR selects transposing
 // operand reads; SF_GRAN_128 selects one packed scale code per 128 K values.
-template <Mfma16x16x128GemmMode Mode, int MN_MAJOR = 0, int SF_GRAN_128 = 0>
+// TYPE maps tiles onto the groups of grouped GEMMs (tile_scheduler.cuh).
+template <Mfma16x16x128GemmMode Mode, int MN_MAJOR = 0, int SF_GRAN_128 = 0,
+          GemmType TYPE = GemmType::Normal>
 struct Mfma16x16x128GemmConfig {
   static constexpr int BM = 256, BN = 256, BK = 128, NW = 4, NT = 256;
   static constexpr int GROUP_M = 8;
   static constexpr bool PERSISTENT = Mode == Mfma16x16x128GemmMode::Persistent;
   static constexpr bool SPLIT_K = Mode == Mfma16x16x128GemmMode::SplitK;
+  static constexpr GemmType kType = TYPE;
+  using Scheduler = TileScheduler<TYPE, BM, BN, GROUP_M>;
+  static constexpr bool K_GROUPED = Scheduler::K_GROUPED;
+  static constexpr bool MASKED = Scheduler::MASKED;
+  // m-grouped GEMMs index B and its scales by group
+  static constexpr bool B_GROUPED = TYPE == GemmType::MGroupedContiguous ||
+                                    TYPE == GemmType::MGroupedContiguousPsum || MASKED;
+  static_assert(!SPLIT_K || TYPE == GemmType::Normal, "split-K only for normal GEMMs");
   static constexpr bool A_MN_MAJOR = MN_MAJOR & 1, B_MN_MAJOR = MN_MAJOR & 2;
   static constexpr int SFA_SHIFT = SF_GRAN_128 & 1 ? 2 : 0;
   static constexpr int SFB_SHIFT = SF_GRAN_128 & 2 ? 2 : 0;
@@ -168,44 +178,29 @@ template <class Cfg, class OutT>
 __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
 #if defined(__HIP_DEVICE_COMPILE__)
   constexpr int BM = Cfg::BM, BN = Cfg::BN, BK = Cfg::BK, NW = Cfg::NW;
+  using Scheduler = typename Cfg::Scheduler;
+  using Src = GroupTile;
   extern __shared__ __attribute__((aligned(1024))) uint8_t smem[];
 
   const int tid = threadIdx.x, lane = tid % 64, g = lane / 16, r16 = lane % 16;
   const int wave = __builtin_amdgcn_readfirstlane(tid / 64);
   const int wm = wave / 2, wn = wave % 2;
-  const int tiles_m = (p.M + BM - 1) / BM, tiles_n = (p.N + BN - 1) / BN, tiles = tiles_m * tiles_n;
-  const int KT = (p.K + BK - 1) / BK;
+  // ---- K range of the current tile. A K-grouped GEMM takes it from the tile's group; its K-major
+  // operands are [M, kg] / [N, kg] blocks, whose row strides are kg.
+  int K = p.K, lda = p.lda, ldb = p.ldb;
+  int KT = (K + BK - 1) / BK;
+  KGroup kgrp{0, p.K, 0};
   // ---- work of this workgroup: ntiles output tiles with logical ids lid0, lid0 + gridDim.x, ...
   // (PERSISTENT; otherwise one tile and one K split), each over K tiles kb .. kb + nkt - 1
-  int lid0, ntiles = 1, split = 0, kb = 0, nkt = KT, full = 0, rest = 0;
-  if constexpr (Cfg::PERSISTENT) {
-    lid0 = xcd_remap(blockIdx.x, gridDim.x);
-    full = tiles / gridDim.x;
-    rest = tiles - full * gridDim.x;
-    ntiles = full + (blockIdx.x < rest);
-  } else {
-    const int splits = Cfg::SPLIT_K ? p.splits : 1;
-    const int uid = xcd_remap(blockIdx.x, tiles * splits);
-    const int kps = (KT + splits - 1) / splits;
-    split = uid / tiles;
-    lid0 = uid - split * tiles;
-    kb = split * kps;
-    nkt = min(KT - kb, kps);
-  }
-  auto tile_origin_id = [&](int lid, int &m0, int &n0) { // logical tile id -> origin
-    int tm, tn;
-    tile_coords<Cfg::GROUP_M>(lid, tiles_m, tiles_n, tm, tn);
-    m0 = tm * BM;
-    n0 = tn * BN;
-  };
+  int lid0 = 0, ntiles = 1, split = 0, kb = 0, nkt = KT, full = 0, rest = 0;
   // Spread the partial last round across the participating workgroups.
   auto lid_of = [&](int t) {
     return Cfg::PERSISTENT && t == full ? full * (int)gridDim.x + xcd_remap(blockIdx.x, rest)
                                         : lid0 + t * (int)gridDim.x;
   };
-  auto tile_origin = [&](int t, int &m0, int &n0) { tile_origin_id(lid_of(t), m0, n0); };
+  auto src_of = [&](int t) { return Scheduler::tile(p, lid_of(t)); };
   // a partial last K tile is processed first (not with PERSISTENT)
-  const bool tail = !Cfg::PERSISTENT && p.K % BK != 0 && kb + nkt == KT;
+  bool tail = false;
   auto ktile = [&](int t) { return tail ? (t == 0 ? KT - 1 : kb + t - 1) : kb + t; };
 
   // ---- Global -> LDS. Load i covers K_ROWS K-major rows starting at
@@ -223,18 +218,39 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   // works per dword from the base: the last row ends at align(K, 4), which a row stride that is a
   // multiple of 4 always contains. Past the last row these are 1-3 bytes beyond the matrix, which
   // stay in the aligned dword of its last byte because the host API requires a 4-byte aligned base.
-  const uint32_t k4 = (uint32_t)(p.K + 3) & ~3u;
-  const uint8_t *const a_end = p.A + (Cfg::A_MN_MAJOR ? (size_t)(p.K - 1) * p.lda + ((p.M + 3) & ~3)
-                                                      : (size_t)(p.M - 1) * p.lda + k4);
-  const uint8_t *const b_end = p.B + (Cfg::B_MN_MAJOR ? (size_t)(p.K - 1) * p.ldb + ((p.N + 3) & ~3)
-                                                      : (size_t)(p.N - 1) * p.ldb + k4);
-  // scale words: one per K tile, or (128-wide scale blocks, shift 2) one per 4 K tiles
-  const int sa_words = (KT + (1 << Cfg::SFA_SHIFT) - 1) >> Cfg::SFA_SHIFT;
-  const int sb_words = (KT + (1 << Cfg::SFB_SHIFT) - 1) >> Cfg::SFB_SHIFT;
-  const uint8_t *const sa_end =
-      (const uint8_t *)p.sfa + ((size_t)(sa_words - 1) * p.lda_sf + p.M) * 4;
-  const uint8_t *const sb_end =
-      (const uint8_t *)p.sfb + ((size_t)(sb_words - 1) * p.ldb_sf + p.N) * 4;
+  // Grouped operands: the matrix is the tile's group (its base from *_group below), and the
+  // extents are the bytes from a group's base to the end of its data.
+  static_assert(NW == 4, "the keys of the rows of load i must not depend on i");
+  constexpr int k_rows = Cfg::K_ROWS, k_lanes = Cfg::K_LANES, mn_lanes = Cfg::MN_LANES,
+                load_bytes = Cfg::DMA_BYTES;
+  const uint32_t mn_voff_row = (uint32_t)(Cfg::mn_row(wave) + lane / mn_lanes);
+  const uint32_t mn_voff_chunk =
+      (uint32_t)((lane % mn_lanes) ^ Cfg::keyMN((int)mn_voff_row)) * load_bytes;
+  const uint32_t k_row = (uint32_t)(k_rows * wave + lane / k_lanes);
+  const uint32_t s_voff = (Cfg::WAVE_SIZE * wave + lane) * Cfg::SCALE_BYTES;
+  uint32_t a_voff, b_voff, a_step, b_step;
+  int64_t a_extent, b_extent, sa_extent, sb_extent;
+  auto set_geometry = [&] {
+    KT = (K + BK - 1) / BK;
+    const int64_t k4 = (K + 3) & ~3;
+    a_extent = Cfg::A_MN_MAJOR ? (int64_t)(K - 1) * lda + ((p.M + 3) & ~3)
+                               : (int64_t)(p.M - 1) * lda + k4;
+    b_extent = Cfg::B_MN_MAJOR ? (int64_t)(K - 1) * ldb + ((p.N + 3) & ~3)
+                               : (int64_t)(p.N - 1) * ldb + k4;
+    // scale words: one per K tile, or (128-wide scale blocks, shift 2) one per 4 K tiles
+    const int sa_words = (KT + (1 << Cfg::SFA_SHIFT) - 1) >> Cfg::SFA_SHIFT;
+    const int sb_words = (KT + (1 << Cfg::SFB_SHIFT) - 1) >> Cfg::SFB_SHIFT;
+    sa_extent = ((int64_t)(sa_words - 1) * p.lda_sf + p.M) * 4;
+    sb_extent = ((int64_t)(sb_words - 1) * p.ldb_sf + p.N) * 4;
+    a_voff = Cfg::A_MN_MAJOR
+                 ? mn_voff_row * lda + mn_voff_chunk
+                 : k_row * lda + ((lane % k_lanes) ^ Cfg::key((int)k_row)) * load_bytes;
+    b_voff = Cfg::B_MN_MAJOR
+                 ? mn_voff_row * ldb + mn_voff_chunk
+                 : k_row * ldb + ((lane % k_lanes) ^ Cfg::keyB((int)k_row)) * load_bytes;
+    a_step = k_rows * NW * lda;
+    b_step = k_rows * NW * ldb;
+  };
   // size = min(end - base, 2^32 - 1) from the high word. 64-bit compares are VALU only, and the
   // compiler turns hi != 0 back into one unless hi is opaque.
   auto rsrc_at = [&](const uint8_t *base, const uint8_t *end) {
@@ -243,32 +259,43 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
     asm("" : "+s"(hi));
     return make_rsrc(base, hi ? 0xffffffffu : (uint32_t)n);
   };
-  static_assert(NW == 4, "the keys of the rows of load i must not depend on i");
-  constexpr int k_rows = Cfg::K_ROWS, k_lanes = Cfg::K_LANES, mn_lanes = Cfg::MN_LANES,
-                load_bytes = Cfg::DMA_BYTES;
-  const uint32_t mn_voff_row = (uint32_t)(Cfg::mn_row(wave) + lane / mn_lanes);
-  const uint32_t mn_voff_chunk =
-      (uint32_t)((lane % mn_lanes) ^ Cfg::keyMN((int)mn_voff_row)) * load_bytes;
-  const uint32_t k_row = (uint32_t)(k_rows * wave + lane / k_lanes);
-  const uint32_t a_voff =
-      Cfg::A_MN_MAJOR ? mn_voff_row * p.lda + mn_voff_chunk
-                      : k_row * p.lda + ((lane % k_lanes) ^ Cfg::key((int)k_row)) * load_bytes;
-  const uint32_t b_voff =
-      Cfg::B_MN_MAJOR ? mn_voff_row * p.ldb + mn_voff_chunk
-                      : k_row * p.ldb + ((lane % k_lanes) ^ Cfg::keyB((int)k_row)) * load_bytes;
-  const uint32_t a_step = k_rows * NW * p.lda, b_step = k_rows * NW * p.ldb;
-  const uint32_t s_voff = (Cfg::WAVE_SIZE * wave + lane) * Cfg::SCALE_BYTES;
+  // Group bases of A, B and their packed scales
+  auto a_group = [&](const Src &s) -> const uint8_t * {
+    if constexpr (Cfg::MASKED)
+      return p.A + (size_t)s.group * p.a_group_stride;
+    else if constexpr (Cfg::K_GROUPED)
+      return p.A + (size_t)kgrp.k0 * (Cfg::A_MN_MAJOR ? lda : p.M);
+    else
+      return p.A;
+  };
+  auto b_group = [&](const Src &s) -> const uint8_t * {
+    if constexpr (Cfg::B_GROUPED)
+      return p.B + (size_t)s.group * p.b_group_stride;
+    else if constexpr (Cfg::K_GROUPED)
+      return p.B + (size_t)kgrp.k0 * (Cfg::B_MN_MAJOR ? ldb : p.N);
+    else
+      return p.B;
+  };
+  auto sa_group = [&](const Src &s) -> const uint8_t * {
+    const uint8_t *base = (const uint8_t *)p.sfa;
+    if constexpr (Cfg::MASKED)
+      return base + (size_t)s.group * p.sfa_group_stride * 4;
+    else if constexpr (Cfg::K_GROUPED)
+      return base + (size_t)kgrp.w0 * p.lda_sf * 4;
+    else
+      return base;
+  };
+  auto sb_group = [&](const Src &s) -> const uint8_t * {
+    const uint8_t *base = (const uint8_t *)p.sfb;
+    if constexpr (Cfg::B_GROUPED)
+      return base + (size_t)s.group * p.sfb_group_stride * 4;
+    else if constexpr (Cfg::K_GROUPED)
+      return base + (size_t)kgrp.w0 * p.ldb_sf * 4;
+    else
+      return base;
+  };
   // a tile's origin. The DMA bases are built from it per K step: kept 64-bit for two tiles (the
   // current and the next), they cost the persistent kernel SGPR spills.
-  struct Src {
-    int m0, n0;
-  };
-  auto src_of_id = [&](int lid) {
-    Src s;
-    tile_origin_id(lid, s.m0, s.n0);
-    return s;
-  };
-  auto src_of = [&](int t) { return src_of_id(lid_of(t)); };
   // descriptor i (0: A, 1: B, 2, 3: their scales) of K tile kt (local index) of tile `ld`. Base:
   // the tile's first row (K-major) / column, plus K row kp BK (MN-major) or the scale word of kp.
   struct Rsrc {
@@ -277,19 +304,26 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   auto kp_of = [&](int kt) { return ktile(kt); };
   auto step_rsrc = [&](int i, const Src &ld, int kt) {
     const int kp = kp_of(kt);
-    if (i == 0)
-      return rsrc_at(
-          p.A + (Cfg::A_MN_MAJOR ? (size_t)(kp * BK) * p.lda + ld.m0 : (size_t)ld.m0 * p.lda),
-          a_end);
-    if (i == 1)
-      return rsrc_at(
-          p.B + (Cfg::B_MN_MAJOR ? (size_t)(kp * BK) * p.ldb + ld.n0 : (size_t)ld.n0 * p.ldb),
-          b_end);
-    if (i == 2)
-      return rsrc_at(
-          (const uint8_t *)p.sfa + ((size_t)(kp >> Cfg::SFA_SHIFT) * p.lda_sf + ld.m0) * 4, sa_end);
-    return rsrc_at((const uint8_t *)p.sfb + ((size_t)(kp >> Cfg::SFB_SHIFT) * p.ldb_sf + ld.n0) * 4,
-                   sb_end);
+    if (i == 0) {
+      const uint8_t *base = a_group(ld);
+      return rsrc_at(base + (Cfg::A_MN_MAJOR ? (size_t)(kp * BK) * lda + ld.m0
+                                             : (size_t)ld.m0 * lda),
+                     base + a_extent);
+    }
+    if (i == 1) {
+      const uint8_t *base = b_group(ld);
+      return rsrc_at(base + (Cfg::B_MN_MAJOR ? (size_t)(kp * BK) * ldb + ld.n0
+                                             : (size_t)ld.n0 * ldb),
+                     base + b_extent);
+    }
+    if (i == 2) {
+      const uint8_t *base = sa_group(ld);
+      return rsrc_at(base + ((size_t)(kp >> Cfg::SFA_SHIFT) * p.lda_sf + ld.m0) * 4,
+                     base + sa_extent);
+    }
+    const uint8_t *base = sb_group(ld);
+    return rsrc_at(base + ((size_t)(kp >> Cfg::SFB_SHIFT) * p.ldb_sf + ld.n0) * 4,
+                   base + sb_extent);
   };
   auto rsrc_of = [&](const Src &ld, int kt) {
     return Rsrc{
@@ -305,7 +339,7 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
       if constexpr (Cfg::A_MN_MAJOR)
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             rs.r[0], (lds_ptr_t)(st + Cfg::A_OFF + (Cfg::mn_row(wave) + Cfg::mn_jrow(j)) * Cfg::BM),
-            Cfg::DMA_BYTES, a_voff, __builtin_amdgcn_readfirstlane(Cfg::mn_jrow(j) * p.lda), 0, 0);
+            Cfg::DMA_BYTES, a_voff, __builtin_amdgcn_readfirstlane(Cfg::mn_jrow(j) * lda), 0, 0);
       else
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             rs.r[0], (lds_ptr_t)(st + Cfg::A_OFF + (j * NW + wave) * Cfg::K_WAVE_BYTES),
@@ -316,7 +350,7 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             rs.r[1],
             (lds_ptr_t)(st + Cfg::B_OFF + (Cfg::mn_row(wave) + Cfg::mn_jrow(jb)) * Cfg::BN),
-            Cfg::DMA_BYTES, b_voff, __builtin_amdgcn_readfirstlane(Cfg::mn_jrow(jb) * p.ldb), 0, 0);
+            Cfg::DMA_BYTES, b_voff, __builtin_amdgcn_readfirstlane(Cfg::mn_jrow(jb) * ldb), 0, 0);
       else
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             rs.r[1], (lds_ptr_t)(st + Cfg::B_OFF + (jb * NW + wave) * Cfg::K_WAVE_BYTES),
@@ -424,13 +458,6 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   };
 
   v4f acc[8][8];
-  if constexpr (!Cfg::PERSISTENT) {
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-#pragma unroll
-      for (int j = 0; j < 8; ++j)
-        acc[i][j] = v4f{};
-  }
 
   // MFMA of slot t. B goes into the MFMA's A slot, so acc[i][j][e] of lane l is
   //   D[wm*128 + 16 i + l % 16][wn*128 + bfrag(j) + brow(4 (l / 16) + e)]  (one row per lane).
@@ -453,7 +480,8 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
     constexpr bool LAST = decltype(last)::value, FIRST = decltype(first)::value;
     const uint32_t cur = (s & 1) * Cfg::STAGE_BYTES, nxt = Cfg::STAGE_BYTES - cur;
     const bool same = k + 2 < nkt;
-    const Src ld{same ? src.m0 : src_nx.m0, same ? src.n0 : src_nx.n0};
+    const Src ld{same ? src.m0 : src_nx.m0, same ? src.n0 : src_nx.n0,
+                 same ? src.group : src_nx.group, 0};
     const int kl = same ? k + 2 : k + 2 - nkt;
     // scale bytes of this step's K tile and of the next step's (the next tile's first: local 0)
     const ScaleByteOffsets scale_bytes_this_step = scale_byte_offsets(k);
@@ -492,15 +520,28 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
     });
   };
 
+  // Output group bases (D and C share their layout)
+  auto d_group = [&](const Src &s) -> uint8_t * {
+    if constexpr (Cfg::MASKED || Cfg::K_GROUPED)
+      return (uint8_t *)p.D + (size_t)s.group * p.d_group_stride * sizeof(OutT);
+    else
+      return (uint8_t *)p.D;
+  };
+  auto c_group = [&](const Src &s) -> const uint8_t * {
+    if (!p.C)
+      return nullptr;
+    if constexpr (Cfg::MASKED || Cfg::K_GROUPED)
+      return (const uint8_t *)p.C + (size_t)s.group * p.d_group_stride * sizeof(OutT);
+    else
+      return (const uint8_t *)p.C;
+  };
+
   // Persistent epilogue. Full tiles stage BF16 values through LDS for coalesced
   // stores; edge tiles use bounds-checked stores from each lane's accumulators.
   const bool vec_ok = (p.ldd * (int)sizeof(OutT)) % 16 == 0 && ((uintptr_t)p.D & 15) == 0 &&
-                      ((uintptr_t)p.C & 15) == 0;
+                      ((uintptr_t)p.C & 15) == 0 &&
+                      (p.d_group_stride * (int64_t)sizeof(OutT)) % 16 == 0;
   const bool fast_ok = !p.C && vec_ok;
-  const uint8_t *const d_end = (const uint8_t *)p.D + (size_t)p.M * p.ldd * sizeof(OutT);
-  auto rout_at = [&](int m0) {
-    return rsrc_at((const uint8_t *)p.D + (size_t)m0 * p.ldd * sizeof(OutT), d_end);
-  };
   // Persistent LDS epilogue: round i stages rows 16 i .. + 15 of both wave rows (32 rows x 256
   // columns); wave w then stores staging rows 8 w .. 8 w + 7, two per instruction (lane: row +
   // lane / 32, 16 B chunk lane % 32)
@@ -512,8 +553,10 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
       Cfg::EPI_OFF + (uint32_t)(8 * wave + lane / 32) * Cfg::EPI_PITCH + (lane % 32) * 16;
   const uint32_t epi_out =
       ((uint32_t)((wave / 2) * 128 + 8 * (wave % 2) + lane / 32) * p.ldd + (lane % 32) * 8) * 2;
-  auto store_tile_lds = [&](int m0, int n0, auto unit_alpha) {
-    const __amdgpu_buffer_rsrc_t rout = rout_at(m0);
+  auto store_tile_lds = [&](const Src &s, auto unit_alpha) {
+    uint8_t *const dg = d_group(s);
+    const __amdgpu_buffer_rsrc_t rout =
+        rsrc_at(dg + (size_t)s.m0 * p.ldd * sizeof(OutT), dg + (size_t)p.M * p.ldd * sizeof(OutT));
     static_for<0, 8>([&](auto I) {
       constexpr int i = decltype(I)::value;
       if constexpr (Cfg::PAIRED_B_FRAGMENTS) {
@@ -539,33 +582,33 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
       }
       asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
       static_for<0, 4>([&](auto S) {
-        constexpr int s = decltype(S)::value;
-        const v4u v = *(const v4u *)(smem + epi_rd + 2 * s * Cfg::EPI_PITCH);
-        const int soff = (int)(((uint32_t)(16 * i + 2 * s) * p.ldd + n0) * 2);
+        constexpr int ss = decltype(S)::value;
+        const v4u v = *(const v4u *)(smem + epi_rd + 2 * ss * Cfg::EPI_PITCH);
+        const int soff = (int)(((uint32_t)(16 * i + 2 * ss) * p.ldd + s.n0) * 2);
         buffer_store16(v, rout, epi_out, soff);
       });
       asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
     });
   };
-  auto store_persistent_tile = [&](int lid) { // logical tile id
-    int m0, n0;
-    tile_origin_id(lid, m0, n0);
-    if (fast_ok && m0 + BM <= p.M && n0 + BN <= p.N) {
+  auto store_persistent_tile = [&](const Src &s) {
+    if (fast_ok && s.m0 + BM <= s.m_end && s.n0 + BN <= p.N) {
       if constexpr (Cfg::PERSISTENT && std::is_same<OutT, uint16_t>::value) {
         if (p.alpha == 1.f)
-          store_tile_lds(m0, n0, std::true_type{});
+          store_tile_lds(s, std::true_type{});
         else
-          store_tile_lds(m0, n0, std::false_type{});
+          store_tile_lds(s, std::false_type{});
         return;
       }
     }
+    void *const dg = d_group(s);
+    const void *const cg = c_group(s);
     if constexpr (Cfg::PAIRED_B_FRAGMENTS) {
 #pragma unroll
       for (int i = 0; i < 8; ++i)
 #pragma unroll
         for (int pp = 0; pp < 4; ++pp) {
-          store8<OutT>(p.D, p.C, p.ldd, p.M, p.N, m0 + (wm * 128 + 16 * i + r16),
-                       n0 + wn * 128 + 32 * pp + 8 * g, acc[i][2 * pp] * p.alpha,
+          store8<OutT>(dg, cg, p.ldd, s.m_end, p.N, s.m0 + (wm * 128 + 16 * i + r16),
+                       s.n0 + wn * 128 + 32 * pp + 8 * g, acc[i][2 * pp] * p.alpha,
                        acc[i][2 * pp + 1] * p.alpha, vec_ok);
           // keeps the scheduler from hoisting all 256 accumulator reads (the registers are full)
           __builtin_amdgcn_sched_barrier(0);
@@ -575,28 +618,13 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
       for (int i = 0; i < 8; ++i)
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-          store4<OutT>(p.D, p.C, p.ldd, p.M, p.N, m0 + (wm * 128 + 16 * i + r16),
-                       n0 + wn * 128 + 16 * j + 4 * g, acc[i][j] * p.alpha, vec_ok);
+          store4<OutT>(dg, cg, p.ldd, s.m_end, p.N, s.m0 + (wm * 128 + 16 * i + r16),
+                       s.n0 + wn * 128 + 16 * j + 4 * g, acc[i][j] * p.alpha, vec_ok);
           __builtin_amdgcn_sched_barrier(0);
         }
     }
   };
 
-  // ---- prologue: steps 0 and 1 in flight, wait for step 0, read its A / B 0-3
-  Src src = src_of(0), src_nx = src_of(min(1, ntiles - 1));
-  {
-    const Rsrc rs0 = rsrc_of(src, 0), rs1 = rsrc_of(nkt > 1 ? src : src_nx, nkt > 1 ? 1 : 0);
-#pragma unroll
-    for (int j = 0; j < Cfg::DMA_PER_TILE; ++j)
-      dma(j, 0, rs0, 0);
-#pragma unroll
-    for (int j = 0; j < Cfg::DMA_PER_TILE; ++j)
-      dma(j, Cfg::STAGE_BYTES, rs1, nkt > 1 ? 1 : 0);
-  }
-  __builtin_amdgcn_s_waitcnt(waitcnt_vm(Cfg::DMA_PER_TILE));
-  asm volatile("s_barrier" ::: "memory");
-  if (tail)
-    clear_k_overhang<Cfg>(smem, tid, p.K, KT, Cfg::SFA_SHIFT == 0, Cfg::SFB_SHIFT == 0);
   // Fragments 0-3 of the first K step of a tile. Every other step gets them from the step before
   // (after its barrier 2); the prologue has no step before, and the last step of a tile skips them
   // so that they are not live across the epilogue.
@@ -605,11 +633,38 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
     static_for<0, Cfg::READS_PER_FRAGMENT_GROUP>(
         [&](auto I) { read_fragments_0_to_3(decltype(I)::value, stage_offset, scale_bytes); });
   };
-  read_first_step_fragments_0_to_3(0);
+  // ---- prologue: steps 0 and 1 in flight, wait for step 0, read its A / B 0-3
+  auto prologue = [&](const Src &src, const Src &src_nx) {
+    {
+      const Rsrc rs0 = rsrc_of(src, 0), rs1 = rsrc_of(nkt > 1 ? src : src_nx, nkt > 1 ? 1 : 0);
+#pragma unroll
+      for (int j = 0; j < Cfg::DMA_PER_TILE; ++j)
+        dma(j, 0, rs0, 0);
+#pragma unroll
+      for (int j = 0; j < Cfg::DMA_PER_TILE; ++j)
+        dma(j, Cfg::STAGE_BYTES, rs1, nkt > 1 ? 1 : 0);
+    }
+    __builtin_amdgcn_s_waitcnt(waitcnt_vm(Cfg::DMA_PER_TILE));
+    asm volatile("s_barrier" ::: "memory");
+    if (tail)
+      clear_k_overhang<Cfg>(smem, tid, K, KT, Cfg::SFA_SHIFT == 0, Cfg::SFB_SHIFT == 0);
+    read_first_step_fragments_0_to_3(0);
+  };
   constexpr std::false_type not_last{}, not_first{};
   constexpr std::true_type last{}, first{};
 
   if constexpr (Cfg::PERSISTENT) { // nkt >= 2: steps s + 2 are at most one tile ahead
+    set_geometry();
+    nkt = KT;
+    const int tiles = Scheduler::num_tiles(p);
+    lid0 = xcd_remap(blockIdx.x, gridDim.x);
+    full = tiles / gridDim.x;
+    rest = tiles - full * gridDim.x;
+    ntiles = full + (blockIdx.x < rest);
+    if (ntiles == 0)
+      return;
+    Src src = src_of(0), src_nx = src_of(min(1, ntiles - 1));
+    prologue(src, src_nx);
     int s = 0;
     for (int t = 0; t < ntiles; ++t) {
       if (t > 0) {
@@ -620,54 +675,99 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
       for (int k = 1; k < nkt - 1; ++k, ++s)
         iter(s, k, src, src_nx, not_last, not_first);
       iter(s++, nkt - 1, src, src_nx, last, not_first);
-      store_persistent_tile(lid_of(t));
+      store_persistent_tile(src);
       if (t + 1 < ntiles)
         read_first_step_fragments_0_to_3((s & 1) * Cfg::STAGE_BYTES);
     }
     return;
   }
 
-  // MN-major: the last step stays in the loop (its 24 reads of the next step are wasted). As a
-  // separate copy it gets its own register assignment, and the allocator moves accumulators between
-  // AGPRs and VGPRs around the MFMAs there, which corrupted a few outputs.
-  if constexpr (Cfg::A_MN_MAJOR || Cfg::B_MN_MAJOR) {
-    for (int s = 0; s < nkt; ++s)
-      iter(s, s, src, src, not_last, not_first);
-  } else {
-    for (int s = 0; s < nkt - 1; ++s)
-      iter(s, s, src, src, not_last, not_first);
-    iter(nkt - 1, nkt - 1, src, src, last, not_first);
-  }
-  asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)\n\ts_barrier" ::: "memory");
-
-  // ---- Data-parallel and split-K epilogue. Stage 32 rows (fragments 2q and
-  // 2q + 1) through each wave's LDS strip, then store sixteen bytes per lane.
-  int m0, n0;
-  tile_origin(0, m0, n0);
-  using OutE = typename std::conditional<Cfg::SPLIT_K, float, OutT>::type;
-  void *const out = Cfg::SPLIT_K ? (void *)(p.ws + (size_t)split * p.M * p.ldw) : p.D;
-  const void *const cin = Cfg::SPLIT_K ? nullptr : p.C;
-  const int ldo = Cfg::SPLIT_K ? p.ldw : p.ldd;
-  const float alpha = Cfg::SPLIT_K ? 1.f : p.alpha;
-  float *stg = (float *)(smem + wave * Cfg::EPI_WAVE_BYTES);
-  const int er = lane / 16, ec = (lane % 16) * 8;
-  const bool vec_ok_e = (ldo * (int)sizeof(OutE)) % 16 == 0 && ((uintptr_t)out & 15) == 0 &&
-                        (!cin || ((uintptr_t)cin & 15) == 0);
+  // ---- Data-parallel and split-K: one tile (and K split) at a time
+  auto run_tile = [&](const Src &src) {
+    if constexpr (Cfg::K_GROUPED) {
+      kgrp = Scheduler::k_group(p, src.group, 128 << Cfg::SFA_SHIFT);
+      K = kgrp.kg;
+      if constexpr (!Cfg::A_MN_MAJOR)
+        lda = K;
+      if constexpr (!Cfg::B_MN_MAJOR)
+        ldb = K;
+      set_geometry();
+      kb = 0;
+      nkt = KT;
+    }
+    tail = K % BK != 0 && kb + nkt == KT;
 #pragma unroll
-  for (int q = 0; q < 4; ++q) {
-#pragma unroll
-    for (int ii = 0; ii < 2; ++ii)
+    for (int i = 0; i < 8; ++i)
 #pragma unroll
       for (int j = 0; j < 8; ++j)
-        *(v4f *)(stg + (16 * ii + r16) * Cfg::EPI_LD + 16 * j + 4 * g) = acc[2 * q + ii][j] * alpha;
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-      const int r = er + 4 * k;
-      const v4f lo = *(const v4f *)(stg + r * Cfg::EPI_LD + ec),
-                hi = *(const v4f *)(stg + r * Cfg::EPI_LD + ec + 4);
-      store8<OutE>(out, cin, ldo, p.M, p.N, m0 + wm * 128 + 32 * q + r, n0 + wn * 128 + ec, lo, hi,
-                   vec_ok_e);
+        acc[i][j] = v4f{};
+    if (nkt > 0) {
+      prologue(src, src);
+      // MN-major: the last step stays in the loop (its 24 reads of the next step are wasted). As a
+      // separate copy it gets its own register assignment, and the allocator moves accumulators
+      // between AGPRs and VGPRs around the MFMAs there, which corrupted a few outputs.
+      if constexpr (Cfg::A_MN_MAJOR || Cfg::B_MN_MAJOR) {
+        for (int s = 0; s < nkt; ++s)
+          iter(s, s, src, src, not_last, not_first);
+      } else {
+        for (int s = 0; s < nkt - 1; ++s)
+          iter(s, s, src, src, not_last, not_first);
+        iter(nkt - 1, nkt - 1, src, src, last, not_first);
+      }
+      asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)\n\ts_barrier" ::: "memory");
     }
+
+    // Stage 32 rows (fragments 2q and 2q + 1) through each wave's LDS strip, then store sixteen
+    // bytes per lane.
+    using OutE = typename std::conditional<Cfg::SPLIT_K, float, OutT>::type;
+    void *const out = Cfg::SPLIT_K ? (void *)(p.ws + (size_t)split * p.M * p.ldw) : d_group(src);
+    const void *const cin = Cfg::SPLIT_K ? nullptr : c_group(src);
+    const int ldo = Cfg::SPLIT_K ? p.ldw : p.ldd;
+    const float alpha = Cfg::SPLIT_K ? 1.f : p.alpha;
+    float *stg = (float *)(smem + wave * Cfg::EPI_WAVE_BYTES);
+    const int er = lane / 16, ec = (lane % 16) * 8;
+    const bool vec_ok_e = (ldo * (int)sizeof(OutE)) % 16 == 0 && ((uintptr_t)out & 15) == 0 &&
+                          (!cin || ((uintptr_t)cin & 15) == 0);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+#pragma unroll
+      for (int ii = 0; ii < 2; ++ii)
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          *(v4f *)(stg + (16 * ii + r16) * Cfg::EPI_LD + 16 * j + 4 * g) =
+              acc[2 * q + ii][j] * alpha;
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        const int r = er + 4 * k;
+        const v4f lo = *(const v4f *)(stg + r * Cfg::EPI_LD + ec),
+                  hi = *(const v4f *)(stg + r * Cfg::EPI_LD + ec + 4);
+        store8<OutE>(out, cin, ldo, src.m_end, p.N, src.m0 + wm * 128 + 32 * q + r,
+                     src.n0 + wn * 128 + ec, lo, hi, vec_ok_e);
+      }
+    }
+  };
+
+  if constexpr (!Cfg::K_GROUPED)
+    set_geometry();
+  if constexpr (Scheduler::DYNAMIC) {
+    // device-side tile count: walk it in rounds of the grid
+    const int tiles = Scheduler::num_tiles(p);
+    const int first_lid = xcd_remap(blockIdx.x, gridDim.x);
+    for (int lid = first_lid; lid < tiles; lid += gridDim.x) {
+      nkt = KT;
+      run_tile(Scheduler::tile(p, lid));
+      asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+    }
+  } else {
+    const int tiles = Scheduler::num_tiles(p);
+    const int splits = Cfg::SPLIT_K ? p.splits : 1;
+    const int uid = xcd_remap(blockIdx.x, tiles * splits);
+    const int kps = (KT + splits - 1) / splits;
+    split = uid / tiles;
+    lid0 = uid - split * tiles;
+    kb = split * kps;
+    nkt = min(KT - kb, kps);
+    run_tile(Scheduler::tile(p, lid0));
   }
 #endif
 }
