@@ -23,11 +23,12 @@ The grouped entry points keep the CUDA signatures and layouts:
 | `k_grouped_fp8_gemm_nt_contiguous` | per-group K-major `[M, k_g]` / `[N, k_g]` blocks stored back to back | padded K per group |
 
 Group starts of contiguous layouts are multiples of `get_mk_alignment_for_contiguous_layout()`.
-The kernels use 256-row output tiles, so m-grouped layouts need an alignment that is a multiple
-of 256 (the default and `get_theoretical_mk_alignment_for_contiguous_layout()`); other values
-raise an error. K-grouped layouts take any multiple of 128. With the PSUM layout and
-`ensure_zero_padding=True` (the default) the last tile of a group is stored whole, so zero A
-padding rows produce zero D padding rows. K-grouped groups with K = 0 write C (or zero), and a
+The default alignment, 256 (also `get_theoretical_mk_alignment_for_contiguous_layout()`), matches
+the 256-row tiles; other multiples of 16 (for example the CUDA default 128) run the small-M
+kernel's 16- to 64-row tiles. K-grouped layouts take any multiple of 128. With the PSUM layout
+and `ensure_zero_padding=True` (the default) the rows from a group's end to the next aligned row
+are stored as well: the 256-row tiles compute them from the zero A padding rows, the small-M
+kernel stores zeros without reading them. K-grouped groups with K = 0 write C (or zero), and a
 PSUM group whose K is not a multiple of 128 stops reading at its end.
 
 Scales follow the CUDA SM100 forms: FP32 UE8M0 values (B of m-grouped GEMMs typically as
@@ -35,10 +36,21 @@ Scales follow the CUDA SM100 forms: FP32 UE8M0 values (B of m-grouped GEMMs typi
 group for m-grouped operands, and `[sum of per-group words, rows]` for K-grouped operands, where
 each group starts a new word.
 
-All grouped GEMMs run the same 256x256 MFMA pipeline as the dense GEMM. m-grouped GEMMs use the
-persistent kernel when K is a multiple of 128 and at least 256; the PSUM and masked layouts count
-and locate their tiles on the device, so no host synchronization is needed. K-grouped GEMMs run
-one data-parallel tile per workgroup with the K range of its group.
+Grouped GEMMs run the 256x256 MFMA pipeline of the dense GEMM, or the small-M kernel below for
+few rows per group (`expected_m` of a masked layout, `expected_m_for_psum_layout` of a PSUM
+layout, at most 64). m-grouped GEMMs use the persistent kernel when K is a multiple of 128 and
+at least 256; the PSUM and masked layouts count and locate their tiles on the device, so no host
+synchronization is needed. K-grouped GEMMs run one data-parallel tile per workgroup with the K
+range of its group.
+
+## Small M
+
+GEMMs with up to 64 rows (32 for weights above 64 Mi elements) and K-major operands run
+`fp8_gemm_mfma_16x16x128_small_m.cuh`: streaming the weights bounds their time, so every wave
+loads its MFMA operands from global memory straight into a ring of registers, with no LDS and no
+barrier in the K loop. The four waves of a workgroup split K and add their tiles in LDS in a
+fixed order, which keeps results deterministic. Tiles are 16, 32 or 64 rows by 16 to 64 columns,
+chosen from the rows and the number of workgroups the columns provide.
 
 ```bash
 pytest -q tests/test_cdna4_grouped_fp8_gemm.py                  # reduced shapes

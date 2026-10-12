@@ -93,11 +93,25 @@ def test_m_grouped_contiguous_ragged_k_uses_data_parallel_path():
         assert calc_diff(d[valid], ref[valid]) < MAX_DIFF
 
 
+@pytest.mark.parametrize("alignment", [128, 64])
+@pytest.mark.parametrize("use_psum_layout", [False, True])
+def test_m_grouped_contiguous_small_alignment(alignment, use_psum_layout):
+    # alignments the 256-row tiles do not divide run the small-M kernel's shorter tiles
+    deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+    m, a, b, layout, d, ref, valid = generate_m_grouped_contiguous(
+        5, 300, 1024, 1536, MajorTypeAB.KMajor, MajorTypeAB.KMajor, use_ue8m0=True,
+        use_psum_layout=use_psum_layout)
+    run = lambda: deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, d, layout, use_psum_layout=use_psum_layout)
+    run()
+    assert calc_diff(d[valid], ref[valid]) < MAX_DIFF
+    _repeat_equal(run, d, valid)
+
+
 def test_m_grouped_contiguous_rejects_unsupported_alignment():
     m, a, b, layout, d, _, _ = generate_m_grouped_contiguous(
         2, 256, 256, 256, MajorTypeAB.KMajor, MajorTypeAB.KMajor, use_ue8m0=True)
-    deep_gemm.set_mk_alignment_for_contiguous_layout(128)
-    with pytest.raises(RuntimeError, match="multiple of 256"):
+    deep_gemm.set_mk_alignment_for_contiguous_layout(8)
+    with pytest.raises(RuntimeError, match="must be a multiple of 16"):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, d, layout)
 
 
@@ -120,12 +134,20 @@ def test_m_grouped_masked(groups, max_m, expected_m, n, k, use_psum_layout):
     run()
     assert calc_diff(d[valid], ref[valid]) < MAX_DIFF
     _repeat_equal(run, d, valid)
+    if use_psum_layout:
+        # the padding rows of the PSUM groups (uninitialized A rows) are stored as zeros
+        alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+        for end in layout.tolist():
+            gap = d[end:align(end, alignment)]
+            if expected_m * 1.2 <= 64:
+                assert torch.equal(gap, torch.zeros_like(gap))
 
 
-def test_m_grouped_masked_leaves_rows_past_mask_untouched():
-    a, b, masked_m, d, ref, valid = generate_m_grouped_masked(4, 512, 100, 512, 512, use_ue8m0=True)
+@pytest.mark.parametrize("expected_m", [100, 20])
+def test_m_grouped_masked_leaves_rows_past_mask_untouched(expected_m):
+    a, b, masked_m, d, ref, valid = generate_m_grouped_masked(4, 512, expected_m, 512, 512, use_ue8m0=True)
     d.fill_(7)
-    deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, 128)
+    deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, int(expected_m * 1.2))
     assert bool((d[~valid] == 7).all())
     assert calc_diff(d[valid], ref[valid]) < MAX_DIFF
 

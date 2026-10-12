@@ -11,7 +11,7 @@ enum class GemmType : int {
   Normal = 0,
   // A [M, K], B [G, N, K]; grouped_layout[m] is the group of row m (-1: padding)
   MGroupedContiguous = 1,
-  // grouped_layout[g] is the end row of group g; group g starts at align(end[g - 1], BM)
+  // grouped_layout[g] is the end row of group g; group g starts at align(end[g - 1], m_alignment)
   MGroupedContiguousPsum = 2,
   // A [G, max_m, K], B [G, N, K], D [G, max_m, N]; grouped_layout[g] is the row count of group g
   MGroupedMasked = 3,
@@ -41,6 +41,11 @@ struct GemmArgs {
   const std::int32_t* grouped_layout;
   int num_groups;
   int k_alignment;
+  // row alignment of the group starts of a PSUM layout
+  int m_alignment;
+  // small-M kernel, masked and PSUM layouts: workgroups per group and column block, each taking
+  // every group_m_slots-th m tile of the group
+  int group_m_slots;
   int zero_padding;
   std::int64_t a_group_stride, b_group_stride;
   std::int64_t sfa_group_stride, sfb_group_stride;

@@ -49,6 +49,47 @@ __device__ __forceinline__ void store8(void *out, const void *C, int ldo, int M,
   }
 }
 
+// C[row][col .. col + 7] as FP32 (0 past M and N). Loading C ahead of a group of store8 calls keeps
+// the loads in flight together: C may alias the output, so the compiler cannot move a load past
+// an earlier store, and each accumulation would wait for its own load.
+template <class OutT>
+__device__ __forceinline__ void load_c8(const void *C, int ldo, int M, int N, int row, int col,
+                                        bool vec_ok, v4f &lo, v4f &hi) {
+  lo = hi = v4f{};
+  if (row >= M || col >= N)
+    return;
+  const size_t off = (size_t)row * ldo + col;
+  if (vec_ok && col + 8 <= N) {
+    if constexpr (std::is_same<OutT, uint16_t>::value) {
+      const v4i c = *(const v4i *)((const uint16_t *)C + off);
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        float c0, c1, c2, c3;
+        unpack_bf16x2(c[i], c0, c1);
+        unpack_bf16x2(c[2 + i], c2, c3);
+        lo[2 * i] = c0;
+        lo[2 * i + 1] = c1;
+        hi[2 * i] = c2;
+        hi[2 * i + 1] = c3;
+      }
+    } else {
+      lo = *(const v4f *)((const float *)C + off);
+      hi = *(const v4f *)((const float *)C + off + 4);
+    }
+  } else {
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      if (col + e >= N)
+        break;
+      const float v = load_out((const OutT *)C + off + e);
+      if (e < 4)
+        lo[e] = v;
+      else
+        hi[e - 4] = v;
+    }
+  }
+}
+
 // store8 for 4 consecutive outputs of a row (persistent kernel with an MN-major B)
 template <class OutT>
 __device__ __forceinline__ void store4(void *out, const void *C, int ldo, int M, int N, int row,

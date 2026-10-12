@@ -208,10 +208,28 @@ void launch_or_throw(GemmArgs& args, const deep_gemm::cdna4::KernelConfig& confi
 
 constexpr int kBlockMN = 256;
 
-void check_m_alignment(int alignment) {
-    TORCH_CHECK(alignment > 0 && alignment % kBlockMN == 0,
-                "CDNA4 grouped GEMMs use ", kBlockMN, "-row tiles: the M alignment of the contiguous layout must be "
-                "a multiple of ", kBlockMN, " (set_mk_alignment_for_contiguous_layout)");
+void check_m_alignment(int alignment, int block_m) {
+    TORCH_CHECK(alignment > 0 && alignment % block_m == 0,
+                "this CDNA4 grouped GEMM uses ", block_m, "-row tiles: the M alignment of the contiguous layout "
+                "must be a multiple of ", block_m, " (set_mk_alignment_for_contiguous_layout)");
+}
+
+// Small-M kernel for a grouped GEMM: tiles that fit `rows` rows, at most as tall as the alignment
+deep_gemm::cdna4::KernelConfig grouped_small_m_config(int rows, int n, int k, int alignment, int scale_gran_128,
+                                                      deep_gemm::cdna4::GemmType type, int groups) {
+    auto config = deep_gemm::cdna4::get_small_m_config(rows, n, k, scale_gran_128, type, groups);
+    while (config.block_m > 16 && alignment % config.block_m != 0)
+        config = deep_gemm::cdna4::get_small_m_config(config.block_m / 2, n, k, scale_gran_128, type, groups);
+    return config;
+}
+
+// Small-M kernel on a masked / PSUM layout: workgroups per group and column block, enough for the
+// expected rows (more rows loop inside the workgroups); returns the launch's workgroups
+int set_group_m_slots(GemmArgs& args, const deep_gemm::cdna4::KernelConfig& config, int expected_rows,
+                      int max_rows, int groups, int n) {
+    args.group_m_slots = std::clamp(ceil_div(std::max(expected_rows, 1), config.block_m), 1,
+                                    std::max(1, ceil_div(max_rows, config.block_m)));
+    return groups * args.group_m_slots * ceil_div(n, config.block_n);
 }
 
 // D[M, N] = A[M, K] @ B[group(m), N, K]^T with per-row groups or PSUM group ends.
@@ -219,7 +237,7 @@ void cdna4_m_grouped_fp8_gemm_contiguous(const torch::Tensor& a, const torch::Te
                                          const torch::Tensor& b, const torch::Tensor& sfb,
                                          const torch::Tensor& d, const torch::Tensor& grouped_layout,
                                          int gran_k_a, int gran_k_b, bool use_psum_layout,
-                                         bool ensure_zero_padding, int m_alignment) {
+                                         bool ensure_zero_padding, int m_alignment, int expected_m) {
     const auto device = d.device();
     check_tensor(d, device, "d");
     check_tensor(a, device, "a");
@@ -231,7 +249,7 @@ void cdna4_m_grouped_fp8_gemm_contiguous(const torch::Tensor& a, const torch::Te
     TORCH_CHECK(d.scalar_type() == torch::kBFloat16, "m-grouped GEMMs write BF16 outputs");
     TORCH_CHECK(n <= 1 || d.stride(1) == 1, "d must be N-major");
     check_grouped_layout(grouped_layout, use_psum_layout ? groups : m, device);
-    check_m_alignment(m_alignment);
+    TORCH_CHECK(m_alignment > 0, "the M alignment must be positive");
     const c10::hip::HIPGuard device_guard(d.get_device());
     if (m == 0 || n == 0)
         return;
@@ -244,16 +262,27 @@ void cdna4_m_grouped_fp8_gemm_contiguous(const torch::Tensor& a, const torch::Te
     const int ldd = m > 1 ? stride_as_int(d, 0, "d") : n;
     const auto type = use_psum_layout ? deep_gemm::cdna4::GemmType::MGroupedContiguousPsum
                                       : deep_gemm::cdna4::GemmType::MGroupedContiguous;
-    const auto config = deep_gemm::cdna4::get_m_grouped_config(
-        type, k, ldd, reinterpret_cast<uintptr_t>(d.data_ptr()) % 16 == 0,
-        int(rhs.mn_major) << 1, int(gran_k_a == 128) | (int(gran_k_b == 128) << 1));
+    const int sf_gran = int(gran_k_a == 128) | (int(gran_k_b == 128) << 1);
+    // Small groups (a PSUM layout with few expected rows), or an alignment the 256-row tiles do not
+    // divide, take the small-M kernel; it needs K-major B.
+    const bool small_m = !rhs.mn_major && ((use_psum_layout && deep_gemm::cdna4::small_m_eligible(expected_m, n, k, 0)) ||
+                                           m_alignment % kBlockMN != 0);
+    const auto config = small_m
+        ? grouped_small_m_config(expected_m > 0 ? expected_m : 64, n, k, m_alignment, sf_gran, type, groups)
+        : deep_gemm::cdna4::get_m_grouped_config(type, k, ldd, reinterpret_cast<uintptr_t>(d.data_ptr()) % 16 == 0,
+                                                 int(rhs.mn_major) << 1, sf_gran);
+    check_m_alignment(m_alignment, config.block_m);
     GemmArgs args = make_args(a, sfa, b, sfb, d, nullptr, m, n, k, lhs.ld, rhs.ld, lda_sf, ldb_sf, ldd);
     args.grouped_layout = grouped_layout.data_ptr<std::int32_t>();
     args.num_groups = groups;
+    args.m_alignment = m_alignment;
     args.zero_padding = ensure_zero_padding;
     args.b_group_stride = rhs.group_stride;
     args.sfb_group_stride = sfb_group_stride;
-    launch_or_throw(args, config, MXFP8_OUT_BF16, d, ceil_div(m, kBlockMN) * ceil_div(n, kBlockMN));
+    int tiles = ceil_div(m, config.block_m) * ceil_div(n, config.block_n);
+    if (small_m && use_psum_layout)
+        tiles = set_group_m_slots(args, config, expected_m > 0 ? expected_m : m / groups, m, groups, n);
+    launch_or_throw(args, config, MXFP8_OUT_BF16, d, tiles);
 }
 
 // D[g, :masked_m[g]] = A[g, :masked_m[g]] @ B[g]^T
@@ -284,10 +313,13 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor& a, const torch::Tensor
     const auto [lda_sf, sfa_group_stride] = grouped_scale_stride(sfa, groups, max_m, k, gran_k_a, "sfa");
     const auto [ldb_sf, sfb_group_stride] = grouped_scale_stride(sfb, groups, n, k, gran_k_b, "sfb");
     const int ldd = max_m > 1 ? stride_as_int(d, 1, "d") : n;
-    const auto config = deep_gemm::cdna4::get_m_grouped_config(
-        deep_gemm::cdna4::GemmType::MGroupedMasked, k, ldd,
-        reinterpret_cast<uintptr_t>(d.data_ptr()) % 16 == 0 && (d.stride(0) * 2) % 16 == 0, 0,
-        int(gran_k_a == 128) | (int(gran_k_b == 128) << 1));
+    const int sf_gran = int(gran_k_a == 128) | (int(gran_k_b == 128) << 1);
+    const auto config = deep_gemm::cdna4::small_m_eligible(expected_m, n, k, 0)
+        ? deep_gemm::cdna4::get_small_m_config(expected_m, n, k, sf_gran, deep_gemm::cdna4::GemmType::MGroupedMasked,
+                                               groups)
+        : deep_gemm::cdna4::get_m_grouped_config(
+              deep_gemm::cdna4::GemmType::MGroupedMasked, k, ldd,
+              reinterpret_cast<uintptr_t>(d.data_ptr()) % 16 == 0 && (d.stride(0) * 2) % 16 == 0, 0, sf_gran);
     GemmArgs args = make_args(a, sfa, b, sfb, d, nullptr, max_m, n, k, lhs.ld, rhs.ld, lda_sf, ldb_sf, ldd);
     args.grouped_layout = masked_m.data_ptr<std::int32_t>();
     args.num_groups = groups;
@@ -296,7 +328,10 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor& a, const torch::Tensor
     args.sfa_group_stride = sfa_group_stride;
     args.sfb_group_stride = sfb_group_stride;
     args.d_group_stride = d.stride(0);
-    launch_or_throw(args, config, MXFP8_OUT_BF16, d, groups * ceil_div(max_m, kBlockMN) * ceil_div(n, kBlockMN));
+    const int tiles = config.variant == deep_gemm::cdna4::KernelVariant::mfma_16x16x128_small_m
+        ? set_group_m_slots(args, config, expected_m, max_m, groups, n)
+        : groups * ceil_div(max_m, config.block_m) * ceil_div(n, config.block_n);
+    launch_or_throw(args, config, MXFP8_OUT_BF16, d, tiles);
 }
 
 // D[g] (+)= A_g^T B_g over the K range of group g. MN-major (TN): A [sum_k, M], B [sum_k, N].
@@ -383,7 +418,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("cdna4_m_grouped_fp8_gemm_contiguous", &cdna4_m_grouped_fp8_gemm_contiguous,
           py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("gran_k_a"), py::arg("gran_k_b"), py::arg("use_psum_layout"), py::arg("ensure_zero_padding"),
-          py::arg("m_alignment"));
+          py::arg("m_alignment"), py::arg("expected_m") = 0);
     m.def("cdna4_m_grouped_fp8_gemm_masked", &cdna4_m_grouped_fp8_gemm_masked,
           py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("gran_k_a"), py::arg("gran_k_b"));

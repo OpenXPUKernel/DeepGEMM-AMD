@@ -58,13 +58,15 @@ public:
         if (tiles == 0)
             return 0;
         unsigned int grid = tiles;
-        unsigned int block = 256;
+        unsigned int block = config.variant == KernelVariant::mfma_16x16x128_small_m ? 64 * config.waves : 256;
         unsigned int shared = shared_bytes(config);
         if (config.variant == KernelVariant::mfma_16x16x128_persistent)
             grid = std::min(tiles, std::max(num_cus, 1));
         else if (config.variant == KernelVariant::mfma_16x16x128_split_k)
             grid = tiles * std::max(config.split_k, 1);
-        else if (config.type == GemmType::MGroupedContiguousPsum || config.type == GemmType::MGroupedMasked)
+        else if (config.variant != KernelVariant::mfma_16x16x128_small_m &&
+                 (config.type == GemmType::MGroupedContiguousPsum || config.type == GemmType::MGroupedMasked))
+            // device-counted tiles: one round of resident workgroups walks them
             grid = std::min(tiles, std::max(num_cus, 1));
 
         void* params[] = {&args};
@@ -94,11 +96,14 @@ private:
         case KernelVariant::mfma_16x16x128_data_parallel: return "mfma_16x16x128_data_parallel";
         case KernelVariant::mfma_16x16x128_persistent: return "mfma_16x16x128_persistent";
         case KernelVariant::mfma_16x16x128_split_k: return "mfma_16x16x128_split_k";
+        case KernelVariant::mfma_16x16x128_small_m: return "mfma_16x16x128_small_m";
         }
         return "unknown";
     }
 
     static unsigned int shared_bytes(const KernelConfig& config) {
+        if (config.variant == KernelVariant::mfma_16x16x128_small_m) // a tile per wave, padded rows
+            return config.waves * config.block_m * (config.block_n + 4) * sizeof(float);
         // MFMA 16x16x128 pipeline: two operand stages, plus the persistent BF16 epilogue buffer.
         const unsigned int stage = 256 * 128 + 256 * 128 + 256 * 4 + 256 * 4;
         const unsigned int epilogue = config.variant == KernelVariant::mfma_16x16x128_persistent
@@ -120,6 +125,18 @@ private:
 
     std::string source_for(const KernelConfig& config, const int out_dtype) const {
         const char* output = out_dtype == MXFP8_OUT_FP32 ? "float" : "std::uint16_t";
+        if (config.variant == KernelVariant::mfma_16x16x128_small_m) {
+            std::ostringstream source;
+            const int threads = 64 * config.waves;
+            source << "#include <deep_gemm/impls/cdna4/fp8_gemm_mfma_16x16x128_small_m.cuh>\n"
+                   << "extern \"C\" __global__ __attribute__((amdgpu_flat_work_group_size(" << threads << ","
+                   << threads << "))) void dg_cdna4_gemm(GemmArgs p) { "
+                      "fp8_gemm_mfma_16x16x128_small_m_impl<Mfma16x16x128SmallMConfig<"
+                   << config.block_m / 16 << "," << config.block_n / 16 << "," << config.depth << ","
+                   << config.waves << "," << config.scale_gran_128 << ",GemmType::" << type_name(config.type) << ","
+                   << (config.k_tail ? "true" : "false") << ">," << output << ">(p); }\n";
+            return source.str();
+        }
         const char* mode = config.variant == KernelVariant::mfma_16x16x128_persistent ? "Persistent" :
                            config.variant == KernelVariant::mfma_16x16x128_split_k ? "SplitK" : "DataParallel";
         std::ostringstream source;
@@ -144,7 +161,9 @@ private:
         const std::string key = std::to_string(device) + ":" + arch + ":" +
                                 variant_name(config.variant) + ":" + std::to_string(out_dtype) + ":" +
                                 std::to_string(config.mn_major) + ":" + std::to_string(config.scale_gran_128) +
-                                ":" + type_name(config.type);
+                                ":" + type_name(config.type) + ":" + std::to_string(config.block_m) + "x" +
+                                std::to_string(config.block_n) + ":" + std::to_string(config.depth) + ":" +
+                                std::to_string(config.waves) + (config.k_tail ? ":tail" : "");
         auto found = modules_.find(key);
         if (found != modules_.end())
             return found->second;

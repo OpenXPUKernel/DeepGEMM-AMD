@@ -3,6 +3,7 @@
 #include "gemm_args.h"
 #include <cstdint>
 #include <hip/hip_runtime.h>
+#include <type_traits>
 using deep_gemm::cdna4::GemmArgs;
 
 typedef int v2i __attribute__((ext_vector_type(2)));
@@ -81,6 +82,16 @@ __device__ __forceinline__ void buffer_store16(v4u v, __amdgpu_buffer_rsrc_t r, 
 }
 
 #endif
+
+// f(integral_constant<int, I>) for I = B .. E - 1: a compile-time unrolled loop. The MFMA slots
+// of a K step are too many for `#pragma unroll` to be reliable, and a rolled loop would put the
+// register arrays in scratch.
+template <int B, int E, class F> __device__ __forceinline__ void static_for(F &&f) {
+  if constexpr (B < E) {
+    f(std::integral_constant<int, B>{});
+    static_for<B + 1, E>(f);
+  }
+}
 
 // Join the two halves of a scaled MFMA operand.
 __device__ __forceinline__ v8i cat8(const v4i &lo, const v4i &hi) {

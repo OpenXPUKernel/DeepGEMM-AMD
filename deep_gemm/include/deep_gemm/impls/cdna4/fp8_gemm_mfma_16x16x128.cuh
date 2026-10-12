@@ -6,16 +6,6 @@
 #include "tile_scheduler.cuh"
 #include <type_traits>
 
-// f(integral_constant<int, I>) for I = B .. E - 1: a compile-time unrolled loop. The 64 MFMA slots
-// of an iteration are too big for `#pragma unroll` to be reliable, and a rolled loop would put the
-// register arrays in scratch.
-template <int B, int E, class F> __device__ __forceinline__ void static_for(F &&f) {
-  if constexpr (B < E) {
-    f(std::integral_constant<int, B>{});
-    static_for<B + 1, E>(f);
-  }
-}
-
 enum class Mfma16x16x128GemmMode { DataParallel, Persistent, SplitK };
 
 // The masks use bit 0 for A and bit 1 for B. MN_MAJOR selects transposing
@@ -730,6 +720,14 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
                           (!cin || ((uintptr_t)cin & 15) == 0);
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
+      // the round's C is loaded first; staging the accumulators overlaps the loads
+      v4f c_lo[8], c_hi[8];
+      if (cin) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+          load_c8<OutE>(cin, ldo, src.m_end, p.N, src.m0 + wm * 128 + 32 * q + er + 4 * k,
+                        src.n0 + wn * 128 + ec, vec_ok_e, c_lo[k], c_hi[k]);
+      }
 #pragma unroll
       for (int ii = 0; ii < 2; ++ii)
 #pragma unroll
@@ -739,9 +737,13 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
         const int r = er + 4 * k;
-        const v4f lo = *(const v4f *)(stg + r * Cfg::EPI_LD + ec),
-                  hi = *(const v4f *)(stg + r * Cfg::EPI_LD + ec + 4);
-        store8<OutE>(out, cin, ldo, src.m_end, p.N, src.m0 + wm * 128 + 32 * q + r,
+        v4f lo = *(const v4f *)(stg + r * Cfg::EPI_LD + ec),
+            hi = *(const v4f *)(stg + r * Cfg::EPI_LD + ec + 4);
+        if (cin) {
+          lo += c_lo[k];
+          hi += c_hi[k];
+        }
+        store8<OutE>(out, nullptr, ldo, src.m_end, p.N, src.m0 + wm * 128 + 32 * q + r,
                      src.n0 + wn * 128 + ec, lo, hi, vec_ok_e);
       }
     }

@@ -449,7 +449,8 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous(
         sfa, sfb, m, n, k, recipe, recipe_a, recipe_b, None, num_groups, disable_ue8m0_cast)
     _backend().cdna4_m_grouped_fp8_gemm_contiguous(
         a_fp8, sfa, b_fp8, sfb, d, grouped_layout, gran_k_a, gran_k_b, use_psum_layout,
-        ensure_zero_padding, get_mk_alignment_for_contiguous_layout())
+        ensure_zero_padding, get_mk_alignment_for_contiguous_layout(),
+        int(expected_m_for_psum_layout or 0))
 
 
 def m_grouped_fp8_fp4_gemm_nn_contiguous(

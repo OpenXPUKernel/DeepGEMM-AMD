@@ -47,9 +47,10 @@ __device__ __forceinline__ int wave_sum(int v) {
 }
 
 // A tile of the output: origin rows m0 .. m0 + BM - 1 (within group g's rows for masked GEMMs, of
-// D otherwise) and columns n0 .. n0 + BN - 1. Rows >= m_end are not stored. group < 0: no tile.
+// D otherwise) and columns n0 .. n0 + BN - 1. Rows >= m_end are not stored; rows m_data ..
+// m_end - 1 are the zero padding of a PSUM group. group < 0: no tile.
 struct GroupTile {
-  int m0, n0, group, m_end;
+  int m0, n0, group, m_end, m_data;
 };
 
 // K range of group g of a K-grouped GEMM: K values k0 .. k0 + kg - 1 of A and B, and scale words
@@ -90,14 +91,21 @@ template <GemmType TYPE, int BM, int BN, int GROUP_M> struct TileScheduler {
   // Tile counts are only known on the device; a tile lookup walks the group table.
   static constexpr bool DYNAMIC = PSUM || MASKED;
 
+  // PSUM group g: rows start .. end - 1 hold data; with zero padding the rows up to the next
+  // aligned row are stored too
+  __device__ static int psum_start(const GemmArgs &p, int g) {
+    return g ? align_up(p.grouped_layout[g - 1], p.m_alignment) : 0;
+  }
+  __device__ static int psum_stored_end(const GemmArgs &p, int g) {
+    const int end = p.grouped_layout[g];
+    return p.zero_padding ? min(p.M, align_up(end, p.m_alignment)) : end;
+  }
   // m-tiles of group g (masked / psum)
   __device__ static int group_tiles_m(const GemmArgs &p, int g) {
     if constexpr (MASKED)
       return (p.grouped_layout[g] + BM - 1) / BM;
-    else {
-      const int start = g ? align_up(p.grouped_layout[g - 1], BM) : 0;
-      return max(0, (p.grouped_layout[g] - start + BM - 1) / BM);
-    }
+    else
+      return max(0, (psum_stored_end(p, g) - psum_start(p, g) + BM - 1) / BM);
   }
 
   __device__ static int num_tiles(const GemmArgs &p) {
@@ -117,7 +125,7 @@ template <GemmType TYPE, int BM, int BN, int GROUP_M> struct TileScheduler {
 
   __device__ static GroupTile tile(const GemmArgs &p, int lid) {
     const int tiles_m = (p.M + BM - 1) / BM, tiles_n = (p.N + BN - 1) / BN;
-    GroupTile t{0, 0, 0, p.M};
+    GroupTile t{0, 0, 0, p.M, p.M};
     int tm, tn;
     if constexpr (DYNAMIC) {
       int before;
@@ -131,13 +139,11 @@ template <GemmType TYPE, int BM, int BN, int GROUP_M> struct TileScheduler {
       tile_coords<GROUP_M>(lid - before, group_tiles_m(p, t.group), tiles_n, tm, tn);
       t.m0 = tm * BM;
       if constexpr (MASKED) {
-        t.m_end = p.grouped_layout[t.group];
+        t.m_end = t.m_data = p.grouped_layout[t.group];
       } else {
-        const int start = t.group ? align_up(p.grouped_layout[t.group - 1], BM) : 0;
-        t.m0 += start;
-        // With zero padding the whole last tile is stored: its rows past the group end come from
-        // zero A rows.
-        t.m_end = p.zero_padding ? p.M : p.grouped_layout[t.group];
+        t.m0 += psum_start(p, t.group);
+        t.m_end = psum_stored_end(p, t.group);
+        t.m_data = p.grouped_layout[t.group];
       }
     } else if constexpr (K_GROUPED) {
       const int per_group = tiles_m * tiles_n;

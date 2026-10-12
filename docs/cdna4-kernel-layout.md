@@ -13,6 +13,7 @@ The packaged headers are organized by responsibility:
 | Header | Responsibility |
 | --- | --- |
 | `fp8_gemm_mfma_16x16x128.cuh` | 16×16×128 scaled MFMA, direct global-to-LDS DMA, and interleaved instruction scheduling; data-parallel, persistent, and split-K execution |
+| `fp8_gemm_mfma_16x16x128_small_m.cuh` | Small-M GEMMs: operands streamed from global memory into registers, K split across the waves of a workgroup; dense and m-grouped |
 | `epilogue.cuh` | Output stores, accumulation, and boundary handling |
 | `split_k_reduce.cuh` | Deterministic reduction of split-K partials |
 | `tile_scheduler.cuh` | Output-tile ordering for the execution modes, and the mapping of tiles onto the groups (and K ranges) of grouped GEMMs |

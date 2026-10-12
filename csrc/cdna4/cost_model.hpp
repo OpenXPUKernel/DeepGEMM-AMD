@@ -3,6 +3,9 @@
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 
 #include "deep_gemm/impls/cdna4/gemm_args.h"
 
@@ -15,6 +18,8 @@ enum class KernelVariant {
     mfma_16x16x128_data_parallel,
     mfma_16x16x128_persistent,
     mfma_16x16x128_split_k,
+    // B streamed into registers per wave (fp8_gemm_mfma_16x16x128_small_m.cuh)
+    mfma_16x16x128_small_m,
 };
 
 struct KernelConfig {
@@ -27,6 +32,11 @@ struct KernelConfig {
     int mn_major = 0;
     int scale_gran_128 = 0;
     GemmType type = GemmType::Normal;
+    // Small-M kernel: K steps in flight per wave, waves per workgroup, and whether K has a
+    // partial last step
+    int depth = 0;
+    int waves = 4;
+    bool k_tail = false;
 };
 
 inline int ceil_div(const int x, const int y) { return x / y + (x % y != 0); }
@@ -64,10 +74,55 @@ inline bool persistent_eligible(const int k, const int out_dtype, const bool has
            d_aligned16 && ldd % 8 == 0 && ldd < (1 << 23);
 }
 
+// Small-M kernel: tile rows 16 FM >= rows (the rows of a GEMM, or the expected rows of a group),
+// 16 NF columns per workgroup and four waves splitting K. Wider column blocks cut the A reads per B
+// byte (up to NF = max(FM, 2)) while at least 192 workgroups remain for the compute units.
+// "DG_CDNA4_SMALL_M=NF,DEPTH,WAVES" overrides the plan (0 keeps a value), "off" disables the kernel.
+inline KernelConfig get_small_m_config(const int rows, const int n, const int k, const int scale_gran_128,
+                                       const GemmType type = GemmType::Normal, const int groups = 1) {
+    KernelConfig config{KernelVariant::mfma_16x16x128_small_m};
+    config.type = type;
+    config.scale_gran_128 = scale_gran_128;
+    const int fm = rows <= 16 ? 1 : rows <= 32 ? 2 : rows <= 64 ? 4 : 8;
+    int nf = 1;
+    for (int c = std::max(fm, 2); c > 1 && nf == 1; c /= 2)
+        if (c <= 4 && int64_t(groups) * ceil_div(n, 16 * c) >= 192)
+            nf = c;
+    int depth = nf >= 4 ? 2 : 3, waves = 4;
+    if (const char* env = std::getenv("DG_CDNA4_SMALL_M")) {
+        int e_nf = 0, e_depth = 0, e_waves = 0;
+        if (std::sscanf(env, "%d,%d,%d", &e_nf, &e_depth, &e_waves) >= 1) {
+            nf = e_nf > 0 ? e_nf : nf;
+            depth = e_depth > 0 ? e_depth : depth;
+            waves = e_waves > 0 ? e_waves : waves;
+        }
+    }
+    config.block_m = 16 * fm;
+    config.block_n = 16 * nf;
+    config.depth = depth;
+    config.waves = waves;
+    config.k_tail = k % 128 != 0;
+    return config;
+}
+
+// Rows up to 32 always stream B faster than the 256x256 tiles; up to 64 rows, the larger weight
+// matrices still go to the 256x256 tiles (their A reads per B byte grow with the rows).
+inline bool small_m_eligible(const int rows, const int n, const int k, const int mn_major) {
+    int max_rows = int64_t(n) * k > (int64_t(64) << 20) ? 32 : 64;
+    if (const char* env = std::getenv("DG_CDNA4_SMALL_M")) {
+        if (std::string(env) == "off")
+            return false;
+        max_rows = 128; // an explicit configuration covers 8 A fragments too
+    }
+    return mn_major == 0 && rows > 0 && rows <= max_rows;
+}
+
 inline KernelConfig get_best_config(const int m, const int n, const int k,
                                     const int out_dtype, const bool has_c,
                                     const int ldd, const bool d_aligned16,
                                     const int mn_major = 0, const int scale_gran_128 = 0) {
+    if (small_m_eligible(m, n, k, mn_major))
+        return get_small_m_config(m, n, k, scale_gran_128);
     KernelConfig config{KernelVariant::mfma_16x16x128_data_parallel};
     config.mn_major = mn_major;
     config.scale_gran_128 = scale_gran_128;
