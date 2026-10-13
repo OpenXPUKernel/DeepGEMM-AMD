@@ -39,8 +39,10 @@ struct Mfma16x16x128GemmConfig {
   // m-grouped GEMMs index B and its scales by group
   static constexpr bool B_GROUPED = TYPE == GemmType::MGroupedContiguous ||
                                     TYPE == GemmType::MGroupedContiguousPsum || MASKED;
-  static_assert(!SPLIT_K || TYPE == GemmType::Normal, "split-K only for normal GEMMs");
+  static constexpr bool K_BATCHED = TYPE == GemmType::KBatched;
+  static_assert(!SPLIT_K || TYPE == GemmType::Normal || K_BATCHED, "split-K only for normal GEMMs");
   static constexpr bool A_MN_MAJOR = MN_MAJOR & 1, B_MN_MAJOR = MN_MAJOR & 2;
+  static_assert(!K_BATCHED || (MN_MAJOR == 0 && BF16), "K-batched GEMMs take K-major BF16 operands");
   static constexpr int SFA_SHIFT = SF_GRAN_128 & 1 ? 2 : 0;
   static constexpr int SFB_SHIFT = SF_GRAN_128 & 2 ? 2 : 0;
   // Paired B fragments give each lane eight adjacent output columns. A
@@ -290,10 +292,12 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   int64_t a_extent, b_extent, sa_extent, sb_extent;
   auto set_geometry = [&] {
     KT = (K + BK - 1) / BK;
+    // (a K-batched row holds the K of one batch)
+    const int row_k = Cfg::K_BATCHED ? p.k_batch_tiles * BK : K;
     a_extent = Cfg::A_MN_MAJOR ? (int64_t)(K - 1) * lda + ((Cfg::a_bytes(p.M) + 3) & ~3)
-                               : (int64_t)(p.M - 1) * lda + ((Cfg::a_bytes(K) + 3) & ~3);
+                               : (int64_t)(p.M - 1) * lda + ((Cfg::a_bytes(row_k) + 3) & ~3);
     b_extent = Cfg::B_MN_MAJOR ? (int64_t)(K - 1) * ldb + ((Cfg::b_bytes(p.N) + 3) & ~3)
-                               : (int64_t)(p.N - 1) * ldb + ((Cfg::b_bytes(K) + 3) & ~3);
+                               : (int64_t)(p.N - 1) * ldb + ((Cfg::b_bytes(row_k) + 3) & ~3);
     // scale words: one per K tile, or (128-wide scale blocks, shift 2) one per 4 K tiles
     const int sa_words = (KT + (1 << Cfg::SFA_SHIFT) - 1) >> Cfg::SFA_SHIFT;
     const int sb_words = (KT + (1 << Cfg::SFB_SHIFT) - 1) >> Cfg::SFB_SHIFT;
@@ -363,16 +367,19 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
     __amdgpu_buffer_rsrc_t r[4];
   };
   auto kp_of = [&](int kt) { return ktile(kt); };
+  // K-batched: the batch of K tile kp, and the tile within it
+  auto batch_of = [&](int kp) { return Cfg::K_BATCHED ? kp / p.k_batch_tiles : 0; };
+  auto tile_in_batch = [&](int kp) { return Cfg::K_BATCHED ? kp - batch_of(kp) * p.k_batch_tiles : kp; };
   auto step_rsrc = [&](int i, const Src &ld, int kt) {
     const int kp = kp_of(kt);
     if (i == 0) {
-      const uint8_t *base = a_group(ld);
+      const uint8_t *base = a_group(ld) + (size_t)batch_of(kp) * (Cfg::K_BATCHED ? p.a_group_stride : 0);
       return rsrc_at(base + (Cfg::A_MN_MAJOR ? (size_t)(kp * BK) * lda + (size_t)Cfg::a_bytes(ld.m0)
                                              : (size_t)ld.m0 * lda),
                      base + a_extent);
     }
     if (i == 1) {
-      const uint8_t *base = b_group(ld);
+      const uint8_t *base = b_group(ld) + (size_t)batch_of(kp) * (Cfg::K_BATCHED ? p.b_group_stride : 0);
       return rsrc_at(base + (Cfg::B_MN_MAJOR ? (size_t)(kp * BK) * ldb + (size_t)Cfg::b_bytes(ld.n0)
                                              : (size_t)ld.n0 * ldb),
                      base + b_extent);
@@ -407,7 +414,7 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
       else
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             rs.r[0], (lds_ptr_t)(st + Cfg::A_OFF + (j * NW + wave) * Cfg::K_WAVE_BYTES),
-            Cfg::DMA_BYTES, a_voff, j * a_step + kp * Cfg::A_ROW, 0, 0);
+            Cfg::DMA_BYTES, a_voff, j * a_step + tile_in_batch(kp) * Cfg::A_ROW, 0, 0);
     } else if (j < Cfg::A_LOADS + Cfg::B_LOADS) {
       const int jb = j - Cfg::A_LOADS;
       if constexpr (Cfg::B_MN_MAJOR)
@@ -419,7 +426,7 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
       else
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             rs.r[1], (lds_ptr_t)(st + Cfg::B_OFF + (jb * NW + wave) * Cfg::K_WAVE_BYTES),
-            Cfg::DMA_BYTES, b_voff, jb * b_step + kp * Cfg::B_ROW, 0, 0);
+            Cfg::DMA_BYTES, b_voff, jb * b_step + tile_in_batch(kp) * Cfg::B_ROW, 0, 0);
     } else if (j == Cfg::A_LOADS + Cfg::B_LOADS)
       __builtin_amdgcn_raw_ptr_buffer_load_lds(
           rs.r[2], (lds_ptr_t)(st + Cfg::SA_OFF + wave * Cfg::SCALE_WAVE_BYTES), Cfg::SCALE_BYTES,

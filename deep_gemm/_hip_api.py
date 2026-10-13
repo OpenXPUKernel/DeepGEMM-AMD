@@ -41,7 +41,7 @@ __all__ = [
     "set_block_size_multiple_of", "set_pdl", "get_pdl", "use_deterministic_algorithms",
     "get_mqa_logits_metadata", "fp8_fp4_mqa_logits", "get_paged_mqa_logits_metadata", "fp8_fp4_paged_mqa_logits",
     "get_sparse_mqa_logits_metadata", "get_paged_sparse_mqa_logits_metadata", "fp8_fp4_sparse_mqa_logits",
-    "fp8_fp4_paged_sparse_mqa_logits",
+    "fp8_fp4_paged_sparse_mqa_logits", "einsum", "fp8_einsum",
 ]
 
 def _backend():
@@ -713,6 +713,71 @@ def k_grouped_fp4_gemm_nt_contiguous(
     if not (_is_fp4(a[0]) and _is_fp4(b[0]) and a[0].dim() == 2 and b[0].dim() == 2):
         raise TypeError("a and b must be 2-D packed FP4 (torch.int8) tensors")
     _k_grouped_gemm(a, b, d, ks_cpu, grouped_layout, c, tuple(recipe), use_psum_layout, epilogue, True)
+
+
+# ---- Einsum: the expressions of the CUDA backend as strided batched GEMMs (no copies)
+_full_rows_cache = {}
+
+
+def _full_rows(groups: int, rows: int, device) -> torch.Tensor:
+    """masked_m of a batched GEMM whose groups are full: cached, so that calls launch one kernel
+    (create it before graph capture)."""
+    key = (str(device), groups, rows)
+    if key not in _full_rows_cache:
+        _full_rows_cache[key] = torch.full((groups, ), rows, dtype=torch.int32, device=device)
+    return _full_rows_cache[key]
+
+
+def _batched_gemm(a, sfa, b, sfb, d, c, gran_k_a=0, gran_k_b=0):
+    """d[g] (+)= a[g] @ b[g]^T over [G, M, K] / [G, N, K] / [G, M, N] views."""
+    groups, rows = d.size(0), d.size(1)
+    _backend().cdna4_m_grouped_fp8_gemm_masked(a, sfa, b, sfb, d, _full_rows(groups, rows, d.device), max(rows, 1),
+                                               gran_k_a, gran_k_b, c=c, alpha=1.0)
+
+
+def _einsum_views(expr, a, b, d, c):
+    """(A [G, M, K], B [G, N, K], D [G, M, N], C) views of a batched expression"""
+    perm = lambda t, *dims: None if t is None else t.permute(*dims)
+    if expr == "bhr,hdr->bhd":
+        return a.permute(1, 0, 2), b, d.permute(1, 0, 2), perm(c, 1, 0, 2)
+    if expr == "bhd,hdr->bhr":
+        return a.permute(1, 0, 2), b.permute(0, 2, 1), d.permute(1, 0, 2), perm(c, 1, 0, 2)
+    if expr == "bhd,bhr->hdr":
+        return a.permute(1, 2, 0), b.permute(1, 2, 0), d, c
+    raise NotImplementedError(f"unsupported einsum expression: {expr}")
+
+
+def einsum(expr, a, b, d, c=None, epilogue=None) -> None:
+    """The BF16 einsum expressions of the CUDA backend: "bmk,bnk->mn" (D (+)= sum over b),
+    "bhr,hdr->bhd", "bhd,hdr->bhr" and "bhd,bhr->hdr"."""
+    if epilogue is not None:
+        raise NotImplementedError("custom epilogues are not supported by the CDNA4 backend")
+    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16 or d.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError("einsum takes BF16 a and b, and a BF16 or FP32 d")
+    if c is not None and c.dtype != d.dtype:
+        raise TypeError("c must have the dtype of d")
+    _check_same_device(d, a, b, *((c,) if c is not None else ()))
+    if expr == "bmk,bnk->mn":
+        _backend().cdna4_k_batched_gemm(a, b, d, c)
+        return
+    av, bv, dv, cv = _einsum_views(expr, a, b, d, c)
+    _batched_gemm(av, None, bv, None, dv, cv)
+
+
+def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128), epilogue=None) -> None:
+    """The FP8 einsum expressions of the CUDA backend ("bhr,hdr->bhd", "bhd,hdr->bhr" and
+    "bhd,bhr->hdr") with BF16 or FP32 outputs; a and b are (data, scales) pairs."""
+    if epilogue is not None or isinstance(d, (tuple, list)):
+        raise NotImplementedError("FP8 outputs and custom epilogues are not supported by the CDNA4 backend")
+    (a_fp8, sfa), (b_fp8, sfb) = a, b
+    _check_same_device(d, a_fp8, b_fp8, sfa, sfb, *((c,) if c is not None else ()))
+    av, bv, dv, cv = _einsum_views(expr, a_fp8, b_fp8, d, c)
+    # the scale tensors follow the permutation of their data
+    sfa_v, sfb_v, _, _ = _einsum_views(expr, sfa, sfb, d, None)
+    groups, m, k = av.size(0), av.size(1), av.size(2)
+    sfa_p, sfb_p, gran_k_a, gran_k_b = _transform_sf_pair(sfa_v, sfb_v, m, bv.size(1), k, tuple(recipe), None, None,
+                                                          groups, groups, False)
+    _batched_gemm(av, sfa_p, bv, sfb_p, dv, cv, gran_k_a, gran_k_b)
 
 
 # ---- Runtime configuration (CUDA API parity). The CDNA4 kernels size their grids from the compute

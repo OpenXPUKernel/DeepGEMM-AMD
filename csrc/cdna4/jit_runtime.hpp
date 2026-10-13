@@ -145,6 +145,7 @@ private:
         case GemmType::MGroupedMasked: return "MGroupedMasked";
         case GemmType::KGroupedContiguous: return "KGroupedContiguous";
         case GemmType::KGroupedContiguousPsum: return "KGroupedContiguousPsum";
+        case GemmType::KBatched: return "KBatched";
         }
         return "unknown";
     }

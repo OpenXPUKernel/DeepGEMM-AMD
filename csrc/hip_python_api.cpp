@@ -350,10 +350,14 @@ void cdna4_m_grouped_fp8_gemm_contiguous(const torch::Tensor& a, const OptTensor
 }
 
 // D[g, :masked_m[g]] = A[g, :masked_m[g]] @ B[g]^T
+// D[g, :masked_m[g]] (+)= alpha A[g, :masked_m[g]] @ B[g]^T: the masked layout, and (masked_m all
+// full) batched GEMMs over strided views. A / B are K- or MN-major within each group (MN-major
+// operands run the 256x256 tiles); D is N-major, C (if any) has D's strides.
 void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor& a, const OptTensor& sfa,
                                      const torch::Tensor& b, const OptTensor& sfb,
                                      const torch::Tensor& d, const torch::Tensor& masked_m,
-                                     int expected_m, int gran_k_a, int gran_k_b) {
+                                     int expected_m, int gran_k_a, int gran_k_b,
+                                     const OptTensor& c, double alpha) {
     const auto device = d.device();
     const bool bf16 = !sfa.has_value();
     TORCH_CHECK(sfa.has_value() == sfb.has_value(), "pass scales for both operands or for none");
@@ -362,12 +366,15 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor& a, const OptTensor& sf
                 "all tensors must be on the output accelerator device");
     TORCH_CHECK(a.dim() == 3 && b.dim() == 3 && d.dim() == 3, "masked GEMMs take 3-D a, b and d");
     const auto a_type = operand_type(a, !bf16, "a"), b_type = operand_type(b, !bf16, "b");
-    const int groups = a.size(0), max_m = a.size(1), k = logical_mn_k(a, a_type).second;
+    const int groups = a.size(0), max_m = logical_mn_k(a, a_type).first, k = logical_mn_k(a, a_type).second;
     const int n = logical_mn_k(b, b_type).first;
     TORCH_CHECK(b.size(0) == groups && logical_mn_k(b, b_type).second == k && d.size(0) == groups &&
                 d.size(1) == max_m && d.size(2) == n, "masked GEMM shape mismatch");
-    TORCH_CHECK(d.scalar_type() == torch::kBFloat16, "masked GEMMs write BF16 outputs");
+    TORCH_CHECK(d.scalar_type() == torch::kBFloat16 || d.scalar_type() == torch::kFloat, "d must be BF16 or FP32");
     TORCH_CHECK(n <= 1 || d.stride(2) == 1, "d must be N-major");
+    if (c.has_value())
+        TORCH_CHECK(c->is_cuda() && c->device() == device && c->sizes() == d.sizes() && c->strides() == d.strides() &&
+                    c->scalar_type() == d.scalar_type(), "c must match d in shape, strides and dtype");
     TORCH_CHECK(expected_m > 0, "expected_m must be positive");
     check_grouped_layout(masked_m, groups, device);
     const c10::hip::HIPGuard device_guard(d.get_device());
@@ -375,9 +382,9 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor& a, const OptTensor& sf
         return;
     TORCH_CHECK(k > 0, "masked GEMMs need K > 0");
     const auto lhs = grouped_operand_layout(a, "a", a_type);
-    TORCH_CHECK(!lhs.mn_major, "a must be K-major");
     const auto rhs = grouped_operand_layout(b, "b", b_type);
-    TORCH_CHECK(!rhs.mn_major, "b must be K-major");
+    const int mn_major = int(lhs.mn_major) | (int(rhs.mn_major) << 1);
+    const int out_dtype = d.scalar_type() == torch::kFloat ? MXFP8_OUT_FP32 : MXFP8_OUT_BF16;
     const auto [lda_sf, sfa_group_stride] =
         bf16 ? std::pair<int, int64_t>{0, 0} : grouped_scale_stride(*sfa, groups, max_m, k, gran_k_a, "sfa");
     const auto [ldb_sf, sfb_group_stride] =
@@ -385,15 +392,18 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor& a, const OptTensor& sf
     const int ldd = max_m > 1 ? stride_as_int(d, 1, "d") : n;
     const int kb = deep_gemm::cdna4::planner_k(k, a_type);
     const int sf_gran = bf16 ? 0 : int(gran_k_a == 128) | (int(gran_k_b == 128) << 1);
-    auto config = deep_gemm::cdna4::small_m_eligible(expected_m, n, kb, 0)
+    const bool aligned = reinterpret_cast<uintptr_t>(d.data_ptr()) % 16 == 0 &&
+                         (d.stride(0) * d.element_size()) % 16 == 0;
+    auto config = deep_gemm::cdna4::small_m_eligible(expected_m, n, kb, mn_major)
         ? deep_gemm::cdna4::get_small_m_config(expected_m, n, kb, sf_gran, deep_gemm::cdna4::GemmType::MGroupedMasked,
                                                groups)
-        : deep_gemm::cdna4::get_m_grouped_config(
-              deep_gemm::cdna4::GemmType::MGroupedMasked, kb, ldd,
-              reinterpret_cast<uintptr_t>(d.data_ptr()) % 16 == 0 && (d.stride(0) * 2) % 16 == 0, 0, sf_gran);
+        : deep_gemm::cdna4::get_m_grouped_config(deep_gemm::cdna4::GemmType::MGroupedMasked, kb, ldd, aligned,
+                                                 mn_major, sf_gran, out_dtype, c.has_value());
     config.a_type = a_type;
     config.b_type = b_type;
-    GemmArgs args = make_args(a, sfa, b, sfb, d, nullptr, max_m, n, k, lhs.ld, rhs.ld, lda_sf, ldb_sf, ldd);
+    GemmArgs args = make_args(a, sfa, b, sfb, d, c.has_value() ? c->data_ptr() : nullptr, max_m, n, k, lhs.ld, rhs.ld,
+                              lda_sf, ldb_sf, ldd);
+    args.alpha = static_cast<float>(alpha);
     args.grouped_layout = masked_m.data_ptr<std::int32_t>();
     args.num_groups = groups;
     args.a_group_stride = lhs.group_stride;
@@ -404,7 +414,7 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor& a, const OptTensor& sf
     const int tiles = config.variant == deep_gemm::cdna4::KernelVariant::mfma_16x16x128_small_m
         ? set_group_m_slots(args, config, expected_m, max_m, groups, n)
         : groups * ceil_div(max_m, config.block_m) * ceil_div(n, config.block_n);
-    launch_or_throw(args, config, MXFP8_OUT_BF16, d, tiles);
+    launch_or_throw(args, config, out_dtype, d, tiles);
 }
 
 // D[g] (+)= A_g^T B_g over the K range of group g. MN-major (TN): A [sum_k, M], B [sum_k, N].
@@ -480,6 +490,57 @@ void cdna4_k_grouped_fp8_gemm(const torch::Tensor& a, const OptTensor& sfa,
     args.k_alignment = k_alignment;
     args.d_group_stride = int64_t(m) * n;
     launch_or_throw(args, config, out_dtype, d, groups * ceil_div(m, kBlockMN) * ceil_div(n, kBlockMN));
+}
+
+// D (+)= sum_b A[b] @ B[b]^T for contiguous BF16 A [batches, M, k], B [batches, N, k] (einsum
+// "bmk,bnk->mn"): one GEMM whose K runs through the batches, split over the compute units when
+// the output has few tiles.
+void cdna4_k_batched_gemm(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                          const OptTensor& c) {
+    const auto device = d.device();
+    TORCH_CHECK(a.is_cuda() && a.device() == device && b.is_cuda() && b.device() == device,
+                "all tensors must be on the output accelerator device");
+    TORCH_CHECK(a.dim() == 3 && b.dim() == 3 && a.is_contiguous() && b.is_contiguous() &&
+                a.scalar_type() == torch::kBFloat16 && b.scalar_type() == torch::kBFloat16,
+                "a and b must be contiguous [batches, M, k] / [batches, N, k] BF16 tensors");
+    const int batches = a.size(0), m = a.size(1), k = a.size(2), n = b.size(1);
+    TORCH_CHECK(b.size(0) == batches && b.size(2) == k && d.dim() == 2 && d.size(0) == m && d.size(1) == n,
+                "K-batched GEMM shape mismatch");
+    TORCH_CHECK(d.scalar_type() == torch::kBFloat16 || d.scalar_type() == torch::kFloat, "d must be BF16 or FP32");
+    TORCH_CHECK(n <= 1 || d.stride(1) == 1, "d must be N-major");
+    if (c.has_value())
+        TORCH_CHECK(c->sizes() == d.sizes() && c->strides() == d.strides() && c->scalar_type() == d.scalar_type(),
+                    "c must match d in shape, strides and dtype");
+    const c10::hip::HIPGuard device_guard(d.get_device());
+    if (m == 0 || n == 0)
+        return;
+    if (batches == 0 || k == 0) {
+        if (!c.has_value()) d.zero_();
+        else if (c->data_ptr() != d.data_ptr()) d.copy_(*c);
+        return;
+    }
+    TORCH_CHECK(k % 64 == 0, "K-batched GEMMs need k divisible by 64");
+    TORCH_CHECK(int64_t(batches) * k <= std::numeric_limits<int>::max(), "K-batched GEMM K is out of range");
+    const int total_k = batches * k, ldd = m > 1 ? stride_as_int(d, 0, "d") : n;
+    deep_gemm::cdna4::KernelConfig config{deep_gemm::cdna4::KernelVariant::mfma_16x16x128_data_parallel};
+    config.type = deep_gemm::cdna4::GemmType::KBatched;
+    config.a_type = config.b_type = OperandType::Bf16;
+    config.split_k = deep_gemm::cdna4::plan_splits(m, n, 2 * total_k, deep_gemm::cdna4::num_compute_units());
+    if (config.split_k > 1)
+        config.variant = deep_gemm::cdna4::KernelVariant::mfma_16x16x128_split_k;
+    const int out_dtype = d.scalar_type() == torch::kFloat ? MXFP8_OUT_FP32 : MXFP8_OUT_BF16;
+    const auto workspace_size = jit_runtime.workspace_size(config, m, n);
+    auto workspace = workspace_size == 0 ? torch::Tensor() :
+        torch::empty({static_cast<int64_t>(workspace_size / sizeof(float))}, d.options().dtype(torch::kFloat));
+    GemmArgs args = make_args(a, std::nullopt, b, std::nullopt, d, c.has_value() ? c->data_ptr() : nullptr,
+                              m, n, total_k, 2 * k, 2 * k, 0, 0, ldd);
+    args.k_batch_tiles = k / 64;
+    args.a_group_stride = int64_t(m) * k * 2;
+    args.b_group_stride = int64_t(n) * k * 2;
+    args.splits = config.split_k;
+    args.ws = workspace.defined() ? workspace.data_ptr<float>() : nullptr;
+    args.ldw = ceil_div(n, 4) * 4;
+    launch_or_throw(args, config, out_dtype, d, 0);
 }
 
 // MQA logits of q [num_q, H, D] (packed FP4: D / 2 bytes) against KV rows from `source`
@@ -585,7 +646,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("m_alignment"), py::arg("expected_m") = 0);
     m.def("cdna4_m_grouped_fp8_gemm_masked", &cdna4_m_grouped_fp8_gemm_masked,
           py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("d"), py::arg("masked_m"),
-          py::arg("expected_m"), py::arg("gran_k_a"), py::arg("gran_k_b"));
+          py::arg("expected_m"), py::arg("gran_k_a"), py::arg("gran_k_b"), py::arg("c") = std::nullopt,
+          py::arg("alpha") = 1.0);
     m.def("cdna4_k_grouped_fp8_gemm", &cdna4_k_grouped_fp8_gemm,
           py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("d"), py::arg("c"),
           py::arg("grouped_layout"), py::arg("use_psum_layout"), py::arg("k_alignment"), py::arg("gran_k"),
@@ -598,4 +660,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("page_kv") = 0, py::arg("sparse_starts") = std::nullopt, py::arg("num_max_sparse_blocks") = 0,
           py::arg("sparse_block_kv") = 0);
     m.def("cdna4_mqa_logits_tokens_per_wave", &cdna4_mqa_logits_tokens_per_wave, py::arg("num_heads"));
+    m.def("cdna4_k_batched_gemm", &cdna4_k_batched_gemm, py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("c") = std::nullopt);
 }

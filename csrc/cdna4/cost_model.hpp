@@ -147,15 +147,16 @@ inline KernelConfig get_best_config(const int m, const int n, const int k,
     return config;
 }
 
-// m-grouped GEMMs (contiguous, PSUM and masked layouts): BF16 output, no accumulation.
+// m-grouped GEMMs (contiguous, PSUM and masked layouts; masked layouts may accumulate into FP32)
 inline KernelConfig get_m_grouped_config(const GemmType type, const int k, const int ldd,
                                          const bool d_aligned16, const int mn_major,
-                                         const int scale_gran_128) {
+                                         const int scale_gran_128, const int out_dtype = MXFP8_OUT_BF16,
+                                         const bool has_c = false) {
     KernelConfig config{KernelVariant::mfma_16x16x128_data_parallel};
     config.type = type;
     config.mn_major = mn_major;
     config.scale_gran_128 = scale_gran_128;
-    if (persistent_eligible(k, MXFP8_OUT_BF16, false, ldd, d_aligned16))
+    if (persistent_eligible(k, out_dtype, has_c, ldd, d_aligned16))
         config.variant = KernelVariant::mfma_16x16x128_persistent;
     return config;
 }

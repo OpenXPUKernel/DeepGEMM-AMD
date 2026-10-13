@@ -19,6 +19,9 @@ enum class GemmType : int {
   KGroupedContiguous = 4,
   // grouped_layout[g] is the end K of group g; group g starts at align(end[g - 1], k_alignment)
   KGroupedContiguousPsum = 5,
+  // D = sum_b A[b] @ B[b]^T for K-major A [batches, M, k], B [batches, N, k]: one GEMM whose K
+  // (batches x k) runs through the batches, k_batch_tiles K tiles each (group strides: batches)
+  KBatched = 6,
 };
 
 // Element type of an operand. FP4 (E2M1) values are packed two per byte, the lower K index in the
@@ -51,6 +54,8 @@ struct GemmArgs {
   // every group_m_slots-th m tile of the group
   int group_m_slots;
   int zero_padding;
+  // KBatched: K tiles per batch
+  int k_batch_tiles;
   std::int64_t a_group_stride, b_group_stride;
   std::int64_t sfa_group_stride, sfb_group_stride;
   std::int64_t d_group_stride;

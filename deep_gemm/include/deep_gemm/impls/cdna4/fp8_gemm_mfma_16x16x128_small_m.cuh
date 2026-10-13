@@ -238,16 +238,18 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p)
       for (int j = 0; j < NF; ++j)
         *(v4f *)(my_tile + (16 * i + r16) * Cfg::TILE_LD + 16 * j + 4 * g) = acc[i][j];
     __syncthreads();
-    uint8_t *const out = (uint8_t *)p.D + (Cfg::MASKED ? ga * p.d_group_stride * sizeof(OutT) : 0);
+    const size_t group_offset = Cfg::MASKED ? ga * p.d_group_stride * sizeof(OutT) : 0;
+    uint8_t *const out = (uint8_t *)p.D + group_offset;
+    const uint8_t *const cin = p.C ? (const uint8_t *)p.C + group_offset : nullptr;
     const bool vec_ok = (p.ldd * (int)sizeof(OutT)) % 16 == 0 && ((uintptr_t)out & 15) == 0 &&
-                        ((uintptr_t)p.C & 15) == 0;
+                        ((uintptr_t)cin & 15) == 0;
     for (int e = tid; e < BM * BN / 4; e += Cfg::NT) {
       const int row = e / (BN / 4), col = (e % (BN / 4)) * 4;
       v4f s = *(const v4f *)(tiles + row * Cfg::TILE_LD + col);
 #pragma unroll
       for (int w = 1; w < WAVES; ++w)
         s += *(const v4f *)(tiles + (w * BM + row) * Cfg::TILE_LD + col);
-      store4<OutT>(out, p.C, p.ldd, t.m_end, p.N, m0 + row, n0 + col, s * p.alpha, vec_ok);
+      store4<OutT>(out, cin, p.ldd, t.m_end, p.N, m0 + row, n0 + col, s * p.alpha, vec_ok);
     }
   };
 

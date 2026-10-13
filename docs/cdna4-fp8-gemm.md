@@ -82,6 +82,30 @@ row on six of the seven `forward` shapes of the FP8 benchmark below, 0.36-0.98x 
 and 0.92-0.97x on large square shapes. Contiguous grouped GEMMs reach 0.97-0.99x of the dense
 kernel on the same total problem, and masked GEMMs 0.92-2.4x of a per-group hipBLASLt loop.
 
+## Einsum
+
+`einsum` covers the BF16 expressions of the CUDA backend and `fp8_einsum` the FP8 ones, with BF16
+or FP32 (accumulating) outputs:
+
+| Expression | GEMM |
+| --- | --- |
+| `bmk,bnk->mn` | one GEMM whose K runs through the batches (`GemmType::KBatched`), split over the compute units for small outputs |
+| `bhr,hdr->bhd` | a GEMM per head over strided views: A `[h, b, r]`, D `[h, b, d]` |
+| `bhd,hdr->bhr` | as above, with an MN-major B `[h, r, d]` |
+| `bhd,bhr->hdr` | a GEMM per head with K = b: MN-major A `[h, d, b]` and B `[h, r, b]` |
+
+The per-head GEMMs run the masked GEMM kernels with full groups, so no operand is copied or
+transposed; FP8 scales are permuted with their data and packed per head. FP8 outputs (the
+`(d, sfd)` pair) and custom epilogues are not supported.
+
+```bash
+pytest -q tests/test_cdna4_einsum.py
+```
+
+The tests check the FP32 results against an FP32 reference and that BF16 outputs are those
+results rounded once. Against `torch.einsum` (hipBLASLt) the expressions run at 0.4-1.45x; the
+256x256 tiles make outputs with 128 columns or rows, and small K, the slow cases.
+
 ## FP4 GEMMs
 
 `fp8_fp4_gemm_{nt,nn,tn,tt}`, `m_grouped_fp8_fp4_gemm_{nt,nn}_contiguous`,
