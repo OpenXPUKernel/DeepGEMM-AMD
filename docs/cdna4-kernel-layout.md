@@ -18,6 +18,7 @@ The packaged headers are organized by responsibility:
 | `hc_prenorm_gemm.cuh` | Hyper-connection prenorm GEMM: BF16 A against FP32 B as two BF16 terms, with the rows' sums of squares |
 | `mqa_logits.cuh` | MQA logits (contiguous, paged and sparse KV): scaled-MFMA dot products with the weighted ReLU sum over the heads in the lanes |
 | `mqa_logits_args.h` | Argument layout, formats and KV sources of the MQA logits kernels |
+| `mega_gate.cuh`, `mega_gate_args.h` | MoE gate routing from FP32 logits: top-k by wave reductions, weights, shared experts, physical replicas and the routing controls |
 | `epilogue.cuh` | Output stores, accumulation, and boundary handling |
 | `split_k_reduce.cuh` | Deterministic reduction of split-K partials |
 | `tile_scheduler.cuh` | Output-tile ordering for the execution modes, and the mapping of tiles onto the groups (and K ranges) of grouped GEMMs |

@@ -41,7 +41,7 @@ __all__ = [
     "set_block_size_multiple_of", "set_pdl", "get_pdl", "use_deterministic_algorithms",
     "get_mqa_logits_metadata", "fp8_fp4_mqa_logits", "get_paged_mqa_logits_metadata", "fp8_fp4_paged_mqa_logits",
     "get_sparse_mqa_logits_metadata", "get_paged_sparse_mqa_logits_metadata", "fp8_fp4_sparse_mqa_logits",
-    "fp8_fp4_paged_sparse_mqa_logits", "einsum", "fp8_einsum", "tf32_hc_prenorm_gemm",
+    "fp8_fp4_paged_sparse_mqa_logits", "einsum", "fp8_einsum", "tf32_hc_prenorm_gemm", "bf16_mega_gate",
 ]
 
 def _backend():
@@ -785,6 +785,59 @@ def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None) -> None:
     with num_splits, D [num_splits, M, N] and sqr_sum [num_splits, M] hold the K splits' partials.
     CDNA4 has no TF32 MFMA: B runs as two BF16 terms, which is more precise than TF32."""
     _backend().cdna4_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)
+
+
+def bf16_mega_gate(x, weight, num_topk, use_shared_as_routed, num_shared_experts, routed_scaling_factor, ep_rank,
+                   scoring_func="sqrtsoftplus", mask=None, bias=None, image_bias=None, image_token_mask=None,
+                   fix_routing_mask=None, to_physical_map=None, logical_count=None, unmapped_topk_idx=None,
+                   force_random=None, out=None):
+    """MoE gate: top-k experts of x @ weight^T per token (sqrt-softplus scores ranked with the bias,
+    weights normalized over the top-k and scaled), the shared experts after them with weight 1,
+    mapped to physical replicas; returns (topk_idx, topk_weights). See the CUDA documentation for
+    the routing controls."""
+    num_tokens, hidden = x.shape
+    num_experts = weight.size(0)
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16 or weight.size(1) != hidden:
+        raise TypeError("x [tokens, hidden] and weight [experts, hidden] must be BF16")
+    if scoring_func != "sqrtsoftplus":
+        raise NotImplementedError("only the sqrtsoftplus scoring function is supported")
+    if not 0 < num_topk <= num_experts or num_experts > 512:
+        raise ValueError("0 < num_topk <= num_routed_experts <= 512")
+    shared = 0
+    if use_shared_as_routed:
+        if num_shared_experts not in (1, 2) or num_topk % num_shared_experts or \
+                num_experts % (num_topk // num_shared_experts):
+            raise ValueError("invalid shared experts for use_shared_as_routed")
+        shared = num_shared_experts
+    if num_topk + shared > 32:
+        raise ValueError("at most 32 top-k slots")
+    if (image_bias is None) != (image_token_mask is None) or (to_physical_map is None) != (logical_count is None):
+        raise ValueError("image_bias needs image_token_mask, to_physical_map needs logical_count")
+    if fix_routing_mask is not None and unmapped_topk_idx is None:
+        raise ValueError("fix_routing_mask reads the routing from unmapped_topk_idx")
+    if to_physical_map is not None and (to_physical_map.dim() != 2 or to_physical_map.size(0) != num_experts + shared):
+        raise ValueError("to_physical_map must be [logical experts, duplicates]")
+    if unmapped_topk_idx is not None and (tuple(unmapped_topk_idx.shape) != (num_tokens, num_topk) or
+                                          unmapped_topk_idx.dtype != torch.int64 or unmapped_topk_idx.stride(1) != 1):
+        raise ValueError("unmapped_topk_idx must be int64 [tokens, num_topk] with contiguous slots")
+    if out is None:
+        topk_idx = torch.empty((num_tokens, num_topk + shared), dtype=torch.int64, device=x.device)
+        topk_weights = torch.empty((num_tokens, num_topk + shared), dtype=torch.float32, device=x.device)
+    else:
+        topk_idx, topk_weights = out
+        if tuple(topk_idx.shape) != (num_tokens, num_topk + shared) or not topk_idx.is_contiguous() or \
+                topk_weights.shape != topk_idx.shape or not topk_weights.is_contiguous():
+            raise ValueError("out must be contiguous [tokens, num_topk + shared experts] tensors")
+    if num_tokens == 0:
+        return topk_idx, topk_weights
+    logits = torch.empty((num_tokens, align(num_experts, 4)), dtype=torch.float32, device=x.device)[:, :num_experts]
+    bf16_gemm_nt(x, weight, logits)
+    contiguous = lambda t: None if t is None else t.contiguous()
+    _backend().cdna4_mega_gate_routing(
+        logits, contiguous(bias), contiguous(image_bias), contiguous(image_token_mask), contiguous(mask),
+        contiguous(fix_routing_mask), contiguous(force_random), contiguous(to_physical_map), contiguous(logical_count),
+        topk_idx, topk_weights, unmapped_topk_idx, int(num_topk), shared, int(ep_rank), float(routed_scaling_factor))
+    return topk_idx, topk_weights
 
 
 # ---- Runtime configuration (CUDA API parity). The CDNA4 kernels size their grids from the compute

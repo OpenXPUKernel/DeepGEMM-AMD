@@ -124,6 +124,28 @@ The tests compare against an FP64 reference with the CUDA test's bound. On the s
 `tests/test_hyperconnection.py` the kernel is 2.8-5.7x as fast as a PyTorch BF16 GEMM plus a sum of
 squares for 4096 or more rows, and 1.0-2.5x for 13 and 137 rows.
 
+## MoE gate
+
+`bf16_mega_gate` keeps the CUDA signature and routing semantics (sqrt-softplus scores, bias and
+image bias, shared experts as routed ones, physical replicas, masked, fixed and random routings).
+It runs in two kernels: the BF16 GEMM writes the FP32 logits, and `mega_gate.cuh` routes one token
+per wave. Lane `l` holds experts `EV l .. EV l + EV - 1` (`EV = ceil(experts / 64)`) and keeps its
+best two; every top-k round is one DPP maximum over the lanes, the lowest lane holding it wins
+(the smallest expert among ties) and promotes its second best. Without a bias the ranking is on
+the raw logits and only the selected experts are activated; random routings draw Philox numbers
+with curand's counter layout.
+
+```bash
+pytest -q tests/test_cdna4_mega_gate.py
+python tests/bench_cdna4_mega_gate.py --relative-only
+```
+
+The tests run the checks of `tests/test_mega_gate.py` (weights, selection up to numerical ties,
+replicas, routing controls, bitwise repeatability) against FP64 logits. The gate is 1.4-7.3x as
+fast as the same gate in torch ops; the logits GEMM takes 76-86% of the time, and with 128-1024
+tokens it runs at 0.27-0.62x of hipBLASLt (the 256x256 tiles leave compute units idle or need
+deep K splits).
+
 ## FP4 GEMMs
 
 `fp8_fp4_gemm_{nt,nn,tn,tt}`, `m_grouped_fp8_fp4_gemm_{nt,nn}_contiguous`,

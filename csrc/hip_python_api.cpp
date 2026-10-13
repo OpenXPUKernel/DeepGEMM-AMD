@@ -7,6 +7,7 @@
 #include "cdna4/jit_runtime.hpp"
 #include "cdna4/mqa_logits.hpp"
 #include "deep_gemm/impls/cdna4/gemm_args.h"
+#include "deep_gemm/impls/cdna4/mega_gate_args.h"
 
 #include <limits>
 #include <optional>
@@ -492,6 +493,62 @@ void cdna4_k_grouped_fp8_gemm(const torch::Tensor& a, const OptTensor& sfa,
     launch_or_throw(args, config, out_dtype, d, groups * ceil_div(m, kBlockMN) * ceil_div(n, kBlockMN));
 }
 
+// MoE gate routing (mega_gate.cuh) from FP32 logits [tokens, routed experts]; the Python wrapper
+// validates the tensors and computes the logits with the BF16 GEMM
+void cdna4_mega_gate_routing(const torch::Tensor& logits, const OptTensor& bias, const OptTensor& image_bias,
+                             const OptTensor& image_token_mask, const OptTensor& mask,
+                             const OptTensor& fix_routing_mask, const OptTensor& force_random,
+                             const OptTensor& to_physical_map, const OptTensor& logical_count,
+                             const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
+                             const OptTensor& unmapped_topk_idx, int num_topk, int num_shared_experts,
+                             int rank_idx, double routed_scaling_factor) {
+    TORCH_CHECK(logits.dim() == 2 && logits.scalar_type() == torch::kFloat && logits.stride(1) == 1,
+                "logits must be [tokens, experts] FP32 with contiguous rows");
+    const int num_tokens = logits.size(0), num_experts = logits.size(1);
+    TORCH_CHECK(num_experts > 0 && num_experts <= 512 && num_topk > 0 && num_topk + num_shared_experts <= 32,
+                "up to 512 routed experts and 32 slots");
+    const c10::hip::HIPGuard device_guard(logits.get_device());
+    if (num_tokens == 0)
+        return;
+    const auto ptr = [](const OptTensor& t) { return t.has_value() ? t->data_ptr() : nullptr; };
+    deep_gemm::cdna4::MegaGateArgs args{};
+    args.logits = logits.data_ptr<float>();
+    args.ld_logits = stride_as_int(logits, 0, "logits");
+    args.bias = static_cast<const float*>(ptr(bias));
+    args.image_bias = static_cast<const float*>(ptr(image_bias));
+    args.image_token_mask = static_cast<const std::uint8_t*>(ptr(image_token_mask));
+    args.mask = static_cast<const std::uint8_t*>(ptr(mask));
+    args.fix_routing_mask = static_cast<const std::uint8_t*>(ptr(fix_routing_mask));
+    args.force_random = static_cast<const std::uint8_t*>(ptr(force_random));
+    args.to_physical_map = static_cast<const std::int32_t*>(ptr(to_physical_map));
+    args.logical_count = static_cast<const std::int32_t*>(ptr(logical_count));
+    args.topk_idx = topk_idx.data_ptr<std::int64_t>();
+    args.topk_weights = topk_weights.data_ptr<float>();
+    args.unmapped_topk_idx = unmapped_topk_idx.has_value() ? unmapped_topk_idx->data_ptr<std::int64_t>() : nullptr;
+    args.unmapped_stride = unmapped_topk_idx.has_value() ? unmapped_topk_idx->stride(0) : 0;
+    args.num_tokens = num_tokens, args.num_routed_experts = num_experts;
+    args.num_shared_experts = num_shared_experts, args.num_topk = num_topk;
+    args.num_duplicate_experts = to_physical_map.has_value() ? to_physical_map->size(1) : 0;
+    args.rank_idx = static_cast<std::uint32_t>(rank_idx);
+    args.routed_scaling_factor = static_cast<float>(routed_scaling_factor);
+    TORCH_CHECK(args.ld_logits % 4 == 0 && args.ld_logits >= ceil_div(num_experts, 4) * 4 &&
+                reinterpret_cast<std::uintptr_t>(args.logits) % 16 == 0,
+                "logits rows must be 16-byte aligned with a pitch of the experts rounded up to 4");
+    const int experts_per_lane = ceil_div(num_experts, 64);
+    const bool biased = bias.has_value() || image_bias.has_value();
+    const auto instance = std::to_string(experts_per_lane) + (biased ? ", true" : ", false");
+    const auto module = jit_runtime.get_module("mega_gate:" + instance, [&] {
+        return "#include <deep_gemm/impls/cdna4/mega_gate.cuh>\n"
+               "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_mega_gate(MegaGateArgs p) "
+               "{ mega_gate_impl<" + instance + ">(p); }\n";
+    }, {"dg_cdna4_mega_gate"}, {"-fno-honor-nans"});
+    const unsigned blocks = static_cast<unsigned>(std::min(ceil_div(num_tokens, 4), 16 * deep_gemm::cdna4::num_compute_units()));
+    const auto stream = c10::hip::getCurrentHIPStream(logits.get_device()).stream();
+    const int error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[0], args, dim3(blocks, 1, 1),
+                                                                  dim3(256, 1, 1), 0, stream);
+    TORCH_CHECK(error == 0, "CDNA4 mega gate launch failed with code ", error);
+}
+
 // D = A @ B^T and sqr_sum = sum_k A^2 for BF16 A [M, K], FP32 B [N, K] (hc_prenorm_gemm.cuh). With
 // num_splits, D [splits, M, N] and sqr_sum [splits, M] receive the K splits' partials; without,
 // D [M, N] and sqr_sum [M] the sums (partials of internal splits are added in split order).
@@ -736,4 +793,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("c") = std::nullopt);
     m.def("cdna4_hc_prenorm_gemm", &cdna4_hc_prenorm_gemm, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("sqr_sum"), py::arg("num_splits") = std::nullopt);
+    m.def("cdna4_mega_gate_routing", &cdna4_mega_gate_routing,
+          py::arg("logits"), py::arg("bias"), py::arg("image_bias"), py::arg("image_token_mask"), py::arg("mask"),
+          py::arg("fix_routing_mask"), py::arg("force_random"), py::arg("to_physical_map"), py::arg("logical_count"),
+          py::arg("topk_idx"), py::arg("topk_weights"), py::arg("unmapped_topk_idx"), py::arg("num_topk"),
+          py::arg("num_shared_experts"), py::arg("rank_idx"), py::arg("routed_scaling_factor"));
 }
