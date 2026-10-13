@@ -37,8 +37,7 @@ struct KernelConfig {
     int depth = 0;
     int waves = 4;
     bool k_tail = false;
-    // BF16 operands without scales (16x16x32 BF16 MFMAs)
-    bool bf16 = false;
+    OperandType a_type = OperandType::Fp8, b_type = OperandType::Fp8;
 };
 
 inline int ceil_div(const int x, const int y) { return x / y + (x % y != 0); }
@@ -103,7 +102,7 @@ inline KernelConfig get_small_m_config(const int rows, const int n, const int k,
     config.block_n = 16 * nf;
     config.depth = depth;
     config.waves = waves;
-    config.k_tail = k % 128 != 0; // k: bytes of a row
+    config.k_tail = k % 128 != 0;
     return config;
 }
 
@@ -119,20 +118,24 @@ inline bool small_m_eligible(const int rows, const int n, const int k, const int
     return mn_major == 0 && rows > 0 && rows <= max_rows;
 }
 
-// The planners take K in bytes of an operand row: a 128-byte K step costs the same with FP8 and
-// BF16 operands.
+// The planners take k = 128 x the K steps: K, or 2 K with BF16 operands (64 K values per step).
+inline int planner_k(const int k, const OperandType a_type) { return a_type == OperandType::Bf16 ? 2 * k : k; }
+
 inline KernelConfig get_best_config(const int m, const int n, const int k,
                                     const int out_dtype, const bool has_c,
                                     const int ldd, const bool d_aligned16,
                                     const int mn_major = 0, const int scale_gran_128 = 0,
-                                    const bool bf16 = false) {
+                                    const OperandType a_type = OperandType::Fp8,
+                                    const OperandType b_type = OperandType::Fp8) {
     if (small_m_eligible(m, n, k, mn_major)) {
         auto config = get_small_m_config(m, n, k, scale_gran_128);
-        config.bf16 = bf16;
+        config.a_type = a_type;
+        config.b_type = b_type;
         return config;
     }
     KernelConfig config{KernelVariant::mfma_16x16x128_data_parallel};
-    config.bf16 = bf16;
+    config.a_type = a_type;
+    config.b_type = b_type;
     config.mn_major = mn_major;
     config.scale_gran_128 = scale_gran_128;
     config.split_k = plan_splits(m, n, k, num_compute_units());

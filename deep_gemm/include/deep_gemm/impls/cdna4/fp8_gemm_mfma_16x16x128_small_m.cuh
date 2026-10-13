@@ -1,4 +1,4 @@
-// CDNA4 FP8 and BF16 GEMMs for small M, where streaming B bounds the time.
+// CDNA4 FP8 / FP4 and BF16 GEMMs for small M, where streaming B bounds the time.
 // Every wave loads its scaled-MFMA operands straight from global memory into a ring of DEPTH
 // register stages: no LDS and no barriers in the K loop. The waves of a workgroup take equal
 // parts of the K range of the workgroup's output tile and add their tiles in LDS in wave order,
@@ -9,16 +9,24 @@
 #include "tile_scheduler.cuh"
 
 // FM A fragments (M <= 16 FM per tile), NF B fragments (16 NF output columns per workgroup),
-// DEPTH K steps of 128 in flight per wave, WAVES waves splitting the K range of a workgroup.
-// SF_GRAN_128: bit 0 for A, bit 1 for B. K_TAIL: K is not a multiple of a K step (128 bytes of a row).
-// BF16: BF16 operands without scales, two 16x16x32 BF16 MFMAs per fragment pair and step.
+// DEPTH K steps in flight per wave, WAVES waves splitting the K range of a workgroup.
+// SF_GRAN_128: bit 0 for A, bit 1 for B. K_TAIL: K is not a multiple of a K step.
+// A_TYPE / B_TYPE: FP8 and FP4 operands mix in the scaled MFMA; BF16 operands (no scales) run two
+// 16x16x32 BF16 MFMAs per fragment pair and step.
 template <int FM_, int NF_, int DEPTH_, int WAVES_, int SF_GRAN_128 = 0,
-          GemmType TYPE = GemmType::Normal, bool K_TAIL_ = false, bool BF16_ = false>
+          GemmType TYPE = GemmType::Normal, bool K_TAIL_ = false,
+          OperandType A_TYPE = OperandType::Fp8, OperandType B_TYPE = OperandType::Fp8>
 struct Mfma16x16x128SmallMConfig {
   static constexpr int FM = FM_, NF = NF_, DEPTH = DEPTH_;
-  static constexpr bool K_TAIL = K_TAIL_, BF16 = BF16_;
-  static constexpr int ES = BF16 ? 2 : 1;
-  static constexpr int WAVES = WAVES_, NT = 64 * WAVES, BK = 128; // BK: bytes of a K step
+  static constexpr bool BF16 = A_TYPE == OperandType::Bf16, K_TAIL = K_TAIL_;
+  static_assert(BF16 == (B_TYPE == OperandType::Bf16), "BF16 operands come in pairs");
+  static constexpr bool A_FP4 = A_TYPE == OperandType::Fp4, B_FP4 = B_TYPE == OperandType::Fp4;
+  // A K step is BK K values: 128 bytes of an FP8 or BF16 row, 64 bytes of an FP4 row
+  static constexpr int ES = BF16 ? 2 : 1, BK = 128 / ES;
+  static constexpr int A_STEP = A_FP4 ? 64 : 128, B_STEP = B_FP4 ? 64 : 128;
+  __host__ __device__ static constexpr int a_bytes(int k) { return A_FP4 ? (k + 1) / 2 : k * ES; }
+  __host__ __device__ static constexpr int b_bytes(int k) { return B_FP4 ? (k + 1) / 2 : k * ES; }
+  static constexpr int WAVES = WAVES_, NT = 64 * WAVES;
   static constexpr int BM = 16 * FM, BN = 16 * NF;
   static constexpr int SFA_SHIFT = SF_GRAN_128 & 1 ? 2 : 0, SFB_SHIFT = SF_GRAN_128 & 2 ? 2 : 0;
   static constexpr GemmType kType = TYPE;
@@ -56,15 +64,15 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p)
   const int tid = threadIdx.x, lane = tid % 64, g = lane / 16, r16 = lane % 16;
   const int wave = __builtin_amdgcn_readfirstlane(tid / 64);
 
-  // ---- K steps of this wave (the same for every tile); K counted in bytes of a row
-  const int k_bytes = p.K * Cfg::ES;
-  const int k_steps = (k_bytes + BK - 1) / BK;
+  // ---- K steps of this wave (the same for every tile)
+  const int k_steps = (p.K + BK - 1) / BK;
   const int steps_per_wave = (k_steps + WAVES - 1) / WAVES;
   const int wave_begin = wave * steps_per_wave;
   const int nsteps = max(0, min(k_steps, wave_begin + steps_per_wave) - wave_begin);
-  // bytes of the last K step that hold data
-  const int k_tail = k_bytes - (k_steps - 1) * BK;
-  const uint64_t k4 = (uint64_t)((k_bytes + 3) & ~3);
+  // K values of the last K step that hold data
+  const int k_tail = p.K - (k_steps - 1) * BK;
+  const uint64_t a_k4 = (uint64_t)((Cfg::a_bytes(p.K) + 3) & ~3);
+  const uint64_t b_k4 = (uint64_t)((Cfg::b_bytes(p.K) + 3) & ~3);
   const int sa_words = (k_steps + (1 << Cfg::SFA_SHIFT) - 1) >> Cfg::SFA_SHIFT;
   const int sb_words = (k_steps + (1 << Cfg::SFB_SHIFT) - 1) >> Cfg::SFB_SHIFT;
 
@@ -83,9 +91,9 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p)
     const int m0 = t.m0, n0 = t.n0, rows = min(BM, t.m_data - m0);
     const size_t ga = Cfg::MASKED ? (size_t)t.group : 0, gb = Cfg::B_GROUPED ? (size_t)t.group : 0;
     const __amdgpu_buffer_rsrc_t a_rsrc = rsrc_at(
-        p.A + ga * p.a_group_stride + (size_t)m0 * p.lda, (uint64_t)(rows - 1) * p.lda + k4);
+        p.A + ga * p.a_group_stride + (size_t)m0 * p.lda, (uint64_t)(rows - 1) * p.lda + a_k4);
     const __amdgpu_buffer_rsrc_t b_rsrc = rsrc_at(
-        p.B + gb * p.b_group_stride + (size_t)n0 * p.ldb, (uint64_t)(p.N - n0 - 1) * p.ldb + k4);
+        p.B + gb * p.b_group_stride + (size_t)n0 * p.ldb, (uint64_t)(p.N - n0 - 1) * p.ldb + b_k4);
     const __amdgpu_buffer_rsrc_t sa_rsrc =
         rsrc_at((const uint8_t *)(p.sfa + ga * p.sfa_group_stride + m0),
                 ((uint64_t)(sa_words - 1) * p.lda_sf + rows) * 4);
@@ -93,8 +101,9 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p)
         rsrc_at((const uint8_t *)(p.sfb + gb * p.sfb_group_stride + n0),
                 ((uint64_t)(sb_words - 1) * p.ldb_sf + p.N - n0) * 4);
 
-    // Lane (g, r16) holds row r16 of a fragment: K bytes 16 g .. + 15 (half 0) and 64 + 16 g ..
-    // + 15 (half 1) of the step, and the scale word of its row. Steps past the wave's range load
+    // Lane (g, r16) holds row r16 of a fragment: bytes 16 g .. + 15 (half 0) and 64 + 16 g .. + 15
+    // (half 1) of the step's 128 bytes, or of an FP4 row bytes 16 g .. + 15 (K values 32 g ..
+    // + 31) of the step's 64, and the scale word of its row. Steps past the wave's range load
     // through an empty descriptor: zeros, no memory traffic, so the K loop has no branches (a
     // branch around loads makes every later wait drain all loads).
     v4i a_frag[DEPTH][FM][2], b_frag[DEPTH][NF][2];
@@ -107,42 +116,48 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p)
       const __amdgpu_buffer_rsrc_t br = in_range ? b_rsrc : empty_rsrc;
       const __amdgpu_buffer_rsrc_t sar = in_range ? sa_rsrc : empty_rsrc;
       const __amdgpu_buffer_rsrc_t sbr = in_range ? sb_rsrc : empty_rsrc;
-      const int koff = step * BK;
+      const int a_koff = step * Cfg::A_STEP, b_koff = step * Cfg::B_STEP;
       const int sa_off = (step >> Cfg::SFA_SHIFT) * p.lda_sf * 4;
       const int sb_off = (step >> Cfg::SFB_SHIFT) * p.ldb_sf * 4;
 #pragma unroll
       for (int j = 0; j < NF; ++j) {
         const uint32_t row = (uint32_t)(16 * j + r16) * p.ldb + 16 * g;
-        b_frag[d][j][0] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(br, row, koff, 0);
-        b_frag[d][j][1] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(br, row + 64, koff, 0);
+        b_frag[d][j][0] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(br, row, b_koff, 0);
+        if constexpr (!Cfg::B_FP4)
+          b_frag[d][j][1] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(br, row + 64, b_koff, 0);
         if constexpr (!Cfg::BF16)
           b_code[d][j] = __builtin_amdgcn_raw_buffer_load_b32(sbr, (16 * j + r16) * 4, sb_off, 0);
       }
 #pragma unroll
       for (int i = 0; i < FM; ++i) {
         const uint32_t row = (uint32_t)(16 * i + r16) * p.lda + 16 * g;
-        a_frag[d][i][0] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(ar, row, koff, 0);
-        a_frag[d][i][1] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(ar, row + 64, koff, 0);
+        a_frag[d][i][0] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(ar, row, a_koff, 0);
+        if constexpr (!Cfg::A_FP4)
+          a_frag[d][i][1] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(ar, row + 64, a_koff, 0);
         if constexpr (!Cfg::BF16)
           a_code[d][i] = __builtin_amdgcn_raw_buffer_load_b32(sar, (16 * i + r16) * 4, sa_off, 0);
       }
     };
-    // The last K step of a K that is not a multiple of 128 reads past K (the next row or row
+    // The last K step of a K that is not a multiple of a step reads past K (the next row or row
     // padding, which may hold NaN codes): those bytes become 0. The masks apply to every step (all
     // ones before the last), as selects in the loop are cheaper than the copies a conditional
     // block costs.
     auto clear_tail = [&](auto slot, bool last) {
       constexpr int d = decltype(slot)::value;
-      const int v0 = last ? k_tail - 16 * g : 16, v1 = last ? k_tail - 64 - 16 * g : 16;
+      const int a_tail = Cfg::a_bytes(k_tail), b_tail = Cfg::b_bytes(k_tail);
+      const int a0 = last ? a_tail - 16 * g : 16, a1 = last ? a_tail - 64 - 16 * g : 16;
+      const int b0 = last ? b_tail - 16 * g : 16, b1 = last ? b_tail - 64 - 16 * g : 16;
 #pragma unroll
       for (int i = 0; i < FM; ++i) {
-        a_frag[d][i][0] = keep_first_bytes(a_frag[d][i][0], v0);
-        a_frag[d][i][1] = keep_first_bytes(a_frag[d][i][1], v1);
+        a_frag[d][i][0] = keep_first_bytes(a_frag[d][i][0], a0);
+        if constexpr (!Cfg::A_FP4)
+          a_frag[d][i][1] = keep_first_bytes(a_frag[d][i][1], a1);
       }
 #pragma unroll
       for (int j = 0; j < NF; ++j) {
-        b_frag[d][j][0] = keep_first_bytes(b_frag[d][j][0], v0);
-        b_frag[d][j][1] = keep_first_bytes(b_frag[d][j][1], v1);
+        b_frag[d][j][0] = keep_first_bytes(b_frag[d][j][0], b0);
+        if constexpr (!Cfg::B_FP4)
+          b_frag[d][j][1] = keep_first_bytes(b_frag[d][j][1], b1);
       }
     };
 
@@ -190,8 +205,9 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p)
 #pragma unroll
         for (int i = 0; i < FM; ++i)
           acc[i][j] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-              cat8(b_frag[d][j][0], b_frag[d][j][1]), cat8(a_frag[d][i][0], a_frag[d][i][1]),
-              acc[i][j], kFmtFp8, kFmtFp8, 0, b_c[j], 0, a_c[i]);
+              scaled_operand<Cfg::B_FP4>(b_frag[d][j]), scaled_operand<Cfg::A_FP4>(a_frag[d][i]),
+              acc[i][j], Cfg::B_FP4 ? kFmtFp4 : kFmtFp8, Cfg::A_FP4 ? kFmtFp4 : kFmtFp8, 0, b_c[j], 0,
+              a_c[i]);
     };
 
     // ---- K loop: step s sits in register stage s % DEPTH; steps past nsteps add zeros. Loads

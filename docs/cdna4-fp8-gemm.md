@@ -82,6 +82,32 @@ row on six of the seven `forward` shapes of the FP8 benchmark below, 0.36-0.98x 
 and 0.92-0.97x on large square shapes. Contiguous grouped GEMMs reach 0.97-0.99x of the dense
 kernel on the same total problem, and masked GEMMs 0.92-2.4x of a per-group hipBLASLt loop.
 
+## FP4 GEMMs
+
+`fp8_fp4_gemm_{nt,nn,tn,tt}`, `m_grouped_fp8_fp4_gemm_{nt,nn}_contiguous`,
+`m_grouped_fp8_fp4_gemm_nt_masked` (and their `fp4_*` aliases) take packed FP4 (E2M1) operands as
+int8 tensors, two values per byte with the lower index in the low nibble, wherever they take FP8
+operands: FP8 x FP4, FP4 x FP8 and FP4 x FP4, with 32-wide UE8M0 scale blocks for FP4 operands.
+FP4 operands are K-major (`[MN, K / 2]`) or MN-major, packed along MN (`[MN / 2, K]` viewed
+through its transpose, as `transpose_packed_fp4` produces). `k_grouped_fp4_gemm_nt_contiguous`
+takes K-major `[M, sum_k / 2]` / `[N, sum_k / 2]` operands, recipe `(1, 1, 32)`, and a K alignment
+that is a multiple of 128.
+
+The scaled MFMA mixes the two formats directly, so FP4 operands keep their packed layout up to the
+instruction: a K step still covers 128 K values, 64 bytes of an FP4 row (one 16-byte read per lane
+and fragment instead of two), and MN-major FP4 tiles use `ds_read_b64_tr_b4`. FP8 x FP4 runs at
+the FP8 MFMA rate with half the B traffic; FP4 x FP4 runs at the FP4 rate.
+
+```bash
+pytest -q tests/test_cdna4_fp4_gemm.py
+python tests/bench_cdna4_fp4_gemm.py
+```
+
+On the shapes of the benchmark, with the weights read from memory: for a single row, FP8 x FP4 is
+1.2-1.8x and FP4 x FP4 1.2-1.8x as fast as the FP8 GEMM; with 4096 rows, FP4 x FP4 is 1.15-1.4x as
+fast as the FP8 GEMM and 1.0-2.0x as fast as the PyTorch MXFP4 GEMM, while the FP8 GEMM is 1.4-2.2x
+as fast as the PyTorch MXFP8 GEMM.
+
 The production kernels were refreshed from the current tutorial implementation
 on 2026-10-06. Inputs remain in their native K-major or MN-major storage. Physical
 row strides must cover a row, be divisible by four bytes, and be below `1 << 24`.

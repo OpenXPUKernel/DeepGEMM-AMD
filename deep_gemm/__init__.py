@@ -7,6 +7,9 @@ __version__ = '2.8.1'
 # The CUDA module remains the default for NVIDIA builds.
 if getattr(torch.version, "hip", None) is not None:
     from . import _C
+    # quantization and distributed helpers as in the CUDA API; the CDNA4 definitions take precedence
+    from . import utils
+    from .utils import *
     from ._hip_api import *
 else:
     from ._cuda_api import *

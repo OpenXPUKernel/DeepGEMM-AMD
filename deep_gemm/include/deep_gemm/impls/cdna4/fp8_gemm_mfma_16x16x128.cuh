@@ -1,4 +1,4 @@
-// CDNA4 FP8 GEMM using 16x16x128 scaled MFMA instructions, and the BF16 GEMM on the same
+// CDNA4 FP8 / FP4 GEMMs using 16x16x128 scaled MFMA instructions, and the BF16 GEMM on the same
 // pipeline (16x16x32 BF16 MFMAs).
 // Direct global-to-LDS loads feed two software-pipelined stages. MN-major
 // operands stay in their original layout and use transposing LDS reads.
@@ -11,15 +11,24 @@ enum class Mfma16x16x128GemmMode { DataParallel, Persistent, SplitK };
 
 // The masks use bit 0 for A and bit 1 for B. MN_MAJOR selects transposing
 // operand reads; SF_GRAN_128 selects one packed scale code per 128 K values.
-// TYPE maps tiles onto the groups of grouped GEMMs (tile_scheduler.cuh). BF16 runs BF16 operands
-// (no scales) through two 16x16x32 BF16 MFMAs per slot, in place of one scaled FP8 MFMA.
+// TYPE maps tiles onto the groups of grouped GEMMs (tile_scheduler.cuh). A_TYPE / B_TYPE: FP8 and
+// FP4 operands mix freely in the scaled MFMA; BF16 operands (no scales) run two 16x16x32 BF16
+// MFMAs per slot, in place of one scaled MFMA.
 template <Mfma16x16x128GemmMode Mode, int MN_MAJOR = 0, int SF_GRAN_128 = 0,
-          GemmType TYPE = GemmType::Normal, bool BF16_ = false>
+          GemmType TYPE = GemmType::Normal, OperandType A_TYPE = OperandType::Fp8,
+          OperandType B_TYPE = OperandType::Fp8>
 struct Mfma16x16x128GemmConfig {
-  static constexpr bool BF16 = BF16_, SCALED = !BF16;
-  // ES bytes per element. A K step is 128 bytes of a K-major row, BK elements.
+  static constexpr bool BF16 = A_TYPE == OperandType::Bf16, SCALED = !BF16;
+  static_assert(BF16 == (B_TYPE == OperandType::Bf16), "BF16 operands come in pairs");
+  static constexpr bool A_FP4 = A_TYPE == OperandType::Fp4, B_FP4 = B_TYPE == OperandType::Fp4;
+  // ES bytes per FP8 / BF16 element. A K step is BK elements: 128 bytes of a K-major FP8 or BF16
+  // row, 64 bytes of an FP4 row (A_ROW / B_ROW: the LDS bytes of a K-major row of a stage).
   static constexpr int ES = BF16 ? 2 : 1, BK_BYTES = 128;
   static constexpr int BM = 256, BN = 256, BK = BK_BYTES / ES, NW = 4, NT = 256;
+  static constexpr int A_ROW = A_FP4 ? BK_BYTES / 2 : BK_BYTES, B_ROW = B_FP4 ? BK_BYTES / 2 : BK_BYTES;
+  // bytes of n values of A / B
+  __host__ __device__ static constexpr int64_t a_bytes(int64_t n) { return A_FP4 ? (n + 1) / 2 : n * ES; }
+  __host__ __device__ static constexpr int64_t b_bytes(int64_t n) { return B_FP4 ? (n + 1) / 2 : n * ES; }
   static constexpr int GROUP_M = 8;
   static constexpr bool PERSISTENT = Mode == Mfma16x16x128GemmMode::Persistent;
   static constexpr bool SPLIT_K = Mode == Mfma16x16x128GemmMode::SplitK;
@@ -37,7 +46,7 @@ struct Mfma16x16x128GemmConfig {
   // Paired B fragments give each lane eight adjacent output columns. A
   // transposing read requires sixteen adjacent rows and uses unpaired fragments.
   static constexpr bool PAIRED_B_FRAGMENTS = PERSISTENT && !B_MN_MAJOR;
-  static constexpr int A_OFF = 0, B_OFF = BM * BK_BYTES, SA_OFF = B_OFF + BN * BK_BYTES,
+  static constexpr int A_OFF = 0, B_OFF = BM * A_ROW, SA_OFF = B_OFF + BN * B_ROW,
                        SB_OFF = SA_OFF + BM * 4;
   static constexpr int STAGE_BYTES = SCALED ? SB_OFF + BN * 4 : SA_OFF;
   // Persistent epilogue buffer: 32 rows (16 of each wave row) x 256 bf16, rows padded to 528 B
@@ -45,13 +54,18 @@ struct Mfma16x16x128GemmConfig {
   static constexpr int EPI_OFF = 2 * STAGE_BYTES, EPI_PITCH = 2 * BN + 16;
   static constexpr int LDS_BYTES = EPI_OFF + (PERSISTENT ? 32 * EPI_PITCH : 0);
   static_assert(LDS_BYTES <= 160 * 1024, "CDNA4 LDS capacity");
-  // Each lane moves DMA_BYTES with buffer_load_dwordx4. K_LANES lanes cover
-  // one K-major row; a wave covers K_ROWS rows. An MN-major row has MN_ROW_BYTES bytes.
+  // Each lane moves DMA_BYTES with buffer_load_dwordx4. A_K_LANES lanes cover
+  // one K-major row of A; a wave covers A_K_ROWS rows (B alike). An MN-major K row has
+  // MN_ROW_BYTES bytes (FP8 / BF16), or mn_row_bytes(true) with FP4; mn_lanes lanes cover it.
   static constexpr int WAVE_SIZE = 64, DMA_BYTES = 16, SCALE_BYTES = sizeof(int32_t);
-  static constexpr int K_LANES = BK_BYTES / DMA_BYTES, K_ROWS = WAVE_SIZE / K_LANES;
+  static constexpr int A_K_LANES = A_ROW / DMA_BYTES, A_K_ROWS = WAVE_SIZE / A_K_LANES;
+  static constexpr int B_K_LANES = B_ROW / DMA_BYTES, B_K_ROWS = WAVE_SIZE / B_K_LANES;
   static constexpr int MN_ROW_BYTES = BM * ES;
   static constexpr int MN_LANES = MN_ROW_BYTES / DMA_BYTES, MN_ROWS = WAVE_SIZE / MN_LANES;
-  static constexpr int K_WAVE_BYTES = K_ROWS * BK_BYTES, SCALE_WAVE_BYTES = WAVE_SIZE * SCALE_BYTES;
+  __host__ __device__ static constexpr int mn_row_bytes(bool fp4) { return fp4 ? BM / 2 : MN_ROW_BYTES; }
+  __host__ __device__ static constexpr int mn_lanes(bool fp4) { return mn_row_bytes(fp4) / DMA_BYTES; }
+  __host__ __device__ static constexpr int mn_rows(bool fp4) { return WAVE_SIZE / mn_lanes(fp4); }
+  static constexpr int K_WAVE_BYTES = WAVE_SIZE * DMA_BYTES, SCALE_WAVE_BYTES = WAVE_SIZE * SCALE_BYTES;
   static constexpr int lg(int n) {
     int b = 0;
     while ((1 << b) < n)
@@ -64,14 +78,15 @@ struct Mfma16x16x128GemmConfig {
   // KEY_BIT + 1 and up), which keeps a lane's swizzle key the same for every j.
   static constexpr int TR_ROWS = 8, LG_TR = lg(TR_ROWS), LG_MN_ROWS = lg(MN_ROWS);
   static constexpr int HALF_BIT = LG_TR, KEY_BIT = HALF_BIT + 1;
-  static_assert(BN == BM && WAVE_SIZE % K_LANES == 0 && WAVE_SIZE % MN_LANES == 0,
-                "A and B share the MN-major lane map");
+  static_assert(BN == BM && WAVE_SIZE % MN_LANES == 0, "A and B share the MN-major lane map");
   static_assert(BF16 || (LG_MN_ROWS + 1 == LG_TR && (1 << (LG_TR + 1)) == MN_LANES),
                 "the lane takes bits 0..LG_MN_ROWS-1; one transpose bit is left for the wave, and "
                 "the key covers every chunk");
-  static constexpr int A_LOADS = BM / (K_ROWS * NW),
-                       B_LOADS = BN / (K_ROWS * NW); // per wave, K_WAVE_BYTES
-  static_assert(A_LOADS == BK / (NW * MN_ROWS), "MN-major K rows take one DMA per remaining group");
+  static constexpr int A_LOADS = BM / (A_K_ROWS * NW),
+                       B_LOADS = BN / (B_K_ROWS * NW); // per wave, K_WAVE_BYTES
+  static_assert((!A_MN_MAJOR || A_LOADS == BK / (NW * mn_rows(A_FP4))) &&
+                    (!B_MN_MAJOR || B_LOADS == BK / (NW * mn_rows(B_FP4))),
+                "MN-major K rows take one DMA per remaining group");
   // + one scale load for A and B
   static constexpr int DMA_PER_TILE = A_LOADS + B_LOADS + (SCALED ? 2 : 0);
   static constexpr int EPI_LD = 128 + 4, EPI_WAVE_BYTES = 32 * EPI_LD * 4;
@@ -81,9 +96,29 @@ struct Mfma16x16x128GemmConfig {
   // spread evenly over the SPAN slots that follow barrier 1
   static constexpr int BAR1 = 16, BAR2 = 48, SPAN = 48;
   // LDS reads that bring one group of fragments into registers (A and B fragments 0-3, or 4-7):
-  // 8 fragments x (2 operand halves + 1 scale code with FP8). A half is one ds_read_b128 (K-major)
-  // or two transposing reads (MN-major).
-  static constexpr int PARTS = SCALED ? 3 : 2, READS_PER_FRAGMENT_GROUP = 8 * PARTS;
+  // per fragment its operand halves (one with FP4: 16 bytes per lane and step) and, unless BF16, a
+  // scale code. A half is one ds_read_b128 (K-major) or two transposing reads (MN-major).
+  static constexpr int A_HALVES = A_FP4 ? 1 : 2, B_HALVES = B_FP4 ? 1 : 2;
+  static constexpr int A_PARTS = A_HALVES + SCALED, B_PARTS = B_HALVES + SCALED;
+  static constexpr int READS_PER_FRAGMENT_GROUP = 4 * (A_PARTS + B_PARTS);
+  // read i of a fragment group: part < halves is an operand half, the next part the scale code
+  struct FragmentRead {
+    bool is_b;
+    int fragment, part;
+  };
+  // fragments 4-7 in the order A 4-7, B 4-7
+  __host__ __device__ static constexpr FragmentRead read_of_fragments_4_to_7(int i) {
+    return i < 4 * A_PARTS ? FragmentRead{false, 4 + i / A_PARTS, i % A_PARTS}
+                           : FragmentRead{true, 4 + (i - 4 * A_PARTS) / B_PARTS, (i - 4 * A_PARTS) % B_PARTS};
+  }
+  // fragments 0-3 in the order B 0, A 0-3, B 1-3: the order in which the first quadrant of MFMAs
+  // (B 0-3 x A 0-3, B 0 first) needs them
+  __host__ __device__ static constexpr FragmentRead read_of_fragments_0_to_3(int i) {
+    return i < B_PARTS                 ? FragmentRead{true, 0, i}
+           : i < B_PARTS + 4 * A_PARTS ? FragmentRead{false, (i - B_PARTS) / A_PARTS, (i - B_PARTS) % A_PARTS}
+                                       : FragmentRead{true, 1 + (i - B_PARTS - 4 * A_PARTS) / B_PARTS,
+                                                      (i - B_PARTS - 4 * A_PARTS) % B_PARTS};
+  }
   static_assert(BAR1 >= READS_PER_FRAGMENT_GROUP / 2 && BAR1 + SPAN <= 64,
                 "DMA window: after the reads of stage cur, within the iteration");
   static_assert(SPAN >= DMA_PER_TILE, "at most one DMA per slot");
@@ -120,57 +155,72 @@ struct Mfma16x16x128GemmConfig {
   // BF16: ds_read_b64_tr_b16 gives each of 16 lanes a column of 4 K rows; the 16 lanes read 32 B
   // of each row. keyMN moves those 32 B by row bits 0-1 (2 chunks per step) and the lane group
   // pairs apart by row bit 3 (8 chunks), so the rows a read serves hit different banks.
-  __host__ __device__ static constexpr int keyMN(int r) {
-    return BF16 ? 2 * (r & 3) | (((r >> 3) & 1) << 3)
-                : (r & ((1 << LG_TR) - 1)) | (((r >> KEY_BIT) & 1) << LG_TR);
+  // FP4 (fp4): ds_read_b64_tr_b4 gives each of 16 lanes a column of 16 K rows, 8 bytes of each row.
+  // The 32 lanes of a read cycle read 32 rows at the same 8-byte half of a chunk; the key (row bits
+  // 1-3) spreads the 16 rows of a parity over the 8 chunks: two rows per chunk, a 2-way conflict.
+  __host__ __device__ static constexpr int keyMN(int r, bool fp4 = false) {
+    return fp4    ? (r >> 1) & 7
+           : BF16 ? 2 * (r & 3) | (((r >> 3) & 1) << 3)
+                  : (r & ((1 << LG_TR) - 1)) | (((r >> KEY_BIT) & 1) << LG_TR);
   }
-  // DMA j (0 .. A_LOADS-1) of wave w loads MN_ROWS K rows x MN_ROW_BYTES bytes, at base row
-  // mn_row(w) + mn_jrow(j). The lane adds 0 .. MN_ROWS-1. FP8: wave bit 0 takes the remaining
+  // DMA j (0 .. A_LOADS-1) of wave w loads mn_rows K rows x mn_row_bytes bytes, at base row
+  // mn_row(w) + mn_jrow(j). The lane adds 0 .. mn_rows-1. FP8: wave bit 0 takes the remaining
   // transpose bit and wave bit 1 takes KEY_BIT; j takes HALF_BIT and the bits above KEY_BIT.
   // BF16: the lane takes row bit 0, the wave bits 1 and 3 (the rest of keyMN), j bits 2, 4, 5.
-  __host__ __device__ static constexpr int mn_row(int w) {
-    return BF16 ? ((w & 1) << 1) | ((w >> 1) << 3) : ((w & 1) << LG_MN_ROWS) | ((w >> 1) << KEY_BIT);
+  // FP4: the lane takes row bits 0-2, the wave bits 3 (the rest of the key) and 4, j bits 5-6.
+  __host__ __device__ static constexpr int mn_row(int w, bool fp4 = false) {
+    return fp4    ? ((w & 1) << 3) | ((w >> 1) << 4)
+           : BF16 ? ((w & 1) << 1) | ((w >> 1) << 3)
+                  : ((w & 1) << LG_MN_ROWS) | ((w >> 1) << KEY_BIT);
   }
-  __host__ __device__ static constexpr int mn_jrow(int j) {
-    return BF16 ? ((j & 1) << 2) | ((j >> 1) << 4) : ((j & 1) << HALF_BIT) | ((j >> 1) << (KEY_BIT + 1));
+  __host__ __device__ static constexpr int mn_jrow(int j, bool fp4 = false) {
+    return fp4    ? j << 5
+           : BF16 ? ((j & 1) << 2) | ((j >> 1) << 4)
+                  : ((j & 1) << HALF_BIT) | ((j >> 1) << (KEY_BIT + 1));
   }
   // swizzle keys (physical chunk = logical chunk ^ key(row)). The 16 lanes that one ds_read_b128
   // cycle serves read rows r16 = 0..15 of a fragment and must hit 16 different 16 B bank groups,
-  // i.e. different (row % 2, key) pairs. A: rows 0..15 -> (r >> 1) & 7. B with PAIRED_B_FRAGMENTS:
-  // rows {8a + b : a, b < 4} -> bit 1 and bits 3-4 of the row.
-  __host__ __device__ static constexpr int key(int r) { return (r >> 1) & 7; }
+  // i.e. different (row % 2, key) pairs for 128-byte rows, (row % 4, key) pairs for 64-byte FP4
+  // rows. Rows 0..15 -> (r >> 1) & 7, or (r >> 2) & 3. B with PAIRED_B_FRAGMENTS: rows
+  // {8a + b : a, b < 4} -> bit 1 and bits 3-4 of the row, or bits 3-4.
+  __host__ __device__ static constexpr int row_key(int r, bool fp4) { return fp4 ? (r >> 2) & 3 : (r >> 1) & 7; }
+  __host__ __device__ static constexpr int key(int r) { return row_key(r, A_FP4); }
   __host__ __device__ static constexpr int keyB(int r) {
-    return PAIRED_B_FRAGMENTS ? ((r >> 1) & 1) | (((r >> 3) & 3) << 1) : key(r);
+    return !PAIRED_B_FRAGMENTS ? row_key(r, B_FP4)
+           : B_FP4             ? (r >> 3) & 3
+                               : ((r >> 1) & 1) | (((r >> 3) & 3) << 1);
   }
 };
 
-// The partial last K tile sits in stage 0 (it is processed first): only kv = (K - (KT - 1) BK) ES
-// bytes of each row are data. Zero the rest (it holds the next row, padding, or 0 past the end of
-// the buffer), and set the scale codes of K blocks without data to 127 (= 1.0) so that padding
+// The partial last K tile sits in stage 0 (it is processed first): only its first kv K values,
+// kv_bytes of each row, are data. Zero the rest (it holds the next row, padding, or 0 past the end
+// of the buffer), and set the scale codes of K blocks without data to 127 (= 1.0) so that padding
 // codes cannot turn 0 * scale into NaN. An MN-major operand needs no clearing: its K rows past K
 // are outside its buffer and read as 0. With 128-wide scale blocks (fix_sa / fix_sb false) the
 // tile has one code, and the other bytes of the word belong to other K tiles.
 template <class Cfg>
 __device__ __forceinline__ void clear_k_overhang(uint8_t *smem, int tid, int K, int KT,
                                                  bool fix_sa = true, bool fix_sb = true) {
-  constexpr int BM = Cfg::BM, BN = Cfg::BN, ROW = Cfg::BK_BYTES;
-  const int kv = (K - (KT - 1) * Cfg::BK) * Cfg::ES, nb = (kv + 31) / 32;
+  constexpr int BM = Cfg::BM, BN = Cfg::BN;
+  const int kv = K - (KT - 1) * Cfg::BK, nb = (kv + 31) / 32;
   for (int r = tid; r < BM + BN; r += Cfg::NT) {
-    uint8_t *row = smem + (r < BM ? Cfg::A_OFF + r * ROW : Cfg::B_OFF + (r - BM) * ROW);
-    for (int c = kv / 16; c < 8 && !(r < BM ? Cfg::A_MN_MAJOR : Cfg::B_MN_MAJOR); ++c) {
-      v4i *q =
-          (v4i *)(row + (c ^ (r < BM ? Cfg::key(r) : Cfg::keyB(r - BM))) * 16); // logical chunk c
+    const bool is_a = r < BM;
+    const int row_bytes = is_a ? Cfg::A_ROW : Cfg::B_ROW;
+    const int kv_bytes = (int)(is_a ? Cfg::a_bytes(kv) : Cfg::b_bytes(kv));
+    uint8_t *row = smem + (is_a ? Cfg::A_OFF + r * Cfg::A_ROW : Cfg::B_OFF + (r - BM) * Cfg::B_ROW);
+    for (int c = kv_bytes / 16; c < row_bytes / 16 && !(is_a ? Cfg::A_MN_MAJOR : Cfg::B_MN_MAJOR); ++c) {
+      v4i *q = (v4i *)(row + (c ^ (is_a ? Cfg::key(r) : Cfg::keyB(r - BM))) * 16); // logical chunk c
       v4i v = *q;
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        const int keep = kv - c * 16 - 4 * i; // bytes of dword i that are data
+        const int keep = kv_bytes - c * 16 - 4 * i; // bytes of dword i that are data
         v[i] = keep >= 4 ? v[i] : keep <= 0 ? 0 : (int)((uint32_t)v[i] & ((1u << (8 * keep)) - 1));
       }
       *q = v;
     }
-    if (Cfg::SCALED && nb < 4 && (r < BM ? fix_sa : fix_sb)) {
+    if (Cfg::SCALED && nb < 4 && (is_a ? fix_sa : fix_sb)) {
       uint32_t *w =
-          (uint32_t *)(smem + (r < BM ? Cfg::SA_OFF + r * 4 : Cfg::SB_OFF + (r - BM) * 4));
+          (uint32_t *)(smem + (is_a ? Cfg::SA_OFF + r * 4 : Cfg::SB_OFF + (r - BM) * 4));
       const uint32_t keep = (1u << (8 * nb)) - 1;
       *w = (*w & keep) | (0x7f7f7f7fu & ~keep);
     }
@@ -207,8 +257,8 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   bool tail = false;
   auto ktile = [&](int t) { return tail ? (t == 0 ? KT - 1 : kb + t - 1) : kb + t; };
 
-  // ---- Global -> LDS. Load i covers K_ROWS K-major rows starting at
-  // K_ROWS * (i * NW + wave). For an MN-major operand, load j covers K rows
+  // ---- Global -> LDS. Load i of A covers A_K_ROWS K-major rows starting at
+  // A_K_ROWS * (i * NW + wave) (B alike). For an MN-major operand, load j covers K rows
   // mn_row(wave) + mn_jrow(j) + lane / MN_LANES, chunk lane % MN_LANES. Its buffer ends after the
   // last K row (rows past K read as 0, so a partial K
   // tile needs no clearing); the bounds check works per dword, hence align(MN, 4).
@@ -225,35 +275,38 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   // Grouped operands: the matrix is the tile's group (its base from *_group below), and the
   // extents are the bytes from a group's base to the end of its data.
   static_assert(NW == 4, "the keys of the rows of load i must not depend on i");
-  constexpr int k_rows = Cfg::K_ROWS, k_lanes = Cfg::K_LANES, mn_lanes = Cfg::MN_LANES,
-                load_bytes = Cfg::DMA_BYTES;
-  const uint32_t mn_voff_row = (uint32_t)(Cfg::mn_row(wave) + lane / mn_lanes);
-  const uint32_t mn_voff_chunk =
-      (uint32_t)((lane % mn_lanes) ^ Cfg::keyMN((int)mn_voff_row)) * load_bytes;
-  const uint32_t k_row = (uint32_t)(k_rows * wave + lane / k_lanes);
+  constexpr int load_bytes = Cfg::DMA_BYTES;
+  constexpr int a_mn_lanes = Cfg::mn_lanes(Cfg::A_FP4), b_mn_lanes = Cfg::mn_lanes(Cfg::B_FP4);
+  const uint32_t a_mn_row = (uint32_t)(Cfg::mn_row(wave, Cfg::A_FP4) + lane / a_mn_lanes);
+  const uint32_t b_mn_row = (uint32_t)(Cfg::mn_row(wave, Cfg::B_FP4) + lane / b_mn_lanes);
+  const uint32_t a_mn_chunk =
+      (uint32_t)((lane % a_mn_lanes) ^ Cfg::keyMN((int)a_mn_row, Cfg::A_FP4)) * load_bytes;
+  const uint32_t b_mn_chunk =
+      (uint32_t)((lane % b_mn_lanes) ^ Cfg::keyMN((int)b_mn_row, Cfg::B_FP4)) * load_bytes;
+  const uint32_t a_k_row = (uint32_t)(Cfg::A_K_ROWS * wave + lane / Cfg::A_K_LANES);
+  const uint32_t b_k_row = (uint32_t)(Cfg::B_K_ROWS * wave + lane / Cfg::B_K_LANES);
   const uint32_t s_voff = (Cfg::WAVE_SIZE * wave + lane) * Cfg::SCALE_BYTES;
   uint32_t a_voff, b_voff, a_step, b_step;
   int64_t a_extent, b_extent, sa_extent, sb_extent;
   auto set_geometry = [&] {
     KT = (K + BK - 1) / BK;
-    const int64_t k4 = (K * Cfg::ES + 3) & ~3;
-    a_extent = Cfg::A_MN_MAJOR ? (int64_t)(K - 1) * lda + ((p.M * Cfg::ES + 3) & ~3)
-                               : (int64_t)(p.M - 1) * lda + k4;
-    b_extent = Cfg::B_MN_MAJOR ? (int64_t)(K - 1) * ldb + ((p.N * Cfg::ES + 3) & ~3)
-                               : (int64_t)(p.N - 1) * ldb + k4;
+    a_extent = Cfg::A_MN_MAJOR ? (int64_t)(K - 1) * lda + ((Cfg::a_bytes(p.M) + 3) & ~3)
+                               : (int64_t)(p.M - 1) * lda + ((Cfg::a_bytes(K) + 3) & ~3);
+    b_extent = Cfg::B_MN_MAJOR ? (int64_t)(K - 1) * ldb + ((Cfg::b_bytes(p.N) + 3) & ~3)
+                               : (int64_t)(p.N - 1) * ldb + ((Cfg::b_bytes(K) + 3) & ~3);
     // scale words: one per K tile, or (128-wide scale blocks, shift 2) one per 4 K tiles
     const int sa_words = (KT + (1 << Cfg::SFA_SHIFT) - 1) >> Cfg::SFA_SHIFT;
     const int sb_words = (KT + (1 << Cfg::SFB_SHIFT) - 1) >> Cfg::SFB_SHIFT;
     sa_extent = ((int64_t)(sa_words - 1) * p.lda_sf + p.M) * 4;
     sb_extent = ((int64_t)(sb_words - 1) * p.ldb_sf + p.N) * 4;
     a_voff = Cfg::A_MN_MAJOR
-                 ? mn_voff_row * lda + mn_voff_chunk
-                 : k_row * lda + ((lane % k_lanes) ^ Cfg::key((int)k_row)) * load_bytes;
+                 ? a_mn_row * lda + a_mn_chunk
+                 : a_k_row * lda + ((lane % Cfg::A_K_LANES) ^ Cfg::key((int)a_k_row)) * load_bytes;
     b_voff = Cfg::B_MN_MAJOR
-                 ? mn_voff_row * ldb + mn_voff_chunk
-                 : k_row * ldb + ((lane % k_lanes) ^ Cfg::keyB((int)k_row)) * load_bytes;
-    a_step = k_rows * NW * lda;
-    b_step = k_rows * NW * ldb;
+                 ? b_mn_row * ldb + b_mn_chunk
+                 : b_k_row * ldb + ((lane % Cfg::B_K_LANES) ^ Cfg::keyB((int)b_k_row)) * load_bytes;
+    a_step = Cfg::A_K_ROWS * NW * lda;
+    b_step = Cfg::B_K_ROWS * NW * ldb;
   };
   // size = min(end - base, 2^32 - 1) from the high word. 64-bit compares are VALU only, and the
   // compiler turns hi != 0 back into one unless hi is opaque.
@@ -267,6 +320,8 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   auto a_group = [&](const Src &s) -> const uint8_t * {
     if constexpr (Cfg::MASKED)
       return p.A + (size_t)s.group * p.a_group_stride;
+    else if constexpr (Cfg::K_GROUPED && Cfg::A_FP4)
+      return p.A + (size_t)kgrp.k0 / 2;
     else if constexpr (Cfg::K_GROUPED)
       return p.A + (size_t)kgrp.k0 * (Cfg::A_MN_MAJOR ? lda : p.M * Cfg::ES);
     else
@@ -275,6 +330,8 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   auto b_group = [&](const Src &s) -> const uint8_t * {
     if constexpr (Cfg::B_GROUPED)
       return p.B + (size_t)s.group * p.b_group_stride;
+    else if constexpr (Cfg::K_GROUPED && Cfg::B_FP4)
+      return p.B + (size_t)kgrp.k0 / 2;
     else if constexpr (Cfg::K_GROUPED)
       return p.B + (size_t)kgrp.k0 * (Cfg::B_MN_MAJOR ? ldb : p.N * Cfg::ES);
     else
@@ -310,13 +367,13 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
     const int kp = kp_of(kt);
     if (i == 0) {
       const uint8_t *base = a_group(ld);
-      return rsrc_at(base + (Cfg::A_MN_MAJOR ? (size_t)(kp * BK) * lda + (size_t)ld.m0 * Cfg::ES
+      return rsrc_at(base + (Cfg::A_MN_MAJOR ? (size_t)(kp * BK) * lda + (size_t)Cfg::a_bytes(ld.m0)
                                              : (size_t)ld.m0 * lda),
                      base + a_extent);
     }
     if (i == 1) {
       const uint8_t *base = b_group(ld);
-      return rsrc_at(base + (Cfg::B_MN_MAJOR ? (size_t)(kp * BK) * ldb + (size_t)ld.n0 * Cfg::ES
+      return rsrc_at(base + (Cfg::B_MN_MAJOR ? (size_t)(kp * BK) * ldb + (size_t)Cfg::b_bytes(ld.n0)
                                              : (size_t)ld.n0 * ldb),
                      base + b_extent);
     }
@@ -344,23 +401,25 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
       if constexpr (Cfg::A_MN_MAJOR)
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             rs.r[0],
-            (lds_ptr_t)(st + Cfg::A_OFF + (Cfg::mn_row(wave) + Cfg::mn_jrow(j)) * Cfg::MN_ROW_BYTES),
-            Cfg::DMA_BYTES, a_voff, __builtin_amdgcn_readfirstlane(Cfg::mn_jrow(j) * lda), 0, 0);
+            (lds_ptr_t)(st + Cfg::A_OFF + (Cfg::mn_row(wave, Cfg::A_FP4) + Cfg::mn_jrow(j, Cfg::A_FP4)) *
+                                              Cfg::mn_row_bytes(Cfg::A_FP4)),
+            Cfg::DMA_BYTES, a_voff, __builtin_amdgcn_readfirstlane(Cfg::mn_jrow(j, Cfg::A_FP4) * lda), 0, 0);
       else
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             rs.r[0], (lds_ptr_t)(st + Cfg::A_OFF + (j * NW + wave) * Cfg::K_WAVE_BYTES),
-            Cfg::DMA_BYTES, a_voff, j * a_step + kp * Cfg::BK_BYTES, 0, 0);
+            Cfg::DMA_BYTES, a_voff, j * a_step + kp * Cfg::A_ROW, 0, 0);
     } else if (j < Cfg::A_LOADS + Cfg::B_LOADS) {
       const int jb = j - Cfg::A_LOADS;
       if constexpr (Cfg::B_MN_MAJOR)
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             rs.r[1],
-            (lds_ptr_t)(st + Cfg::B_OFF + (Cfg::mn_row(wave) + Cfg::mn_jrow(jb)) * Cfg::MN_ROW_BYTES),
-            Cfg::DMA_BYTES, b_voff, __builtin_amdgcn_readfirstlane(Cfg::mn_jrow(jb) * ldb), 0, 0);
+            (lds_ptr_t)(st + Cfg::B_OFF + (Cfg::mn_row(wave, Cfg::B_FP4) + Cfg::mn_jrow(jb, Cfg::B_FP4)) *
+                                              Cfg::mn_row_bytes(Cfg::B_FP4)),
+            Cfg::DMA_BYTES, b_voff, __builtin_amdgcn_readfirstlane(Cfg::mn_jrow(jb, Cfg::B_FP4) * ldb), 0, 0);
       else
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             rs.r[1], (lds_ptr_t)(st + Cfg::B_OFF + (jb * NW + wave) * Cfg::K_WAVE_BYTES),
-            Cfg::DMA_BYTES, b_voff, jb * b_step + kp * Cfg::BK_BYTES, 0, 0);
+            Cfg::DMA_BYTES, b_voff, jb * b_step + kp * Cfg::B_ROW, 0, 0);
     } else if (j == Cfg::A_LOADS + Cfg::B_LOADS)
       __builtin_amdgcn_raw_ptr_buffer_load_lds(
           rs.r[2], (lds_ptr_t)(st + Cfg::SA_OFF + wave * Cfg::SCALE_WAVE_BYTES), Cfg::SCALE_BYTES,
@@ -376,8 +435,9 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   // logical ^ key(row); the key only depends on r16) and byte g of the row's scale word: the code
   // of K block g. With 128-wide scale blocks all lanes read byte kp % 4, the code of K tile kp,
   // which goes into the (uniform) stage offset of the scale reads (scale_byte_offsets).
-  const uint32_t a_row_offset = Cfg::A_OFF + (uint32_t)(wm * 128 + r16) * 128;
-  const uint32_t b_row_offset = Cfg::B_OFF + (uint32_t)(wn * 128 + Cfg::brow(r16)) * 128;
+  // (an FP4 row has logical chunks 0-3 and one half: chunk g)
+  const uint32_t a_row_offset = Cfg::A_OFF + (uint32_t)(wm * 128 + r16) * Cfg::A_ROW;
+  const uint32_t b_row_offset = Cfg::B_OFF + (uint32_t)(wn * 128 + Cfg::brow(r16)) * Cfg::B_ROW;
   const uint32_t a_half0_offset = (uint32_t)(g ^ Cfg::key(r16)) * 16;
   const uint32_t a_half1_offset = (uint32_t)((g + 4) ^ Cfg::key(r16)) * 16;
   const uint32_t b_half0_offset = (uint32_t)(g ^ Cfg::keyB(Cfg::brow(r16))) * 16;
@@ -411,10 +471,17 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
                 : (uint32_t)(16 * g + (r16 >> 1)) * 256 + 8 * (r16 & 1);
   const uint32_t mn_lane_chunk = Cfg::BF16 ? (uint32_t)((r16 & 3) >> 1) : 0u;
   const uint32_t mn_wave_chunk = Cfg::BF16 ? 16u : 8u;
+  // FP4: fragment f covers the 16 MN columns of half f % 2 of chunk 4 w + f / 2 (16 bytes hold 32
+  // columns). Transposing read s gives lane (g, r16) K = 32 g + 16 s .. + 15 of its column r16; lane
+  // r16 points at K row 32 g + 16 s + r16, whose key (r16 / 2) % 8 is the same for every s.
+  const uint32_t fp4_key = (uint32_t)((r16 >> 1) & 7);
+  const uint32_t fp4_lane_offset = (uint32_t)(32 * g + r16) * (uint32_t)Cfg::mn_row_bytes(true);
   const uint32_t a_transpose_base =
-      Cfg::A_OFF + mn_lane_offset + ((mn_wave_chunk * wm + mn_lane_chunk) ^ mn_key) * 16;
+      Cfg::A_FP4 ? Cfg::A_OFF + fp4_lane_offset + ((4u * wm) ^ fp4_key) * 16
+                 : Cfg::A_OFF + mn_lane_offset + ((mn_wave_chunk * wm + mn_lane_chunk) ^ mn_key) * 16;
   const uint32_t b_transpose_base =
-      Cfg::B_OFF + mn_lane_offset + ((mn_wave_chunk * wn + mn_lane_chunk) ^ mn_key) * 16;
+      Cfg::B_FP4 ? Cfg::B_OFF + fp4_lane_offset + ((4u * wn) ^ fp4_key) * 16
+                 : Cfg::B_OFF + mn_lane_offset + ((mn_wave_chunk * wn + mn_lane_chunk) ^ mn_key) * 16;
 
   v4i a_fragments[8][2], b_fragments[8][2];    // [fragment][half]: the MFMA operands
   uint32_t a_scale_codes[8], b_scale_codes[8]; // [fragment]: the lane's scale code, in byte 0
@@ -423,9 +490,15 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   // The XOR goes after the stage offset (whose bits 4-6 are 0): base ^ (f << 4) alone is loop
   // invariant, and the compiler keeps all 8 of them in registers.
   static_assert((Cfg::STAGE_BYTES & 0xf0) == 0, "the stage offset must not touch the chunk bits");
-  auto read_transposed_half = [&](uint32_t stage_offset, uint32_t base, int fragment, int half) {
+  auto read_transposed_half = [&](uint32_t stage_offset, uint32_t base, int fragment, int half, auto fp4) {
     typedef const __attribute__((address_space(3))) v2i *lds_v2i;
-    if constexpr (Cfg::BF16) {
+    if constexpr (decltype(fp4)::value) { // the operand's only half
+      const uint32_t addr =
+          ((base + stage_offset) ^ (uint32_t)((fragment >> 1) << 4)) + 8 * (uint32_t)(fragment & 1);
+      const v2i lo = ds_read_tr4((lds_v2i)(smem + addr));
+      const v2i hi = ds_read_tr4((lds_v2i)(smem + addr + 16 * Cfg::mn_row_bytes(true)));
+      return v4i{lo[0], lo[1], hi[0], hi[1]};
+    } else if constexpr (Cfg::BF16) {
       const uint32_t addr =
           ((base + stage_offset) ^ (uint32_t)(fragment << 5)) + 32 * half * Cfg::MN_ROW_BYTES;
       const v2i lo = ds_read_tr16((lds_v2i)(smem + addr));
@@ -444,42 +517,37 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
                                 const ScaleByteOffsets &scale_bytes) {
     const uint8_t *stage = smem + stage_offset;
     if (!is_b) {
-      if (part < 2)
+      if (part < Cfg::A_HALVES)
         a_fragments[f][part] = Cfg::A_MN_MAJOR
-                                   ? read_transposed_half(stage_offset, a_transpose_base, f, part)
-                                   : *(const v4i *)(stage + a_row_offset + f * 2048 +
+                                   ? read_transposed_half(stage_offset, a_transpose_base, f, part,
+                                                          std::bool_constant<Cfg::A_FP4>{})
+                                   : *(const v4i *)(stage + a_row_offset + f * 16 * Cfg::A_ROW +
                                                     (part ? a_half1_offset : a_half0_offset));
       else
         a_scale_codes[f] =
             *(const uint8_t *)(smem + (stage_offset + scale_bytes.a) + a_scale_offset + f * 64);
     } else {
-      if (part < 2)
+      if (part < Cfg::B_HALVES)
         b_fragments[f][part] = Cfg::B_MN_MAJOR
-                                   ? read_transposed_half(stage_offset, b_transpose_base, f, part)
-                                   : *(const v4i *)(stage + b_row_offset + Cfg::bfrag(f) * 128 +
+                                   ? read_transposed_half(stage_offset, b_transpose_base, f, part,
+                                                          std::bool_constant<Cfg::B_FP4>{})
+                                   : *(const v4i *)(stage + b_row_offset + Cfg::bfrag(f) * Cfg::B_ROW +
                                                     (part ? b_half1_offset : b_half0_offset));
       else
         b_scale_codes[f] = *(const uint8_t *)(smem + (stage_offset + scale_bytes.b) +
                                               b_scale_offset + Cfg::bfrag(f) * 4);
     }
   };
-  // Read i (0 .. READS_PER_FRAGMENT_GROUP - 1) of fragments 4-7 of this K step, in the order A 4-7,
-  // B 4-7: part i % PARTS of the (i / PARTS)-th fragment of that list.
+  // Read i (0 .. READS_PER_FRAGMENT_GROUP - 1) of fragments 4-7 / 0-3 of a K step
   auto read_fragments_4_to_7 = [&](int i, uint32_t stage_offset,
                                    const ScaleByteOffsets &scale_bytes) {
-    const int item = i / Cfg::PARTS;
-    read_fragment_part(item >= 4, 4 + item % 4, i % Cfg::PARTS, stage_offset, scale_bytes);
+    const auto r = Cfg::read_of_fragments_4_to_7(i);
+    read_fragment_part(r.is_b, r.fragment, r.part, stage_offset, scale_bytes);
   };
-  // Read i of fragments 0-3 of a K step, in the order B 0, A 0-3, B 1-3: the order in which the
-  // first quadrant of MFMAs (B 0-3 x A 0-3, B 0 first) needs them.
   auto read_fragments_0_to_3 = [&](int i, uint32_t stage_offset,
                                    const ScaleByteOffsets &scale_bytes) {
-    const int item = i / Cfg::PARTS;
-    read_fragment_part(item == 0 || item >= 5,
-                       item == 0   ? 0
-                       : item <= 4 ? item - 1
-                                   : item - 4,
-                       i % Cfg::PARTS, stage_offset, scale_bytes);
+    const auto r = Cfg::read_of_fragments_0_to_3(i);
+    read_fragment_part(r.is_b, r.fragment, r.part, stage_offset, scale_bytes);
   };
 
   v4f acc[8][8];
@@ -495,8 +563,9 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
       acc[i][j] = mfma_bf16_16x16x32(b_fragments[j][1], a_fragments[i][1], acc[i][j]);
     } else {
       acc[i][j] = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-          cat8(b_fragments[j][0], b_fragments[j][1]), cat8(a_fragments[i][0], a_fragments[i][1]),
-          zero ? v4f{} : acc[i][j], kFmtFp8, kFmtFp8, 0, b_scale_codes[j], 0, a_scale_codes[i]);
+          scaled_operand<Cfg::B_FP4>(b_fragments[j]), scaled_operand<Cfg::A_FP4>(a_fragments[i]),
+          zero ? v4f{} : acc[i][j], Cfg::B_FP4 ? kFmtFp4 : kFmtFp8, Cfg::A_FP4 ? kFmtFp4 : kFmtFp8, 0,
+          b_scale_codes[j], 0, a_scale_codes[i]);
     }
   };
 
@@ -718,9 +787,10 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
     if constexpr (Cfg::K_GROUPED) {
       kgrp = Scheduler::k_group(p, src.group, 128 << Cfg::SFA_SHIFT);
       K = kgrp.kg;
-      if constexpr (!Cfg::A_MN_MAJOR)
+      // (FP4 operands are column ranges of [M, sum_k / 2] / [N, sum_k / 2] rows)
+      if constexpr (!Cfg::A_MN_MAJOR && !Cfg::A_FP4)
         lda = K * Cfg::ES;
-      if constexpr (!Cfg::B_MN_MAJOR)
+      if constexpr (!Cfg::B_MN_MAJOR && !Cfg::B_FP4)
         ldb = K * Cfg::ES;
       set_geometry();
       kb = 0;

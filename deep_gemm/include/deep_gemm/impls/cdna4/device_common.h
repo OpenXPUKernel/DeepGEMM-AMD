@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <type_traits>
 using deep_gemm::cdna4::GemmArgs;
+using deep_gemm::cdna4::OperandType;
 
 typedef int v2i __attribute__((ext_vector_type(2)));
 typedef unsigned v2u __attribute__((ext_vector_type(2)));
@@ -15,7 +16,7 @@ typedef float v4f __attribute__((ext_vector_type(4)));
 typedef unsigned v4u __attribute__((ext_vector_type(4)));
 
 // OCP E4M3 operand format for scaled MFMA.
-constexpr int kFmtFp8 = 0;
+constexpr int kFmtFp8 = 0, kFmtFp4 = 4;
 
 __host__ __device__ inline float bf16_to_f32(std::uint16_t h) {
   std::uint32_t u = (std::uint32_t)h << 16;
@@ -72,6 +73,13 @@ __device__ __forceinline__ v2i ds_read_tr8(const __attribute__((address_space(3)
       const_cast<__attribute__((address_space(3))) v2i *>(p));
 }
 
+// 16 lanes read 8 bytes (16 values) of 16 rows; lane j gets column j of the rows, row i in nibble i
+__device__ __forceinline__ v2i ds_read_tr4(const __attribute__((address_space(3)))
+                                           v2i *__restrict__ p) {
+  return __builtin_amdgcn_ds_read_tr4_b64_v2i32(
+      const_cast<__attribute__((address_space(3))) v2i *>(p));
+}
+
 __device__ __forceinline__ v2i ds_read_tr16(const __attribute__((address_space(3)))
                                             v2i *__restrict__ p) {
   typedef short v4s __attribute__((ext_vector_type(4)));
@@ -111,4 +119,13 @@ __device__ __forceinline__ v4f mfma_bf16_16x16x32(v4i a, v4i b, v4f c) {
 // Join the two halves of a scaled MFMA operand.
 __device__ __forceinline__ v8i cat8(const v4i &lo, const v4i &hi) {
   return __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7);
+}
+
+// Scaled MFMA operand from a fragment's halves: an FP4 operand is the first half alone (its 32 K
+// values per lane fill 4 registers; the instruction does not read the other 4).
+template <bool FP4> __device__ __forceinline__ v8i scaled_operand(const v4i (&halves)[2]) {
+  if constexpr (FP4)
+    return __builtin_shufflevector(halves[0], halves[0], 0, 1, 2, 3, -1, -1, -1, -1);
+  else
+    return cat8(halves[0], halves[1]);
 }

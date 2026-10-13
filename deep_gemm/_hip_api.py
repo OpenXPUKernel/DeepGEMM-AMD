@@ -283,11 +283,30 @@ def get_plan(m: int, n: int, k: int) -> Tuple[int, int]:
     return tuple(_backend().cdna4_fp8_gemm_plan(m, n, k))
 
 
-def _check_fp8(x: torch.Tensor, name: str) -> None:
-    if x.dtype != torch.float8_e4m3fn or x.dim() != 2:
-        raise TypeError(f"{name} must be a 2-D torch.float8_e4m3fn tensor")
-    if x.stride(1) != 1 and x.stride(0) != 1 and min(x.shape) > 1:
+def _is_fp4(x: torch.Tensor) -> bool:
+    """Packed FP4 (E2M1) operands are int8 tensors with two values per byte, the lower index in the
+    low nibble."""
+    return x.dtype in (torch.int8, torch.uint8)
+
+
+def _check_fp8_fp4(x: torch.Tensor, name: str, dim: int = 2) -> None:
+    if x.dim() != dim or (x.dtype != torch.float8_e4m3fn and not _is_fp4(x)):
+        raise TypeError(f"{name} must be a {dim}-D torch.float8_e4m3fn or packed FP4 (torch.int8) tensor")
+    if x.stride(-1) != 1 and x.stride(-2) != 1 and min(x.shape[-2:]) > 1:
         raise ValueError(f"{name} must be K-major or MN-major")
+
+
+def _logical_mn_k(x: torch.Tensor) -> Tuple[int, int]:
+    """(MN, K) of an FP8 or packed FP4 operand [..., MN, K]: FP4 packs two values per byte along its
+    contiguous dimension (K, or MN when MN-major)"""
+    mn, k = x.shape[-2:]
+    if not _is_fp4(x):
+        return mn, k
+    return (2 * mn, k) if k > 1 and x.stride(-1) != 1 else (mn, 2 * k)
+
+
+def _logical_k(x: torch.Tensor) -> int:
+    return _logical_mn_k(x)[1]
 
 
 def _operand_layout(x: torch.Tensor, name: str) -> Tuple[bool, int]:
@@ -343,10 +362,10 @@ def fp8_gemm_nt(
     if epilogue is not None:
         raise NotImplementedError("custom epilogues are not supported by the CDNA4 backend")
     (a_fp8, sfa), (b_fp8, sfb) = a, b
-    _check_fp8(a_fp8, "a")
-    _check_fp8(b_fp8, "b")
-    m, k = a_fp8.shape
-    n, kb = b_fp8.shape
+    _check_fp8_fp4(a_fp8, "a")
+    _check_fp8_fp4(b_fp8, "b")
+    m, k = _logical_mn_k(a_fp8)
+    n, kb = _logical_mn_k(b_fp8)
     if k != kb or d.dim() != 2 or tuple(d.shape) != (m, n):
         raise ValueError(f"shape mismatch: a={tuple(a_fp8.shape)}, b={tuple(b_fp8.shape)}, d={tuple(d.shape)}")
     if d.dtype not in (torch.bfloat16, torch.float32) or (d.stride(1) != 1 and n > 1):
@@ -410,11 +429,6 @@ fp8_fp4_gemm_tt = fp8_gemm_tt
 fp4_gemm_nt = fp8_gemm_nt
 
 
-def _check_fp8_3d(x: torch.Tensor, name: str) -> None:
-    if x.dtype != torch.float8_e4m3fn or x.dim() != 3:
-        raise TypeError(f"{name} must be a 3-D torch.float8_e4m3fn tensor")
-
-
 def _check_same_device(d: torch.Tensor, *tensors: torch.Tensor) -> None:
     if not d.is_cuda or any(t.device != d.device for t in tensors):
         raise ValueError("all GEMM tensors must be on the same accelerator device")
@@ -437,10 +451,10 @@ def m_grouped_fp8_fp4_gemm_nt_contiguous(
     if expected_m_for_psum_layout is not None and not use_psum_layout:
         raise ValueError("expected_m_for_psum_layout requires the PSUM layout")
     (a_fp8, sfa), (b_fp8, sfb) = a, b
-    _check_fp8(a_fp8, "a")
-    _check_fp8_3d(b_fp8, "b")
-    m, k = a_fp8.shape
-    num_groups, n, kb = b_fp8.shape
+    _check_fp8_fp4(a_fp8, "a")
+    _check_fp8_fp4(b_fp8, "b", 3)
+    m, k = a_fp8.size(0), _logical_k(a_fp8)
+    num_groups, (n, kb) = b_fp8.size(0), _logical_mn_k(b_fp8)
     if k != kb or d.dim() != 2 or tuple(d.shape) != (m, n):
         raise ValueError(f"shape mismatch: a={tuple(a_fp8.shape)}, b={tuple(b_fp8.shape)}, d={tuple(d.shape)}")
     if d.dtype != torch.bfloat16:
@@ -475,11 +489,11 @@ def m_grouped_fp8_fp4_gemm_nt_masked(
     if epilogue is not None:
         raise NotImplementedError("custom epilogues are not supported by the CDNA4 backend")
     (a_fp8, sfa), (b_fp8, sfb) = a, b
-    _check_fp8_3d(a_fp8, "a")
-    _check_fp8_3d(b_fp8, "b")
-    num_groups, max_m, k = a_fp8.shape
-    _, n, _ = b_fp8.shape
-    if (tuple(b_fp8.shape) != (num_groups, n, k) or d.dim() != 3 or
+    _check_fp8_fp4(a_fp8, "a", 3)
+    _check_fp8_fp4(b_fp8, "b", 3)
+    num_groups, max_m, k = a_fp8.size(0), a_fp8.size(1), _logical_k(a_fp8)
+    n = _logical_mn_k(b_fp8)[0]
+    if (b_fp8.size(0) != num_groups or _logical_k(b_fp8) != k or d.dim() != 3 or
             tuple(d.shape) != (num_groups, max_m, n)):
         raise ValueError(f"shape mismatch: a={tuple(a_fp8.shape)}, b={tuple(b_fp8.shape)}, d={tuple(d.shape)}")
     if d.dtype != torch.bfloat16:
@@ -511,16 +525,19 @@ def _k_grouped_gemm(a, b, d, ks_cpu, grouped_layout, c, recipe, use_psum_layout,
     if k_alignment % 128:
         raise ValueError("the K alignment must be a multiple of 128")
     (a_fp8, sfa), (b_fp8, sfb) = a, b
+    fp4 = _is_fp4(a_fp8)
     if d.dim() != 3 or grouped_layout.numel() != d.size(0):
         raise ValueError("d must be [G, M, N] with one grouped_layout entry per group")
     if ks_cpu and not use_psum_layout:
-        if sum(ks_cpu) * d.size(1) != a_fp8.numel() or sum(ks_cpu) * d.size(2) != b_fp8.numel():
+        values_per_element = 2 if fp4 else 1
+        if (sum(ks_cpu) * d.size(1) != a_fp8.numel() * values_per_element or
+                sum(ks_cpu) * d.size(2) != b_fp8.numel() * values_per_element):
             raise ValueError("ks_cpu does not match the operand sizes")
     _check_same_device(d, a_fp8, b_fp8, sfa, sfb, grouped_layout)
     if not use_psum_layout and not ks_cpu:
         raise ValueError("ks_cpu is required without the PSUM layout")
-    if k_major:
-        # FP32 scales of K-major blocks come as [mn, sum of K blocks]
+    if k_major and not fp4:
+        # FP32 scales of K-major FP8 blocks come as [mn, sum of K blocks] (FP4: [sum of K blocks, mn])
         sfa = sfa.T if sfa.dtype == torch.float32 else sfa
         sfb = sfb.T if sfb.dtype == torch.float32 else sfb
     if d.size(0) and d.size(1) and d.size(2) and a_fp8.numel():
@@ -678,5 +695,16 @@ m_grouped_fp4_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
 m_grouped_fp8_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
 
 
-def k_grouped_fp4_gemm_nt_contiguous(*args, **kwargs):
-    raise NotImplementedError("FP4 GEMMs are not supported by the CDNA4 backend yet")
+def k_grouped_fp4_gemm_nt_contiguous(
+    a, b, d, ks_cpu, grouped_layout, c=None, recipe=(1, 1, 32), compiled_dims="mn",
+    use_psum_layout=False, epilogue=None,
+) -> None:
+    """K-grouped FP4 GEMM over packed K-major A [M, sum_k / 2], B [N, sum_k / 2]: group g takes the
+    K columns of its range; without the PSUM layout grouped_layout[g] is its padded K, with it its
+    end K."""
+    del compiled_dims
+    if tuple(recipe) != (1, 1, 32):
+        raise ValueError("FP4 K-grouped GEMMs take recipe (1, 1, 32)")
+    if not (_is_fp4(a[0]) and _is_fp4(b[0]) and a[0].dim() == 2 and b[0].dim() == 2):
+        raise TypeError("a and b must be 2-D packed FP4 (torch.int8) tensors")
+    _k_grouped_gemm(a, b, d, ks_cpu, grouped_layout, c, tuple(recipe), use_psum_layout, epilogue, True)

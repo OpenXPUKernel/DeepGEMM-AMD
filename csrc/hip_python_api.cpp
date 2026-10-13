@@ -31,15 +31,38 @@ int stride_as_int(const torch::Tensor& t, int dim, const char* name) {
     return static_cast<int>(value);
 }
 
-struct OperandLayout { bool mn_major; int ld; };
+using deep_gemm::cdna4::OperandType;
 
-const char* dtype_name(torch::ScalarType dtype) {
-    return dtype == torch::kBFloat16 ? "BF16" : "FP8 E4M3";
+// mn, k: the logical sizes (an FP4 tensor packs two values per byte along its contiguous dimension)
+struct OperandLayout { bool mn_major; int ld; int64_t mn, k; };
+
+const char* operand_type_name(OperandType type) {
+    return type == OperandType::Bf16 ? "BF16" : type == OperandType::Fp8 ? "FP8 E4M3" : "packed FP4 (int8)";
+}
+
+bool is_packed_fp4(const torch::Tensor& t) {
+    return t.scalar_type() == torch::kInt8 || t.scalar_type() == torch::kByte;
+}
+
+// Operands with scales are FP8 or packed FP4, operands without scales BF16
+OperandType operand_type(const torch::Tensor& t, bool scaled, const char* name) {
+    if (!scaled) {
+        TORCH_CHECK(t.scalar_type() == torch::kBFloat16, name, " must be BF16 without scales");
+        return OperandType::Bf16;
+    }
+    TORCH_CHECK(t.scalar_type() == torch::kFloat8_e4m3fn || is_packed_fp4(t),
+                name, " must be FP8 E4M3 or packed FP4 (int8)");
+    return is_packed_fp4(t) ? OperandType::Fp4 : OperandType::Fp8;
+}
+
+bool matches(const torch::Tensor& t, OperandType type) {
+    return type == OperandType::Fp4 ? is_packed_fp4(t)
+         : t.scalar_type() == (type == OperandType::Bf16 ? torch::kBFloat16 : torch::kFloat8_e4m3fn);
 }
 
 // Row strides are bytes: the kernels address operands bytewise.
-OperandLayout operand_layout(const torch::Tensor& t, const char* name, torch::ScalarType dtype) {
-    TORCH_CHECK(t.scalar_type() == dtype, name, " must be ", dtype_name(dtype));
+OperandLayout operand_layout(const torch::Tensor& t, const char* name, OperandType type) {
+    TORCH_CHECK(matches(t, type), name, " must be ", operand_type_name(type));
     const int64_t es = t.element_size();
     const auto mn = t.size(0), k = t.size(1);
     TORCH_CHECK(t.stride(1) == 1 || t.stride(0) == 1 || std::min(mn, k) <= 1,
@@ -61,7 +84,8 @@ OperandLayout operand_layout(const torch::Tensor& t, const char* name, torch::Sc
                 name, " physical row stride must cover its row, be divisible by four and below 1 << 24");
     TORCH_CHECK(row % 4 == 0 || reinterpret_cast<uintptr_t>(t.data_ptr()) % 4 == 0,
                 name, " ragged rows require a four-byte aligned base");
-    return {mn_major, static_cast<int>(ld)};
+    const int64_t pack = type == OperandType::Fp4 ? 2 : 1;
+    return {mn_major, static_cast<int>(ld), mn_major ? mn * pack : mn, mn_major ? k : k * pack};
 }
 
 int scale_stride(const torch::Tensor& t, int rows, int k, int gran_k, const char* name) {
@@ -95,7 +119,17 @@ GemmArgs make_args(const torch::Tensor& a, const OptTensor& sfa, const torch::Te
 
 void cdna4_init(const std::string& root) { jit_runtime.init(root); }
 
-// FP8 operands with packed scales, or (no scales) BF16 operands
+// Logical [MN, K] of an operand [..., MN, K]: FP4 packs two values per byte along the contiguous
+// dimension (K, or MN for an MN-major tensor)
+std::pair<int64_t, int64_t> logical_mn_k(const torch::Tensor& t, OperandType type) {
+    if (type != OperandType::Fp4)
+        return {t.size(-2), t.size(-1)};
+    const bool mn_major = t.size(-1) > 1 && t.stride(-1) != 1;
+    return mn_major ? std::pair<int64_t, int64_t>{2 * t.size(-2), t.size(-1)}
+                    : std::pair<int64_t, int64_t>{t.size(-2), 2 * t.size(-1)};
+}
+
+// FP8 / packed FP4 operands with packed scales, or (no scales) BF16 operands
 void cdna4_fp8_gemm_nt(const torch::Tensor& a, const std::optional<torch::Tensor>& sfa,
                        const torch::Tensor& b, const std::optional<torch::Tensor>& sfb,
                        const torch::Tensor& d, const std::optional<torch::Tensor>& c,
@@ -103,7 +137,6 @@ void cdna4_fp8_gemm_nt(const torch::Tensor& a, const std::optional<torch::Tensor
     const auto device = d.device();
     const bool bf16 = !sfa.has_value();
     TORCH_CHECK(sfa.has_value() == sfb.has_value(), "pass scales for both operands or for none");
-    const auto dtype = bf16 ? torch::kBFloat16 : torch::kFloat8_e4m3fn;
     check_tensor(d, device, "d");
     check_tensor(a, device, "a");
     check_tensor(b, device, "b");
@@ -111,11 +144,13 @@ void cdna4_fp8_gemm_nt(const torch::Tensor& a, const std::optional<torch::Tensor
         check_tensor(*sfa, device, "sfa");
         check_tensor(*sfb, device, "sfb");
     }
-    TORCH_CHECK(a.size(0) <= std::numeric_limits<int>::max() &&
-                b.size(0) <= std::numeric_limits<int>::max() &&
-                a.size(1) <= std::numeric_limits<int>::max(), "GEMM dimensions are out of range");
-    const int m = a.size(0), n = b.size(0), k = a.size(1);
-    TORCH_CHECK(b.size(1) == k && d.size(0) == m && d.size(1) == n, "GEMM shape mismatch");
+    const auto a_type = operand_type(a, !bf16, "a"), b_type = operand_type(b, !bf16, "b");
+    const auto [m64, k64] = logical_mn_k(a, a_type);
+    const auto [n64, kb64] = logical_mn_k(b, b_type);
+    TORCH_CHECK(m64 <= std::numeric_limits<int>::max() && n64 <= std::numeric_limits<int>::max() &&
+                k64 <= std::numeric_limits<int>::max(), "GEMM dimensions are out of range");
+    const int m = m64, n = n64, k = k64;
+    TORCH_CHECK(kb64 == k && d.size(0) == m && d.size(1) == n, "GEMM shape mismatch");
     TORCH_CHECK(d.scalar_type() == torch::kBFloat16 || d.scalar_type() == torch::kFloat,
                 "d must be BF16 or FP32");
     TORCH_CHECK(n <= 1 || d.stride(1) == 1, "d must be N-major");
@@ -137,14 +172,14 @@ void cdna4_fp8_gemm_nt(const torch::Tensor& a, const std::optional<torch::Tensor
         else d.zero_();
         return;
     }
-    const auto lhs = operand_layout(a, "a", dtype), rhs = operand_layout(b, "b", dtype);
+    const auto lhs = operand_layout(a, "a", a_type), rhs = operand_layout(b, "b", b_type);
     const int lda_sf = bf16 ? 0 : scale_stride(*sfa, m, k, gran_k_a, "sfa");
     const int ldb_sf = bf16 ? 0 : scale_stride(*sfb, n, k, gran_k_b, "sfb");
     const int out_dtype = d.scalar_type() == torch::kFloat ? MXFP8_OUT_FP32 : MXFP8_OUT_BF16;
-    const auto config = get_best_config(m, n, k * int(a.element_size()), out_dtype, c.has_value(), ldd,
+    const auto config = get_best_config(m, n, deep_gemm::cdna4::planner_k(k, a_type), out_dtype, c.has_value(), ldd,
         reinterpret_cast<uintptr_t>(d.data_ptr()) % 16 == 0,
         int(lhs.mn_major) | (int(rhs.mn_major) << 1),
-        bf16 ? 0 : int(gran_k_a == 128) | (int(gran_k_b == 128) << 1), bf16);
+        bf16 ? 0 : int(gran_k_a == 128) | (int(gran_k_b == 128) << 1), a_type, b_type);
 
     // Each split writes FP32 [M, align(N,4)]; workspace_size is measured in bytes.
     const auto workspace_size = jit_runtime.workspace_size(config, m, n);
@@ -168,8 +203,8 @@ void cdna4_fp8_gemm_nt(const torch::Tensor& a, const std::optional<torch::Tensor
 // B of an m-grouped GEMM, [G, N, K]: K-major or MN-major within each group.
 struct GroupedOperandLayout { bool mn_major; int ld; int64_t group_stride; };
 
-GroupedOperandLayout grouped_operand_layout(const torch::Tensor& t, const char* name, torch::ScalarType dtype) {
-    TORCH_CHECK(t.scalar_type() == dtype && t.dim() == 3, name, " must be a 3-D ", dtype_name(dtype), " tensor");
+GroupedOperandLayout grouped_operand_layout(const torch::Tensor& t, const char* name, OperandType type) {
+    TORCH_CHECK(matches(t, type) && t.dim() == 3, name, " must be a 3-D ", operand_type_name(type), " tensor");
     const int64_t es = t.element_size();
     const auto mn = t.size(1), k = t.size(2);
     const bool mn_major = mn > 1 && k > 1 ? t.stride(2) != 1 : (mn == 1 ? false : t.stride(1) == 1 && k > 1);
@@ -257,16 +292,18 @@ void cdna4_m_grouped_fp8_gemm_contiguous(const torch::Tensor& a, const OptTensor
     const auto device = d.device();
     const bool bf16 = !sfa.has_value();
     TORCH_CHECK(sfa.has_value() == sfb.has_value(), "pass scales for both operands or for none");
-    const auto dtype = bf16 ? torch::kBFloat16 : torch::kFloat8_e4m3fn;
     check_tensor(d, device, "d");
     check_tensor(a, device, "a");
-    TORCH_CHECK(b.is_cuda() && b.device() == device, "b must be on the output accelerator device");
+    TORCH_CHECK(b.is_cuda() && b.device() == device && b.dim() == 3, "b must be a 3-D tensor on the output device");
     if (!bf16) {
         check_tensor(*sfa, device, "sfa");
         TORCH_CHECK(sfb->is_cuda() && sfb->device() == device, "sfb must be on the output accelerator device");
     }
-    const int m = a.size(0), k = a.size(1), groups = b.size(0), n = b.size(1);
-    TORCH_CHECK(b.size(2) == k && d.size(0) == m && d.size(1) == n, "grouped GEMM shape mismatch");
+    const auto a_type = operand_type(a, !bf16, "a"), b_type = operand_type(b, !bf16, "b");
+    const int m = a.size(0), k = logical_mn_k(a, a_type).second, groups = b.size(0);
+    const int n = logical_mn_k(b, b_type).first;
+    TORCH_CHECK(logical_mn_k(b, b_type).second == k && d.size(0) == m && d.size(1) == n,
+                "grouped GEMM shape mismatch");
     TORCH_CHECK(d.scalar_type() == torch::kBFloat16, "m-grouped GEMMs write BF16 outputs");
     TORCH_CHECK(n <= 1 || d.stride(1) == 1, "d must be N-major");
     check_grouped_layout(grouped_layout, use_psum_layout ? groups : m, device);
@@ -275,13 +312,13 @@ void cdna4_m_grouped_fp8_gemm_contiguous(const torch::Tensor& a, const OptTensor
     if (m == 0 || n == 0)
         return;
     TORCH_CHECK(k > 0 && groups > 0, "grouped GEMMs need K > 0 and at least one group");
-    const auto lhs = operand_layout(a, "a", dtype);
+    const auto lhs = operand_layout(a, "a", a_type);
     TORCH_CHECK(!lhs.mn_major || m == 1, "a must be K-major");
-    const auto rhs = grouped_operand_layout(b, "b", dtype);
+    const auto rhs = grouped_operand_layout(b, "b", b_type);
     const int lda_sf = bf16 ? 0 : scale_stride(*sfa, m, k, gran_k_a, "sfa");
     const auto [ldb_sf, sfb_group_stride] =
         bf16 ? std::pair<int, int64_t>{0, 0} : grouped_scale_stride(*sfb, groups, n, k, gran_k_b, "sfb");
-    const int kb = k * int(a.element_size());
+    const int kb = deep_gemm::cdna4::planner_k(k, a_type);
     const int ldd = m > 1 ? stride_as_int(d, 0, "d") : n;
     const auto type = use_psum_layout ? deep_gemm::cdna4::GemmType::MGroupedContiguousPsum
                                       : deep_gemm::cdna4::GemmType::MGroupedContiguous;
@@ -295,7 +332,8 @@ void cdna4_m_grouped_fp8_gemm_contiguous(const torch::Tensor& a, const OptTensor
         ? grouped_small_m_config(expected_m > 0 ? expected_m : 64, n, kb, m_alignment, sf_gran, type, groups)
         : deep_gemm::cdna4::get_m_grouped_config(type, kb, ldd, reinterpret_cast<uintptr_t>(d.data_ptr()) % 16 == 0,
                                                  int(rhs.mn_major) << 1, sf_gran);
-    config.bf16 = bf16;
+    config.a_type = a_type;
+    config.b_type = b_type;
     check_m_alignment(m_alignment, config.block_m);
     GemmArgs args = make_args(a, sfa, b, sfb, d, nullptr, m, n, k, lhs.ld, rhs.ld, lda_sf, ldb_sf, ldd);
     args.grouped_layout = grouped_layout.data_ptr<std::int32_t>();
@@ -318,14 +356,15 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor& a, const OptTensor& sf
     const auto device = d.device();
     const bool bf16 = !sfa.has_value();
     TORCH_CHECK(sfa.has_value() == sfb.has_value(), "pass scales for both operands or for none");
-    const auto dtype = bf16 ? torch::kBFloat16 : torch::kFloat8_e4m3fn;
     TORCH_CHECK(a.is_cuda() && a.device() == device && b.is_cuda() && b.device() == device && d.is_cuda() &&
                 (bf16 || (sfa->is_cuda() && sfa->device() == device && sfb->is_cuda() && sfb->device() == device)),
                 "all tensors must be on the output accelerator device");
-    TORCH_CHECK(a.dim() == 3 && d.dim() == 3, "masked GEMMs take 3-D a and d");
-    const int groups = a.size(0), max_m = a.size(1), k = a.size(2), n = b.size(1);
-    TORCH_CHECK(b.size(0) == groups && b.size(2) == k && d.size(0) == groups && d.size(1) == max_m &&
-                d.size(2) == n, "masked GEMM shape mismatch");
+    TORCH_CHECK(a.dim() == 3 && b.dim() == 3 && d.dim() == 3, "masked GEMMs take 3-D a, b and d");
+    const auto a_type = operand_type(a, !bf16, "a"), b_type = operand_type(b, !bf16, "b");
+    const int groups = a.size(0), max_m = a.size(1), k = logical_mn_k(a, a_type).second;
+    const int n = logical_mn_k(b, b_type).first;
+    TORCH_CHECK(b.size(0) == groups && logical_mn_k(b, b_type).second == k && d.size(0) == groups &&
+                d.size(1) == max_m && d.size(2) == n, "masked GEMM shape mismatch");
     TORCH_CHECK(d.scalar_type() == torch::kBFloat16, "masked GEMMs write BF16 outputs");
     TORCH_CHECK(n <= 1 || d.stride(2) == 1, "d must be N-major");
     TORCH_CHECK(expected_m > 0, "expected_m must be positive");
@@ -334,16 +373,16 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor& a, const OptTensor& sf
     if (groups == 0 || max_m == 0 || n == 0)
         return;
     TORCH_CHECK(k > 0, "masked GEMMs need K > 0");
-    const auto lhs = grouped_operand_layout(a, "a", dtype);
+    const auto lhs = grouped_operand_layout(a, "a", a_type);
     TORCH_CHECK(!lhs.mn_major, "a must be K-major");
-    const auto rhs = grouped_operand_layout(b, "b", dtype);
+    const auto rhs = grouped_operand_layout(b, "b", b_type);
     TORCH_CHECK(!rhs.mn_major, "b must be K-major");
     const auto [lda_sf, sfa_group_stride] =
         bf16 ? std::pair<int, int64_t>{0, 0} : grouped_scale_stride(*sfa, groups, max_m, k, gran_k_a, "sfa");
     const auto [ldb_sf, sfb_group_stride] =
         bf16 ? std::pair<int, int64_t>{0, 0} : grouped_scale_stride(*sfb, groups, n, k, gran_k_b, "sfb");
     const int ldd = max_m > 1 ? stride_as_int(d, 1, "d") : n;
-    const int kb = k * int(a.element_size());
+    const int kb = deep_gemm::cdna4::planner_k(k, a_type);
     const int sf_gran = bf16 ? 0 : int(gran_k_a == 128) | (int(gran_k_b == 128) << 1);
     auto config = deep_gemm::cdna4::small_m_eligible(expected_m, n, kb, 0)
         ? deep_gemm::cdna4::get_small_m_config(expected_m, n, kb, sf_gran, deep_gemm::cdna4::GemmType::MGroupedMasked,
@@ -351,7 +390,8 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor& a, const OptTensor& sf
         : deep_gemm::cdna4::get_m_grouped_config(
               deep_gemm::cdna4::GemmType::MGroupedMasked, kb, ldd,
               reinterpret_cast<uintptr_t>(d.data_ptr()) % 16 == 0 && (d.stride(0) * 2) % 16 == 0, 0, sf_gran);
-    config.bf16 = bf16;
+    config.a_type = a_type;
+    config.b_type = b_type;
     GemmArgs args = make_args(a, sfa, b, sfb, d, nullptr, max_m, n, k, lhs.ld, rhs.ld, lda_sf, ldb_sf, ldd);
     args.grouped_layout = masked_m.data_ptr<std::int32_t>();
     args.num_groups = groups;
@@ -367,7 +407,8 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor& a, const OptTensor& sf
 }
 
 // D[g] (+)= A_g^T B_g over the K range of group g. MN-major (TN): A [sum_k, M], B [sum_k, N].
-// K-major (NT): per-group [M, k_g] / [N, k_g] blocks stored back to back.
+// K-major (NT): per-group [M, k_g] / [N, k_g] blocks stored back to back; FP4: [M, sum_k / 2] /
+// [N, sum_k / 2], a group's K range is a column range of every row.
 void cdna4_k_grouped_fp8_gemm(const torch::Tensor& a, const OptTensor& sfa,
                               const torch::Tensor& b, const OptTensor& sfb,
                               const torch::Tensor& d, const std::optional<torch::Tensor>& c,
@@ -376,11 +417,13 @@ void cdna4_k_grouped_fp8_gemm(const torch::Tensor& a, const OptTensor& sfa,
     const auto device = d.device();
     const bool bf16 = !sfa.has_value();
     TORCH_CHECK(sfa.has_value() == sfb.has_value(), "pass scales for both operands or for none");
-    const auto dtype = bf16 ? torch::kBFloat16 : torch::kFloat8_e4m3fn;
     TORCH_CHECK(a.is_cuda() && a.device() == device && b.is_cuda() && b.device() == device && d.is_cuda() &&
                 (bf16 || (sfa->is_cuda() && sfa->device() == device && sfb->is_cuda() && sfb->device() == device)),
                 "all tensors must be on the output accelerator device");
-    TORCH_CHECK(a.scalar_type() == dtype && b.scalar_type() == dtype, "a and b must be ", dtype_name(dtype));
+    const auto a_type = operand_type(a, !bf16, "a"), b_type = operand_type(b, !bf16, "b");
+    TORCH_CHECK(a_type == b_type, "K-grouped GEMMs take two operands of one type");
+    const bool fp4 = a_type == OperandType::Fp4;
+    TORCH_CHECK(!fp4 || (k_major && gran_k == 32), "FP4 K-grouped GEMMs are K-major with 32-wide scale blocks");
     TORCH_CHECK(d.dim() == 3 && d.is_contiguous(), "d must be a contiguous [G, M, N] tensor");
     TORCH_CHECK(d.scalar_type() == torch::kBFloat16 || d.scalar_type() == torch::kFloat, "d must be BF16 or FP32");
     TORCH_CHECK(bf16 || gran_k == 32 || gran_k == 128, "scale granularity must be 32 or 128");
@@ -396,7 +439,12 @@ void cdna4_k_grouped_fp8_gemm(const torch::Tensor& a, const OptTensor& sfa,
     if (groups == 0 || m == 0 || n == 0)
         return;
     int64_t sum_k;
-    if (k_major) {
+    if (fp4) {
+        TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && a.size(0) == m && b.size(0) == n && a.size(1) == b.size(1),
+                    "FP4 operands must be [M, sum_k / 2] and [N, sum_k / 2]");
+        TORCH_CHECK(a.size(1) % 4 == 0, "FP4 K-grouped operands need sum_k divisible by eight");
+        sum_k = 2 * a.size(1);
+    } else if (k_major) {
         TORCH_CHECK(a.numel() % m == 0 && b.numel() % n == 0 && a.numel() / m == b.numel() / n,
                     "K-major operands must hold sum_k x M and sum_k x N values");
         sum_k = a.numel() / m;
@@ -420,9 +468,12 @@ void cdna4_k_grouped_fp8_gemm(const torch::Tensor& a, const OptTensor& sfa,
     const auto type = use_psum_layout ? deep_gemm::cdna4::GemmType::KGroupedContiguousPsum
                                       : deep_gemm::cdna4::GemmType::KGroupedContiguous;
     auto config = deep_gemm::cdna4::get_k_grouped_config(type, k_major ? 0 : 3, !bf16 && gran_k == 128 ? 3 : 0);
-    config.bf16 = bf16;
+    config.a_type = a_type;
+    config.b_type = b_type;
+    // (K-major FP8 / BF16 row strides are the group's K, set on the device)
+    const int lda = fp4 ? int(a.size(1)) : k_major ? 0 : m * es, ldb = fp4 ? int(b.size(1)) : k_major ? 0 : n * es;
     GemmArgs args = make_args(a, sfa, b, sfb, d, c.has_value() ? d.data_ptr() : nullptr, m, n, 0,
-                              k_major ? 0 : m * es, k_major ? 0 : n * es, lda_sf, ldb_sf, n);
+                              lda, ldb, lda_sf, ldb_sf, n);
     args.grouped_layout = grouped_layout.data_ptr<std::int32_t>();
     args.num_groups = groups;
     args.k_alignment = k_alignment;

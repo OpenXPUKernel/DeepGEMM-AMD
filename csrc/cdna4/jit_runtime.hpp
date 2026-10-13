@@ -123,6 +123,20 @@ private:
         return "unknown";
     }
 
+    static const char* operand_name(const OperandType type) {
+        switch (type) {
+        case OperandType::Fp8: return "Fp8";
+        case OperandType::Fp4: return "Fp4";
+        case OperandType::Bf16: return "Bf16";
+        }
+        return "unknown";
+    }
+
+    static std::string operand_types(const KernelConfig& config) {
+        return std::string("OperandType::") + operand_name(config.a_type) + ",OperandType::" +
+               operand_name(config.b_type);
+    }
+
     std::string source_for(const KernelConfig& config, const int out_dtype) const {
         const char* output = out_dtype == MXFP8_OUT_FP32 ? "float" : "std::uint16_t";
         if (config.variant == KernelVariant::mfma_16x16x128_small_m) {
@@ -134,8 +148,8 @@ private:
                       "fp8_gemm_mfma_16x16x128_small_m_impl<Mfma16x16x128SmallMConfig<"
                    << config.block_m / 16 << "," << config.block_n / 16 << "," << config.depth << ","
                    << config.waves << "," << config.scale_gran_128 << ",GemmType::" << type_name(config.type) << ","
-                   << (config.k_tail ? "true" : "false") << "," << (config.bf16 ? "true" : "false") << ">,"
-                   << output << ">(p); }\n";
+                   << (config.k_tail ? "true" : "false") << "," << operand_types(config) << ">," << output
+                   << ">(p); }\n";
             return source.str();
         }
         const char* mode = config.variant == KernelVariant::mfma_16x16x128_persistent ? "Persistent" :
@@ -149,8 +163,8 @@ private:
                   "void dg_cdna4_gemm(GemmArgs p) { "
                   "fp8_gemm_mfma_16x16x128_impl<Mfma16x16x128GemmConfig<Mfma16x16x128GemmMode::"
                << mode << "," << config.mn_major << "," << config.scale_gran_128
-               << ",GemmType::" << type_name(config.type) << "," << (config.bf16 ? "true" : "false") << ">,"
-               << output << ">(p); }\n";
+               << ",GemmType::" << type_name(config.type) << "," << operand_types(config) << ">," << output
+               << ">(p); }\n";
         if (config.variant == KernelVariant::mfma_16x16x128_split_k)
             source << "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_reduce(GemmArgs p) {"
                    << " splitk_reduce_impl<" << output << ">(p); }\n";
@@ -165,8 +179,8 @@ private:
                                 std::to_string(config.mn_major) + ":" + std::to_string(config.scale_gran_128) +
                                 ":" + type_name(config.type) + ":" + std::to_string(config.block_m) + "x" +
                                 std::to_string(config.block_n) + ":" + std::to_string(config.depth) + ":" +
-                                std::to_string(config.waves) + (config.k_tail ? ":tail" : "") +
-                                (config.bf16 ? ":bf16" : "");
+                                std::to_string(config.waves) + (config.k_tail ? ":tail" : "") + ":" +
+                                operand_name(config.a_type) + "x" + operand_name(config.b_type);
         auto found = modules_.find(key);
         if (found != modules_.end())
             return found->second;

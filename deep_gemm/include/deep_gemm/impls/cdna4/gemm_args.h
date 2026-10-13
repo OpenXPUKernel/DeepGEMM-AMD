@@ -21,6 +21,10 @@ enum class GemmType : int {
   KGroupedContiguousPsum = 5,
 };
 
+// Element type of an operand. FP4 (E2M1) values are packed two per byte, the lower K index in the
+// low nibble. BF16 operands come in pairs and have no scales.
+enum class OperandType : int { Fp8 = 0, Fp4 = 1, Bf16 = 2 };
+
 struct GemmArgs {
   const std::uint8_t* A;
   const std::uint8_t* B;
