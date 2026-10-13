@@ -8,7 +8,7 @@ The supported operation is
 D = alpha * (A @ B.T) + C
 ```
 
-`A` and `B` contain OCP FP8 E4M3 values. Their scale tensors use UE8M0 values with 32 or 128 elements per K block. `recipe_a=(1, 32)` and `recipe_b=(1, 32)` are the direct MXFP8 form; 128-element and mixed A/B recipes are read directly by the kernel. Scales can be passed as float32 tensors or as the packed int32 layout returned by `transform_sf_into_required_layout`. `D` and `C` can be BF16 or FP32. Dense GEMMs, the `nn`/`tn`/`tt` aliases and the grouped GEMMs below are supported; custom epilogues are not part of this backend.
+`A` and `B` contain OCP FP8 E4M3 values. Their scale tensors use UE8M0 values with 32 or 128 elements per K block. `recipe_a=(1, 32)` and `recipe_b=(1, 32)` are the direct MXFP8 form; 128-element and mixed A/B recipes are read directly by the kernel. Scales can be passed as float32 tensors or as the packed int32 layout returned by `transform_sf_into_required_layout`; the layout helpers (`get_mn_major_tma_aligned_tensor`, `get_mn_major_tma_aligned_packed_ue8m0_tensor`, `get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor`) return the CUDA layouts, checked by `tests/test_cdna4_layout.py` with the checks of `tests/test_layout.py`. `D` and `C` can be BF16 or FP32. Dense GEMMs, the `nn`/`tn`/`tt` aliases and the grouped GEMMs below are supported; custom epilogues are not part of this backend.
 
 ## Grouped GEMMs
 
