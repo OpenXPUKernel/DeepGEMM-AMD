@@ -109,6 +109,26 @@ template <int B, int E, class F> __device__ __forceinline__ void static_for(F &&
   }
 }
 
+// Wave maximum (MAX) or sum in DPP row shifts and broadcasts, a fixed order, read from lane 63;
+// lanes without a source keep their value (maximum) or add 0 (sum)
+template <bool MAX> __device__ __forceinline__ float wave_reduce(float x) {
+  const auto step = [&](auto ctrl, auto row_mask, auto bank_mask) {
+    const int identity = MAX ? __float_as_int(x) : 0;
+    const float y = __int_as_float(__builtin_amdgcn_update_dpp(identity, __float_as_int(x), decltype(ctrl)::value,
+                                                               decltype(row_mask)::value, decltype(bank_mask)::value,
+                                                               false));
+    x = MAX ? fmaxf(x, y) : x + y;
+  };
+  using std::integral_constant;
+  step(integral_constant<int, 0x111>{}, integral_constant<int, 0xf>{}, integral_constant<int, 0xf>{}); // row_shr:1
+  step(integral_constant<int, 0x112>{}, integral_constant<int, 0xf>{}, integral_constant<int, 0xf>{}); // row_shr:2
+  step(integral_constant<int, 0x114>{}, integral_constant<int, 0xf>{}, integral_constant<int, 0xe>{}); // row_shr:4
+  step(integral_constant<int, 0x118>{}, integral_constant<int, 0xf>{}, integral_constant<int, 0xc>{}); // row_shr:8
+  step(integral_constant<int, 0x142>{}, integral_constant<int, 0xa>{}, integral_constant<int, 0xf>{}); // row_bcast:15
+  step(integral_constant<int, 0x143>{}, integral_constant<int, 0xc>{}, integral_constant<int, 0xf>{}); // row_bcast:31
+  return __int_as_float(__builtin_amdgcn_readlane(__float_as_int(x), 63));
+}
+
 // D += A B^T on 16x16 tiles with K = 32 BF16 values per lane row (8 per lane)
 __device__ __forceinline__ v4f mfma_bf16_16x16x32(v4i a, v4i b, v4f c) {
   typedef __bf16 v8bf __attribute__((ext_vector_type(8)));

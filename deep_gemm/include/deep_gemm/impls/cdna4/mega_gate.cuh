@@ -54,26 +54,6 @@ struct Philox4x32 {
   __device__ float uniform() { return next() * 2.3283064e-10f + 2.3283064e-10f / 2.f; }
 };
 
-// Wave reductions in DPP row shifts and broadcasts, read from lane 63; IDENTITY fills the lanes
-// without a source
-template <bool MAX> __device__ __forceinline__ float wave_reduce(float x) {
-  const auto step = [&](auto ctrl, auto row_mask, auto bank_mask) {
-    const int identity = MAX ? __float_as_int(x) : 0;
-    const float y = __int_as_float(__builtin_amdgcn_update_dpp(identity, __float_as_int(x), decltype(ctrl)::value,
-                                                               decltype(row_mask)::value, decltype(bank_mask)::value,
-                                                               false));
-    x = MAX ? fmaxf(x, y) : x + y;
-  };
-  using std::integral_constant;
-  step(integral_constant<int, 0x111>{}, integral_constant<int, 0xf>{}, integral_constant<int, 0xf>{}); // row_shr:1
-  step(integral_constant<int, 0x112>{}, integral_constant<int, 0xf>{}, integral_constant<int, 0xf>{}); // row_shr:2
-  step(integral_constant<int, 0x114>{}, integral_constant<int, 0xf>{}, integral_constant<int, 0xe>{}); // row_shr:4
-  step(integral_constant<int, 0x118>{}, integral_constant<int, 0xf>{}, integral_constant<int, 0xc>{}); // row_shr:8
-  step(integral_constant<int, 0x142>{}, integral_constant<int, 0xa>{}, integral_constant<int, 0xf>{}); // row_bcast:15
-  step(integral_constant<int, 0x143>{}, integral_constant<int, 0xc>{}, integral_constant<int, 0xf>{}); // row_bcast:31
-  return __int_as_float(__builtin_amdgcn_readlane(__float_as_int(x), 63));
-}
-
 __device__ __forceinline__ uint32_t wave_min_u32(uint32_t v) {
 #pragma unroll
   for (int offset = 1; offset < 64; offset *= 2)

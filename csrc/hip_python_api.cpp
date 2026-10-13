@@ -549,6 +549,90 @@ void cdna4_mega_gate_routing(const torch::Tensor& logits, const OptTensor& bias,
     TORCH_CHECK(error == 0, "CDNA4 mega gate launch failed with code ", error);
 }
 
+// Mega mHC (mega_mhc.cuh): the residual kernel over (64-token blocks, hidden splits), the mix
+// kernel (a token per thread), then the norm kernel over the tokens. The Python wrapper validates
+// the tensors and sizes the workspace: [token blocks, splits, 64, 25] floats of partials, then
+// [tokens, 4] previous mixes; norm_bf16 is y_bf16 or (shifted, FP8 only) a scratch.
+void cdna4_mega_mhc(const torch::Tensor& x, const torch::Tensor& residual, const OptTensor& shifted_prev_mix,
+                    const torch::Tensor& post_mix, const torch::Tensor& comb_res_mix, const torch::Tensor& fn,
+                    const torch::Tensor& mix_scales, const torch::Tensor& mix_bases, double hc_norm_eps,
+                    double hc_pre_eps, double hc_post_scale, double sinkhorn_eps, int num_sinkhorn_iters,
+                    const torch::Tensor& rmsnorm_weight, double rmsnorm_eps, double rmsnorm_scale,
+                    const torch::Tensor& new_residual, const OptTensor& new_prev_mix,
+                    const torch::Tensor& new_post_mix, const torch::Tensor& new_comb_res_mix,
+                    const OptTensor& norm_bf16, bool write_y_bf16, const OptTensor& y_fp8, const OptTensor& y_sf,
+                    const OptTensor& y_shared_sf, int shared_sf_block_m, const torch::Tensor& workspace, int splits) {
+    const int num_tokens = x.size(0), hidden = x.size(1);
+    TORCH_CHECK(hidden % 1024 == 0 && hidden / 1024 <= 16, "hidden must be a multiple of 1024 up to 16384");
+    const bool shifted = shifted_prev_mix.has_value();
+    TORCH_CHECK(shifted == new_prev_mix.has_value() && (!shifted || norm_bf16.has_value()) &&
+                (!write_y_bf16 || norm_bf16.has_value()) && (write_y_bf16 || y_fp8.has_value()));
+    const int m_blocks = ceil_div(num_tokens, 64);
+    const int64_t partial_floats = int64_t(m_blocks) * splits * 64 * 25;
+    TORCH_CHECK(workspace.scalar_type() == torch::kFloat && workspace.numel() >= partial_floats + int64_t(num_tokens) * 4);
+    const c10::hip::HIPGuard device_guard(x.get_device());
+    if (num_tokens == 0)
+        return;
+    const auto u16 = [](const torch::Tensor& t) { return reinterpret_cast<std::uint16_t*>(t.data_ptr()); };
+    deep_gemm::cdna4::MegaMhcArgs args{};
+    args.x = u16(x), args.residual = u16(residual), args.rmsnorm_weight = u16(rmsnorm_weight);
+    args.post_mix = post_mix.data_ptr<float>(), args.comb_res_mix = comb_res_mix.data_ptr<float>();
+    args.shifted_prev_mix = shifted ? shifted_prev_mix->data_ptr<float>() : nullptr;
+    args.fn = fn.data_ptr<float>(), args.mix_scales = mix_scales.data_ptr<float>();
+    args.mix_bases = mix_bases.data_ptr<float>();
+    args.new_residual = u16(new_residual);
+    args.new_prev_mix = shifted ? new_prev_mix->data_ptr<float>() : nullptr;
+    args.new_post_mix = new_post_mix.data_ptr<float>(), args.new_comb_res_mix = new_comb_res_mix.data_ptr<float>();
+    args.norm_bf16 = norm_bf16.has_value() ? u16(*norm_bf16) : nullptr;
+    args.write_y_bf16 = write_y_bf16;
+    args.y_fp8 = y_fp8.has_value() ? reinterpret_cast<std::uint8_t*>(y_fp8->data_ptr()) : nullptr;
+    if (y_sf.has_value()) {
+        args.y_sf = y_sf->data_ptr<std::int32_t>();
+        args.y_sf_stride_token = y_sf->stride(0), args.y_sf_stride_word = y_sf->stride(1);
+    }
+    if (y_shared_sf.has_value()) {
+        args.y_shared_sf = y_shared_sf->data_ptr<std::int32_t>();
+        args.y_shared_sf_stride_word = y_shared_sf->stride(1);
+        args.shared_sf_block_m = shared_sf_block_m;
+    }
+    args.mix_partials = workspace.data_ptr<float>();
+    args.sqr_partials = args.mix_partials + int64_t(m_blocks) * splits * 64 * 24;
+    args.prev_mix = shifted ? args.new_prev_mix : args.mix_partials + partial_floats;
+    args.num_tokens = num_tokens, args.hidden = hidden, args.splits = splits;
+    args.hc_norm_eps = hc_norm_eps, args.hc_pre_eps = hc_pre_eps, args.hc_post_scale = hc_post_scale;
+    args.sinkhorn_eps = sinkhorn_eps, args.num_sinkhorn_iters = num_sinkhorn_iters;
+    args.rmsnorm_eps = rmsnorm_eps, args.rmsnorm_scale = rmsnorm_scale;
+
+    const std::string mode = shifted ? "true" : "false", chunks = std::to_string(hidden / 1024);
+    const auto module = jit_runtime.get_module("mega_mhc:" + mode + ":" + chunks, [&] {
+        return "#include <deep_gemm/impls/cdna4/mega_mhc.cuh>\n"
+               "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_mega_mhc_residual(MegaMhcArgs p) "
+               "{ mega_mhc_residual_impl<" + mode + ">(p); }\n"
+               "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_mega_mhc_mix(MegaMhcArgs p) "
+               "{ mega_mhc_mix_impl(p); }\n"
+               "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_mega_mhc_norm(MegaMhcArgs p) "
+               "{ mega_mhc_norm_impl<" + mode + ", " + chunks + ">(p); }\n";
+    }, {"dg_cdna4_mega_mhc_residual", "dg_cdna4_mega_mhc_mix", "dg_cdna4_mega_mhc_norm"});
+    const auto stream = c10::hip::getCurrentHIPStream(x.get_device()).stream();
+    int error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[0], args,
+                                                            dim3(m_blocks, splits, 1), dim3(256, 1, 1),
+                                                            64 * 1024, stream);
+    TORCH_CHECK(error == 0, "CDNA4 mega mHC residual launch failed with code ", error);
+    error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[1], args,
+                                                        dim3(ceil_div(num_tokens, 64), 1, 1), dim3(256, 1, 1), 0,
+                                                        stream);
+    TORCH_CHECK(error == 0, "CDNA4 mega mHC mix launch failed with code ", error);
+    // a token per resident workgroup at a time (each loads the next token ahead)
+    int resident = 0;
+    if (hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&resident, module->kernels[2], 256, 0) != hipSuccess)
+        resident = 2;
+    const unsigned norm_blocks = static_cast<unsigned>(
+        std::min(num_tokens, std::max(resident, 1) * deep_gemm::cdna4::num_compute_units()));
+    error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[2], args, dim3(norm_blocks, 1, 1),
+                                                        dim3(256, 1, 1), 0, stream);
+    TORCH_CHECK(error == 0, "CDNA4 mega mHC norm launch failed with code ", error);
+}
+
 // D = A @ B^T and sqr_sum = sum_k A^2 for BF16 A [M, K], FP32 B [N, K] (hc_prenorm_gemm.cuh). With
 // num_splits, D [splits, M, N] and sqr_sum [splits, M] receive the K splits' partials; without,
 // D [M, N] and sqr_sum [M] the sums (partials of internal splits are added in split order).
@@ -793,6 +877,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("c") = std::nullopt);
     m.def("cdna4_hc_prenorm_gemm", &cdna4_hc_prenorm_gemm, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("sqr_sum"), py::arg("num_splits") = std::nullopt);
+    m.def("cdna4_mega_mhc", &cdna4_mega_mhc,
+          py::arg("x"), py::arg("residual"), py::arg("shifted_prev_mix"), py::arg("post_mix"),
+          py::arg("comb_res_mix"), py::arg("fn"), py::arg("mix_scales"), py::arg("mix_bases"),
+          py::arg("hc_norm_eps"), py::arg("hc_pre_eps"), py::arg("hc_post_scale"), py::arg("sinkhorn_eps"),
+          py::arg("num_sinkhorn_iters"), py::arg("rmsnorm_weight"), py::arg("rmsnorm_eps"), py::arg("rmsnorm_scale"),
+          py::arg("new_residual"), py::arg("new_prev_mix"), py::arg("new_post_mix"), py::arg("new_comb_res_mix"),
+          py::arg("norm_bf16"), py::arg("write_y_bf16"), py::arg("y_fp8"), py::arg("y_sf"), py::arg("y_shared_sf"),
+          py::arg("shared_sf_block_m"), py::arg("workspace"), py::arg("splits"));
     m.def("cdna4_mega_gate_routing", &cdna4_mega_gate_routing,
           py::arg("logits"), py::arg("bias"), py::arg("image_bias"), py::arg("image_token_mask"), py::arg("mask"),
           py::arg("fix_routing_mask"), py::arg("force_random"), py::arg("to_physical_map"), py::arg("logical_count"),

@@ -64,6 +64,40 @@ struct GemmArgs {
 // D[s] = A @ B^T and sqr_sum[s] = sum of squares of A's rows over K split s of splits
 // (hc_prenorm_gemm.cuh): BF16 A [M, K], FP32 B [N, K], FP32 D [splits, M, N] and
 // sqr_sum [splits, M] (a workspace of partials when the result is reduced)
+// Mega mHC (mega_mhc.cuh): BF16 [tokens, hidden] and [tokens, 4, hidden] activations, FP32 mixes
+struct MegaMhcArgs {
+    const std::uint16_t* x;
+    const std::uint16_t* residual;
+    const float* post_mix;
+    const float* comb_res_mix;
+    const float* shifted_prev_mix;  // null: normal mHC
+    const float* fn;                // [24, 4 hidden]
+    const float* mix_scales;
+    const float* mix_bases;
+    const std::uint16_t* rmsnorm_weight;
+    std::uint16_t* new_residual;
+    float* new_prev_mix;            // null: normal mHC
+    float* new_post_mix;
+    float* new_comb_res_mix;
+    // shifted: the norm input from the residual kernel (y_bf16 or a scratch), replaced by y when
+    // write_y_bf16; normal: y_bf16
+    std::uint16_t* norm_bf16;
+    int write_y_bf16;
+    std::uint8_t* y_fp8;            // null: no FP8 y
+    std::int32_t* y_sf;             // packed UE8M0 of 128 values per word
+    std::int64_t y_sf_stride_token, y_sf_stride_word;
+    std::int32_t* y_shared_sf;      // null, or the Mega MoE shared-expert rows of shared_sf_block_m tokens
+    std::int64_t y_shared_sf_stride_word;
+    int shared_sf_block_m;
+    float* mix_partials;            // [token blocks, splits, 64, 24]
+    float* sqr_partials;            // [token blocks, splits, 64]
+    float* prev_mix;                // the new previous mix: new_prev_mix (shifted) or [tokens, 4] (normal)
+    int num_tokens, hidden, splits;
+    float hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps;
+    int num_sinkhorn_iters;
+    float rmsnorm_eps, rmsnorm_scale;
+};
+
 struct HcPrenormGemmArgs {
   const std::uint16_t* a;
   const float* b;

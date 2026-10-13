@@ -41,7 +41,7 @@ __all__ = [
     "set_block_size_multiple_of", "set_pdl", "get_pdl", "use_deterministic_algorithms",
     "get_mqa_logits_metadata", "fp8_fp4_mqa_logits", "get_paged_mqa_logits_metadata", "fp8_fp4_paged_mqa_logits",
     "get_sparse_mqa_logits_metadata", "get_paged_sparse_mqa_logits_metadata", "fp8_fp4_sparse_mqa_logits",
-    "fp8_fp4_paged_sparse_mqa_logits", "einsum", "fp8_einsum", "tf32_hc_prenorm_gemm", "bf16_mega_gate",
+    "fp8_fp4_paged_sparse_mqa_logits", "einsum", "fp8_einsum", "tf32_hc_prenorm_gemm", "bf16_mega_gate", "mega_mhc",
 ]
 
 def _backend():
@@ -838,6 +838,83 @@ def bf16_mega_gate(x, weight, num_topk, use_shared_as_routed, num_shared_experts
         contiguous(fix_routing_mask), contiguous(force_random), contiguous(to_physical_map), contiguous(logical_count),
         topk_idx, topk_weights, unmapped_topk_idx, int(num_topk), shared, int(ep_rank), float(routed_scaling_factor))
     return topk_idx, topk_weights
+
+
+def mega_mhc(x, residual, shifted_prev_mix, post_mix, comb_res_mix, fn, mix_scales, mix_bases, hc_mult, hc_norm_eps,
+             hc_pre_eps, hc_post_scale, sinkhorn_eps, num_sinkhorn_iters, rmsnorm_weight, rmsnorm_eps, rmsnorm_scale,
+             new_residual, new_prev_mix, new_post_mix, new_comb_res_mix, y_bf16=None, y_fp8=None, y_gemm_sf=None,
+             y_routed_sf=None, y_shared_sf=None, shared_sf_block_m=0) -> None:
+    """Shifted (with shifted_prev_mix and new_prev_mix) or normal mHC: new_residual, the next mixes
+    and the RMSNorm of the mixed residual into BF16 y_bf16 and / or FP8 y_fp8 (32-value UE8M0
+    scales, four per int32: y_gemm_sf column-major, or y_routed_sf row-major with y_shared_sf in
+    the Mega MoE shared-expert rows of shared_sf_block_m tokens). See the CUDA documentation."""
+    shifted = shifted_prev_mix is not None
+    if shifted != (new_prev_mix is not None):
+        raise ValueError("shifted_prev_mix and new_prev_mix go together")
+    if (y_routed_sf is None) != (y_shared_sf is None) or (y_gemm_sf is not None and y_routed_sf is not None):
+        raise ValueError("FP8 takes y_gemm_sf alone, or y_routed_sf with y_shared_sf")
+    if y_bf16 is None and y_fp8 is None:
+        raise ValueError("y_bf16 or y_fp8 is required")
+    if (y_fp8 is None) != (y_gemm_sf is None and y_routed_sf is None):
+        raise ValueError("y_fp8 needs its scales")
+    if (y_shared_sf is not None) != (shared_sf_block_m > 0):
+        raise ValueError("y_shared_sf needs shared_sf_block_m > 0")
+    num_tokens, hidden = x.shape
+    if hc_mult != 4 or num_tokens > 1 << 20 or hidden % 1024 or hidden > 16384 or num_sinkhorn_iters < 1:
+        raise ValueError("mHC needs hc_mult 4, at most 2^20 tokens, hidden a multiple of 1024 up to 16384")
+
+    def check(t, dtype, shape, name):
+        if t.dtype != dtype or tuple(t.shape) != tuple(shape) or not t.is_contiguous() or t.device != x.device:
+            raise ValueError(f"{name} must be a contiguous {dtype} tensor of shape {tuple(shape)}")
+
+    check(x, torch.bfloat16, (num_tokens, hidden), "x")
+    check(residual, torch.bfloat16, (num_tokens, 4, hidden), "residual")
+    check(post_mix, torch.float, (num_tokens, 4, 1), "post_mix")
+    check(comb_res_mix, torch.float, (num_tokens, 4, 4), "comb_res_mix")
+    check(fn, torch.float, (24, 4 * hidden), "fn")
+    check(mix_scales, torch.float, (3, ), "mix_scales")
+    check(mix_bases, torch.float, (24, ), "mix_bases")
+    check(rmsnorm_weight, torch.bfloat16, (hidden, ), "rmsnorm_weight")
+    check(new_residual, torch.bfloat16, (num_tokens, 4, hidden), "new_residual")
+    check(new_post_mix, torch.float, (num_tokens, 4, 1), "new_post_mix")
+    check(new_comb_res_mix, torch.float, (num_tokens, 4, 4), "new_comb_res_mix")
+    if shifted:
+        check(shifted_prev_mix, torch.float, (num_tokens, 4, 1), "shifted_prev_mix")
+        check(new_prev_mix, torch.float, (num_tokens, 4, 1), "new_prev_mix")
+    if y_bf16 is not None:
+        check(y_bf16, torch.bfloat16, (num_tokens, hidden), "y_bf16")
+    if y_fp8 is not None:
+        check(y_fp8, torch.float8_e4m3fn, (num_tokens, hidden), "y_fp8")
+    sf_shape = (num_tokens, hidden // 128)
+    for name, sf in (("y_gemm_sf", y_gemm_sf), ("y_routed_sf", y_routed_sf), ("y_shared_sf", y_shared_sf)):
+        if sf is not None and (sf.dtype != torch.int32 or tuple(sf.shape) != sf_shape or sf.device != x.device):
+            raise ValueError(f"{name} must be int32 of shape {sf_shape}")
+    if y_gemm_sf is not None and (y_gemm_sf.stride(0) != 1 or y_gemm_sf.stride(1) < num_tokens):
+        raise ValueError("y_gemm_sf must be column-major")
+    if y_routed_sf is not None and not y_routed_sf.is_contiguous():
+        raise ValueError("y_routed_sf must be contiguous")
+    if y_shared_sf is not None:
+        rows = -(-num_tokens // shared_sf_block_m) * align(shared_sf_block_m, 128)
+        last = y_shared_sf.storage_offset() + rows + (hidden // 128 - 1) * y_shared_sf.stride(1)
+        if y_shared_sf.stride(0) != 1 or y_shared_sf.stride(1) < rows or \
+                last * 4 > y_shared_sf.untyped_storage().nbytes():
+            raise ValueError("y_shared_sf must be column-major over the shared-expert rows")
+    if num_tokens == 0:
+        return
+
+    # hidden splits: enough workgroups for the compute units (16 in deterministic mode, so the
+    # results do not depend on the number of tokens), every split nonempty
+    m_blocks, steps = -(-num_tokens // 64), hidden // 64
+    splits = 16 if _config["deterministic"] else min(32, max(1, -(-2 * get_num_sms() // m_blocks)))
+    splits = -(-steps // -(-steps // min(splits, steps)))
+    workspace = torch.empty((m_blocks * splits * 64 * 25 + num_tokens * 4, ), dtype=torch.float, device=x.device)
+    norm_bf16 = y_bf16 if y_bf16 is not None or not shifted else torch.empty_like(x)
+    _backend().cdna4_mega_mhc(
+        x, residual, shifted_prev_mix, post_mix, comb_res_mix, fn, mix_scales, mix_bases, float(hc_norm_eps),
+        float(hc_pre_eps), float(hc_post_scale), float(sinkhorn_eps), int(num_sinkhorn_iters), rmsnorm_weight,
+        float(rmsnorm_eps), float(rmsnorm_scale), new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
+        norm_bf16, y_bf16 is not None, y_fp8, y_routed_sf if y_routed_sf is not None else y_gemm_sf, y_shared_sf,
+        int(shared_sf_block_m), workspace, splits)
 
 
 # ---- Runtime configuration (CUDA API parity). The CDNA4 kernels size their grids from the compute

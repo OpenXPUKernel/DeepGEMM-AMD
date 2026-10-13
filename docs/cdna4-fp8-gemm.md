@@ -124,6 +124,36 @@ The tests compare against an FP64 reference with the CUDA test's bound. On the s
 `tests/test_hyperconnection.py` the kernel is 2.8-5.7x as fast as a PyTorch BF16 GEMM plus a sum of
 squares for 4096 or more rows, and 1.0-2.5x for 13 and 137 rows.
 
+## Mega mHC
+
+`mega_mhc` keeps the CUDA signature: shifted or normal mHC, BF16 and / or FP8 normalized outputs
+(32-value UE8M0 scales packed four per int32, column-major or row-major with the Mega MoE
+shared-expert rows). `mega_mhc.cuh` runs it in three kernels:
+
+- The residual kernel takes 64 tokens and a split of the hidden range. It writes
+  `new_residual = x post + comb^T residual` in BF16 and feeds the rounded values from registers
+  to the mix GEMM: per 64 hidden values, two BF16 MFMAs per route against `fn` split into BF16 hi
+  and lo terms (staged in LDS once for the four waves). The lane groups read and write whole cache
+  lines of a row, and the barriers order LDS only, so the next step's loads and this step's stores
+  stay in flight. Shifted mHC also writes the norm input.
+- The mix kernel takes a token per quad of lanes. It adds the split partials in a fixed order (set
+  by the split count; deterministic mode fixes it to 16, so results do not depend on the number of
+  tokens) and computes the sigmoids and the Sinkhorn normalization, one row per lane.
+- The norm kernel takes a token per workgroup and loads the next token ahead. It computes the
+  RMSNorm and the FP8 cast (DPP amax per 32 values).
+
+```bash
+pytest -q tests/test_cdna4_mega_mhc.py
+python tests/bench_cdna4_mega_mhc.py --relative-only
+```
+
+The tests use the reference of `tests/test_mega_mhc.py` (with FP64 mixes) and bounds 10^3 tighter
+than the CUDA test's. They also check bitwise repeatability, bitwise equal outputs of equal tokens,
+deterministic mode across token counts, CUDA graphs and concurrent streams; no warm-up is needed
+before graph capture. The kernels are 12-50x as fast as the same computation in torch ops. At
+32768 tokens they move the logical and intermediate bytes at 0.83-0.91 of a device copy's rate;
+up to a few hundred tokens the three kernel boundaries bound the time.
+
 ## MoE gate
 
 `bf16_mega_gate` keeps the CUDA signature and routing semantics (sqrt-softplus scores, bias and
