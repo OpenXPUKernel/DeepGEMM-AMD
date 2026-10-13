@@ -492,6 +492,78 @@ void cdna4_k_grouped_fp8_gemm(const torch::Tensor& a, const OptTensor& sfa,
     launch_or_throw(args, config, out_dtype, d, groups * ceil_div(m, kBlockMN) * ceil_div(n, kBlockMN));
 }
 
+// D = A @ B^T and sqr_sum = sum_k A^2 for BF16 A [M, K], FP32 B [N, K] (hc_prenorm_gemm.cuh). With
+// num_splits, D [splits, M, N] and sqr_sum [splits, M] receive the K splits' partials; without,
+// D [M, N] and sqr_sum [M] the sums (partials of internal splits are added in split order).
+void cdna4_hc_prenorm_gemm(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                           const torch::Tensor& sqr_sum, std::optional<int> num_splits) {
+    const auto device = d.device();
+    TORCH_CHECK(a.is_cuda() && a.device() == device && b.is_cuda() && b.device() == device && sqr_sum.is_cuda() &&
+                sqr_sum.device() == device, "all tensors must be on the output accelerator device");
+    TORCH_CHECK(a.dim() == 2 && a.scalar_type() == torch::kBFloat16 && a.stride(1) == 1, "a must be K-major BF16 [M, K]");
+    TORCH_CHECK(b.dim() == 2 && b.scalar_type() == torch::kFloat && b.stride(1) == 1, "b must be K-major FP32 [N, K]");
+    const int m = a.size(0), k = a.size(1), n = b.size(0);
+    TORCH_CHECK(b.size(1) == k && n > 0 && k > 0, "prenorm GEMM shape mismatch");
+    TORCH_CHECK(d.scalar_type() == torch::kFloat && sqr_sum.scalar_type() == torch::kFloat && d.is_contiguous() &&
+                sqr_sum.is_contiguous(), "d and sqr_sum must be contiguous FP32 tensors");
+    if (num_splits.has_value()) {
+        TORCH_CHECK(*num_splits >= 1 && d.dim() == 3 && d.size(0) == *num_splits && d.size(1) == m && d.size(2) == n &&
+                    sqr_sum.dim() == 2 && sqr_sum.size(0) == *num_splits && sqr_sum.size(1) == m,
+                    "split outputs must be [num_splits, M, N] and [num_splits, M]");
+    } else {
+        TORCH_CHECK(d.dim() == 2 && d.size(0) == m && d.size(1) == n && sqr_sum.dim() == 1 && sqr_sum.size(0) == m,
+                    "outputs must be [M, N] and [M]");
+    }
+    const int lda = stride_as_int(a, 0, "a"), ldb = stride_as_int(b, 0, "b");
+    TORCH_CHECK(lda % 8 == 0 && ldb % 4 == 0 && reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0 &&
+                reinterpret_cast<uintptr_t>(b.data_ptr()) % 16 == 0, "a and b rows must be 16-byte aligned");
+    const c10::hip::HIPGuard device_guard(d.get_device());
+    if (m == 0)
+        return;
+    constexpr int fm = 4;
+    const int nf = std::min(4, ceil_div(n, 16));
+    const int row_blocks = ceil_div(m, 16 * fm), col_blocks = ceil_div(n, 16 * nf), k_steps = ceil_div(k, 128);
+    const int cus = deep_gemm::cdna4::num_compute_units();
+    int splits = num_splits.value_or(1);
+    torch::Tensor ws_d, ws_sqr;
+    if (!num_splits.has_value() && row_blocks * col_blocks < cus) {
+        // more workgroups for the compute units: partials of K splits of at least 4 steps per wave
+        splits = std::clamp(ceil_div(2 * cus, row_blocks * col_blocks), 1, std::max(1, k_steps / 16));
+        if (splits > 1) {
+            ws_d = torch::empty({splits, m, n}, d.options());
+            ws_sqr = torch::empty({splits, m}, d.options());
+        }
+    }
+    deep_gemm::cdna4::HcPrenormGemmArgs args{};
+    args.a = reinterpret_cast<const std::uint16_t*>(a.data_ptr());
+    args.b = b.data_ptr<float>();
+    args.d = ws_d.defined() ? ws_d.data_ptr<float>() : d.data_ptr<float>();
+    args.sqr_sum = ws_sqr.defined() ? ws_sqr.data_ptr<float>() : sqr_sum.data_ptr<float>();
+    args.m = m, args.n = n, args.k = k, args.lda = lda, args.ldb = ldb, args.splits = splits;
+    args.final_d = d.data_ptr<float>();
+    args.final_sqr_sum = sqr_sum.data_ptr<float>();
+    const std::string key = "hc_prenorm:" + std::to_string(fm) + "x" + std::to_string(nf);
+    const auto module = jit_runtime.get_module(key, [&] {
+        const std::string cfg = "HcPrenormGemmConfig<" + std::to_string(fm) + "," + std::to_string(nf) + ">";
+        return "#include <deep_gemm/impls/cdna4/hc_prenorm_gemm.cuh>\n"
+               "extern \"C\" __global__ __attribute__((amdgpu_flat_work_group_size(256, 256), amdgpu_waves_per_eu(1, 1))) "
+               "void dg_cdna4_tf32_hc_prenorm_gemm(HcPrenormGemmArgs p) { hc_prenorm_gemm_impl<" + cfg + ">(p); }\n"
+               "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_tf32_hc_prenorm_reduce(HcPrenormGemmArgs p) "
+               "{ hc_prenorm_reduce_impl(p); }\n";
+    }, {"dg_cdna4_tf32_hc_prenorm_gemm", "dg_cdna4_tf32_hc_prenorm_reduce"});
+    const auto stream = c10::hip::getCurrentHIPStream(d.get_device()).stream();
+    const unsigned lds = 4 * (16 * fm * 16 * nf + 16 * fm) * 4;
+    int error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[0], args,
+        dim3(row_blocks, splits, col_blocks), dim3(256, 1, 1), lds, stream);
+    if (error == 0 && ws_d.defined()) {
+        const int64_t elements = int64_t(m) * n + m;
+        const unsigned blocks = static_cast<unsigned>(std::min<int64_t>(ceil_div(elements, 256), 4 * cus));
+        error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[1], args, dim3(blocks, 1, 1),
+                                                            dim3(256, 1, 1), 0, stream);
+    }
+    TORCH_CHECK(error == 0, "CDNA4 prenorm GEMM launch failed with code ", error);
+}
+
 // D (+)= sum_b A[b] @ B[b]^T for contiguous BF16 A [batches, M, k], B [batches, N, k] (einsum
 // "bmk,bnk->mn"): one GEMM whose K runs through the batches, split over the compute units when
 // the output has few tiles.
@@ -662,4 +734,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("cdna4_mqa_logits_tokens_per_wave", &cdna4_mqa_logits_tokens_per_wave, py::arg("num_heads"));
     m.def("cdna4_k_batched_gemm", &cdna4_k_batched_gemm, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt);
+    m.def("cdna4_hc_prenorm_gemm", &cdna4_hc_prenorm_gemm, py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("sqr_sum"), py::arg("num_splits") = std::nullopt);
 }

@@ -60,4 +60,20 @@ struct GemmArgs {
   std::int64_t sfa_group_stride, sfb_group_stride;
   std::int64_t d_group_stride;
 };
+
+// D[s] = A @ B^T and sqr_sum[s] = sum of squares of A's rows over K split s of splits
+// (hc_prenorm_gemm.cuh): BF16 A [M, K], FP32 B [N, K], FP32 D [splits, M, N] and
+// sqr_sum [splits, M] (a workspace of partials when the result is reduced)
+struct HcPrenormGemmArgs {
+  const std::uint16_t* a;
+  const float* b;
+  float* d;
+  float* sqr_sum;
+  int m, n, k;
+  int lda, ldb;  // elements
+  int splits;
+  // the reduction of a workspace (splits partials) into final_d [M, N] and final_sqr_sum [M]
+  float* final_d;
+  float* final_sqr_sum;
+};
 } // namespace deep_gemm::cdna4

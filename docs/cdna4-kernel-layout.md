@@ -15,6 +15,7 @@ The packaged headers are organized by responsibility:
 | --- | --- |
 | `fp8_gemm_mfma_16x16x128.cuh` | 16×16×128 scaled MFMA on FP8 / FP4 operands (or two 16×16×32 BF16 MFMAs per 128-byte K step), direct global-to-LDS DMA, and interleaved instruction scheduling; data-parallel, persistent, and split-K execution |
 | `fp8_gemm_mfma_16x16x128_small_m.cuh` | Small-M FP8 / FP4 and BF16 GEMMs: operands streamed from global memory into registers, K split across the waves of a workgroup; dense and m-grouped |
+| `hc_prenorm_gemm.cuh` | Hyper-connection prenorm GEMM: BF16 A against FP32 B as two BF16 terms, with the rows' sums of squares |
 | `mqa_logits.cuh` | MQA logits (contiguous, paged and sparse KV): scaled-MFMA dot products with the weighted ReLU sum over the heads in the lanes |
 | `mqa_logits_args.h` | Argument layout, formats and KV sources of the MQA logits kernels |
 | `epilogue.cuh` | Output stores, accumulation, and boundary handling |

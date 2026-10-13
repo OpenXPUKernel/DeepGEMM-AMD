@@ -106,6 +106,24 @@ The tests check the FP32 results against an FP32 reference and that BF16 outputs
 results rounded once. Against `torch.einsum` (hipBLASLt) the expressions run at 0.4-1.45x; the
 256x256 tiles make outputs with 128 columns or rows, and small K, the slow cases.
 
+## Hyper-connection prenorm GEMM
+
+`tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None)` computes `D = A @ B^T` and the rows' sums
+of squares of BF16 A for an FP32 B with few rows (the mix outputs), whole or as `num_splits` K
+partials. CDNA4 has no TF32 MFMA: `hc_prenorm_gemm.cuh` splits B into the BF16 terms
+`hi = bf16(b)` and `lo = bf16(b - hi)` in registers and runs both against the exact BF16 A, which
+keeps 16 mantissa bits of B (TF32 keeps 10). A workgroup streams 64 rows of A for every column;
+its four waves split K and add their tiles in LDS in a fixed order, and when the rows alone leave
+compute units idle, internal K splits are added in split order by a second kernel.
+
+```bash
+pytest -q tests/test_cdna4_hyperconnection.py
+```
+
+The tests compare against an FP64 reference with the CUDA test's bound. On the shapes of
+`tests/test_hyperconnection.py` the kernel is 2.8-5.7x as fast as a PyTorch BF16 GEMM plus a sum of
+squares for 4096 or more rows, and 1.0-2.5x for 13 and 137 rows.
+
 ## FP4 GEMMs
 
 `fp8_fp4_gemm_{nt,nn,tn,tt}`, `m_grouped_fp8_fp4_gemm_{nt,nn}_contiguous`,

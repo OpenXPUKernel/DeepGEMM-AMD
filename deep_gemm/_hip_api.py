@@ -41,7 +41,7 @@ __all__ = [
     "set_block_size_multiple_of", "set_pdl", "get_pdl", "use_deterministic_algorithms",
     "get_mqa_logits_metadata", "fp8_fp4_mqa_logits", "get_paged_mqa_logits_metadata", "fp8_fp4_paged_mqa_logits",
     "get_sparse_mqa_logits_metadata", "get_paged_sparse_mqa_logits_metadata", "fp8_fp4_sparse_mqa_logits",
-    "fp8_fp4_paged_sparse_mqa_logits", "einsum", "fp8_einsum",
+    "fp8_fp4_paged_sparse_mqa_logits", "einsum", "fp8_einsum", "tf32_hc_prenorm_gemm",
 ]
 
 def _backend():
@@ -778,6 +778,13 @@ def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128), epilogue=None) -> No
     sfa_p, sfb_p, gran_k_a, gran_k_b = _transform_sf_pair(sfa_v, sfb_v, m, bv.size(1), k, tuple(recipe), None, None,
                                                           groups, groups, False)
     _batched_gemm(av, sfa_p, bv, sfb_p, dv, cv, gran_k_a, gran_k_b)
+
+
+def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None) -> None:
+    """D = A @ B^T and sqr_sum = sum of squares of A's rows, for BF16 A [M, K] and FP32 B [N, K];
+    with num_splits, D [num_splits, M, N] and sqr_sum [num_splits, M] hold the K splits' partials.
+    CDNA4 has no TF32 MFMA: B runs as two BF16 terms, which is more precise than TF32."""
+    _backend().cdna4_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)
 
 
 # ---- Runtime configuration (CUDA API parity). The CDNA4 kernels size their grids from the compute
