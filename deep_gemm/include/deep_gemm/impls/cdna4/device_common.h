@@ -72,6 +72,14 @@ __device__ __forceinline__ v2i ds_read_tr8(const __attribute__((address_space(3)
       const_cast<__attribute__((address_space(3))) v2i *>(p));
 }
 
+__device__ __forceinline__ v2i ds_read_tr16(const __attribute__((address_space(3)))
+                                            v2i *__restrict__ p) {
+  typedef short v4s __attribute__((ext_vector_type(4)));
+  return __builtin_bit_cast(v2i, __builtin_amdgcn_ds_read_tr16_b64_v4i16(
+                                     (__attribute__((address_space(3))) v4s *)const_cast<
+                                         __attribute__((address_space(3))) v2i *>(p)));
+}
+
 // The second half of a 16-byte buffer store is read one cycle after issue.
 __device__ __forceinline__ void buffer_store16(v4u v, __amdgpu_buffer_rsrc_t r, uint32_t voff,
                                                int soff) {
@@ -91,6 +99,13 @@ template <int B, int E, class F> __device__ __forceinline__ void static_for(F &&
     f(std::integral_constant<int, B>{});
     static_for<B + 1, E>(f);
   }
+}
+
+// D += A B^T on 16x16 tiles with K = 32 BF16 values per lane row (8 per lane)
+__device__ __forceinline__ v4f mfma_bf16_16x16x32(v4i a, v4i b, v4f c) {
+  typedef __bf16 v8bf __attribute__((ext_vector_type(8)));
+  return __builtin_amdgcn_mfma_f32_16x16x32_bf16(__builtin_bit_cast(v8bf, a),
+                                                  __builtin_bit_cast(v8bf, b), c, 0, 0, 0);
 }
 
 // Join the two halves of a scaled MFMA operand.

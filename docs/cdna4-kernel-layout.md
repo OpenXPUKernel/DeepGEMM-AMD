@@ -12,8 +12,8 @@ The packaged headers are organized by responsibility:
 
 | Header | Responsibility |
 | --- | --- |
-| `fp8_gemm_mfma_16x16x128.cuh` | 16×16×128 scaled MFMA, direct global-to-LDS DMA, and interleaved instruction scheduling; data-parallel, persistent, and split-K execution |
-| `fp8_gemm_mfma_16x16x128_small_m.cuh` | Small-M GEMMs: operands streamed from global memory into registers, K split across the waves of a workgroup; dense and m-grouped |
+| `fp8_gemm_mfma_16x16x128.cuh` | 16×16×128 scaled MFMA (or two 16×16×32 BF16 MFMAs per 128-byte K step), direct global-to-LDS DMA, and interleaved instruction scheduling; data-parallel, persistent, and split-K execution |
+| `fp8_gemm_mfma_16x16x128_small_m.cuh` | Small-M FP8 and BF16 GEMMs: operands streamed from global memory into registers, K split across the waves of a workgroup; dense and m-grouped |
 | `epilogue.cuh` | Output stores, accumulation, and boundary handling |
 | `split_k_reduce.cuh` | Deterministic reduction of split-K partials |
 | `tile_scheduler.cuh` | Output-tile ordering for the execution modes, and the mapping of tiles onto the groups (and K ranges) of grouped GEMMs |
@@ -27,8 +27,8 @@ overhead and available parallelism; split counts are normalized so every
 workgroup gets a nonempty K range. Persistent mode additionally checks output
 alignment, row stride, dtype and accumulation.
 
-The generated wrapper specializes the execution mode, grouped GEMM type, output dtype,
-both operand layouts, and both scale granularities. All these choices appear in the in-process
+The generated wrapper specializes the execution mode, grouped GEMM type, operand type (FP8 or
+BF16), output dtype, both operand layouts, and both scale granularities. All these choices appear in the in-process
 JIT cache key. Kernels directly consume K-major or MN-major operands and packed
 32-/128-wide scale blocks. Each DMA constructs a bounded descriptor with a
 64-bit base, so tensors can span more than 4 GiB. MN-major fragments use

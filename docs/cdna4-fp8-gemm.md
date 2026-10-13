@@ -55,12 +55,32 @@ chosen from the rows and the number of workgroups the columns provide.
 ```bash
 pytest -q tests/test_cdna4_grouped_fp8_gemm.py                  # reduced shapes
 DG_TEST_FULL=1 pytest -q tests/test_cdna4_grouped_fp8_gemm.py   # shapes of tests/test_fp8_fp4.py
-python tests/bench_cdna4_grouped_fp8.py --csv results/cdna4-grouped.csv
+python tests/bench_cdna4_grouped_gemm.py --csv results/cdna4-grouped.csv
 ```
 
 The benchmark times kernels with the profiler on the shapes of `tests/test_fp8_fp4.py` and, for
 contiguous layouts, the dense FP8 GEMM on the same total problem. On the contiguous shapes the
 grouped kernel reaches 0.93-1.02x of the dense kernel's speed.
+
+## BF16 GEMMs
+
+`bf16_gemm_{nt,nn,tn,tt}`, `m_grouped_bf16_gemm_{nt,nn}_contiguous` (per-row and PSUM layouts),
+`m_grouped_bf16_gemm_nt_masked` and `k_grouped_bf16_gemm_tn_contiguous` keep the CUDA signatures
+and run the same two kernels without scales. A K step still covers 128 bytes of every row
+(64 BF16 values): each FP8 MFMA of the schedule becomes two 16x16x32 BF16 MFMAs on the two
+halves of the same fragment, so tiles, the LDS layout and the pipeline are unchanged. MN-major
+BF16 operands are read with 16-bit transposing LDS reads. Outputs, `alpha`, accumulation and
+group layouts follow the FP8 GEMMs.
+
+```bash
+pytest -q tests/test_cdna4_bf16_gemm.py
+python tests/bench_cdna4_grouped_gemm.py --dtype bf16
+```
+
+Against the PyTorch (hipBLASLt) BF16 GEMM, the dense kernel is 1.0-1.5x as fast for a single
+row on six of the seven `forward` shapes of the FP8 benchmark below, 0.36-0.98x with 128 rows,
+and 0.92-0.97x on large square shapes. Contiguous grouped GEMMs reach 0.97-0.99x of the dense
+kernel on the same total problem, and masked GEMMs 0.92-2.4x of a per-group hipBLASLt loop.
 
 The production kernels were refreshed from the current tutorial implementation
 on 2026-10-06. Inputs remain in their native K-major or MN-major storage. Physical

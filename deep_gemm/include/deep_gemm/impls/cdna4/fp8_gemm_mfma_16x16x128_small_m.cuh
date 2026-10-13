@@ -1,4 +1,4 @@
-// CDNA4 FP8 GEMM for small M, where streaming B bounds the time.
+// CDNA4 FP8 and BF16 GEMMs for small M, where streaming B bounds the time.
 // Every wave loads its scaled-MFMA operands straight from global memory into a ring of DEPTH
 // register stages: no LDS and no barriers in the K loop. The waves of a workgroup take equal
 // parts of the K range of the workgroup's output tile and add their tiles in LDS in wave order,
@@ -10,13 +10,15 @@
 
 // FM A fragments (M <= 16 FM per tile), NF B fragments (16 NF output columns per workgroup),
 // DEPTH K steps of 128 in flight per wave, WAVES waves splitting the K range of a workgroup.
-// SF_GRAN_128: bit 0 for A, bit 1 for B. K_TAIL: K is not a multiple of 128.
+// SF_GRAN_128: bit 0 for A, bit 1 for B. K_TAIL: K is not a multiple of a K step (128 bytes of a row).
+// BF16: BF16 operands without scales, two 16x16x32 BF16 MFMAs per fragment pair and step.
 template <int FM_, int NF_, int DEPTH_, int WAVES_, int SF_GRAN_128 = 0,
-          GemmType TYPE = GemmType::Normal, bool K_TAIL_ = false>
+          GemmType TYPE = GemmType::Normal, bool K_TAIL_ = false, bool BF16_ = false>
 struct Mfma16x16x128SmallMConfig {
   static constexpr int FM = FM_, NF = NF_, DEPTH = DEPTH_;
-  static constexpr bool K_TAIL = K_TAIL_;
-  static constexpr int WAVES = WAVES_, NT = 64 * WAVES, BK = 128;
+  static constexpr bool K_TAIL = K_TAIL_, BF16 = BF16_;
+  static constexpr int ES = BF16 ? 2 : 1;
+  static constexpr int WAVES = WAVES_, NT = 64 * WAVES, BK = 128; // BK: bytes of a K step
   static constexpr int BM = 16 * FM, BN = 16 * NF;
   static constexpr int SFA_SHIFT = SF_GRAN_128 & 1 ? 2 : 0, SFB_SHIFT = SF_GRAN_128 & 2 ? 2 : 0;
   static constexpr GemmType kType = TYPE;
@@ -54,14 +56,15 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p)
   const int tid = threadIdx.x, lane = tid % 64, g = lane / 16, r16 = lane % 16;
   const int wave = __builtin_amdgcn_readfirstlane(tid / 64);
 
-  // ---- K steps of this wave (the same for every tile)
-  const int k_steps = (p.K + BK - 1) / BK;
+  // ---- K steps of this wave (the same for every tile); K counted in bytes of a row
+  const int k_bytes = p.K * Cfg::ES;
+  const int k_steps = (k_bytes + BK - 1) / BK;
   const int steps_per_wave = (k_steps + WAVES - 1) / WAVES;
   const int wave_begin = wave * steps_per_wave;
   const int nsteps = max(0, min(k_steps, wave_begin + steps_per_wave) - wave_begin);
   // bytes of the last K step that hold data
-  const int k_tail = p.K - (k_steps - 1) * BK;
-  const uint64_t k4 = (uint64_t)((p.K + 3) & ~3);
+  const int k_tail = k_bytes - (k_steps - 1) * BK;
+  const uint64_t k4 = (uint64_t)((k_bytes + 3) & ~3);
   const int sa_words = (k_steps + (1 << Cfg::SFA_SHIFT) - 1) >> Cfg::SFA_SHIFT;
   const int sb_words = (k_steps + (1 << Cfg::SFB_SHIFT) - 1) >> Cfg::SFB_SHIFT;
 
@@ -112,14 +115,16 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p)
         const uint32_t row = (uint32_t)(16 * j + r16) * p.ldb + 16 * g;
         b_frag[d][j][0] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(br, row, koff, 0);
         b_frag[d][j][1] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(br, row + 64, koff, 0);
-        b_code[d][j] = __builtin_amdgcn_raw_buffer_load_b32(sbr, (16 * j + r16) * 4, sb_off, 0);
+        if constexpr (!Cfg::BF16)
+          b_code[d][j] = __builtin_amdgcn_raw_buffer_load_b32(sbr, (16 * j + r16) * 4, sb_off, 0);
       }
 #pragma unroll
       for (int i = 0; i < FM; ++i) {
         const uint32_t row = (uint32_t)(16 * i + r16) * p.lda + 16 * g;
         a_frag[d][i][0] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(ar, row, koff, 0);
         a_frag[d][i][1] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(ar, row + 64, koff, 0);
-        a_code[d][i] = __builtin_amdgcn_raw_buffer_load_b32(sar, (16 * i + r16) * 4, sa_off, 0);
+        if constexpr (!Cfg::BF16)
+          a_code[d][i] = __builtin_amdgcn_raw_buffer_load_b32(sar, (16 * i + r16) * 4, sa_off, 0);
       }
     };
     // The last K step of a K that is not a multiple of 128 reads past K (the next row or row
@@ -154,6 +159,16 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p)
     const bool no_data_block = 32 * g >= k_tail;
     auto compute_step = [&](auto slot, int s) {
       constexpr int d = decltype(slot)::value;
+      if constexpr (Cfg::BF16) {
+#pragma unroll
+        for (int j = 0; j < NF; ++j)
+#pragma unroll
+          for (int i = 0; i < FM; ++i) {
+            acc[i][j] = mfma_bf16_16x16x32(b_frag[d][j][0], a_frag[d][i][0], acc[i][j]);
+            acc[i][j] = mfma_bf16_16x16x32(b_frag[d][j][1], a_frag[d][i][1], acc[i][j]);
+          }
+        return;
+      }
       const int step = wave_begin + s;
       const bool no_data = Cfg::K_TAIL && step == k_steps - 1 && no_data_block;
       const int a_shift = 8 * (Cfg::SFA_SHIFT ? step & 3 : g), b_shift = 8 * (Cfg::SFB_SHIFT ? step & 3 : g);

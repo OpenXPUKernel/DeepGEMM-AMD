@@ -34,6 +34,9 @@ __all__ = [
     "m_grouped_fp4_gemm_nt_masked", "m_grouped_fp8_gemm_nt_masked",
     "k_grouped_fp4_gemm_nt_contiguous", "k_grouped_fp8_gemm_nt_contiguous",
     "k_grouped_fp8_gemm_tn_contiguous",
+    "bf16_gemm_nt", "bf16_gemm_nn", "bf16_gemm_tn", "bf16_gemm_tt",
+    "m_grouped_bf16_gemm_nt_contiguous", "m_grouped_bf16_gemm_nn_contiguous",
+    "m_grouped_bf16_gemm_nt_masked", "k_grouped_bf16_gemm_tn_contiguous",
 ]
 
 def _backend():
@@ -549,6 +552,123 @@ def k_grouped_fp8_gemm_nt_contiguous(
     if use_psum_layout:
         raise ValueError("the K-major K-grouped GEMM does not take the PSUM layout")
     _k_grouped_gemm(a, b, d, ks_cpu, grouped_layout, c, tuple(recipe), False, epilogue, True)
+
+
+def _check_bf16(x: torch.Tensor, name: str, dim: int) -> None:
+    if x.dtype != torch.bfloat16 or x.dim() != dim:
+        raise TypeError(f"{name} must be a {dim}-D torch.bfloat16 tensor")
+
+
+def bf16_gemm_nt(a, b, d, c=None, compiled_dims="nk", alpha=None, epilogue=None) -> None:
+    """D = alpha * (A @ B.T) + C for BF16 A [M, K] and B [N, K] (K- or MN-major)."""
+    del compiled_dims
+    if epilogue is not None:
+        raise NotImplementedError("custom epilogues are not supported by the CDNA4 backend")
+    _check_bf16(a, "a", 2)
+    _check_bf16(b, "b", 2)
+    m, k = a.shape
+    n, kb = b.shape
+    if k != kb or d.dim() != 2 or tuple(d.shape) != (m, n):
+        raise ValueError(f"shape mismatch: a={tuple(a.shape)}, b={tuple(b.shape)}, d={tuple(d.shape)}")
+    if d.dtype not in (torch.bfloat16, torch.float32) or (d.stride(1) != 1 and n > 1):
+        raise ValueError("d must be a row-major bf16 or fp32 tensor")
+    if c is not None:
+        if c.dtype != d.dtype or tuple(c.shape) != tuple(d.shape) or (c.stride(1) != 1 and n > 1):
+            raise ValueError("c must match d in shape, dtype and layout")
+        if c.data_ptr() == d.data_ptr() and c.stride() != d.stride():
+            raise ValueError("c aliases d with different strides")
+    _check_same_device(d, a, b, *((c,) if c is not None else ()))
+    if m == 0 or n == 0:
+        return
+    if k == 0:
+        if c is None:
+            d.zero_()
+        elif c.data_ptr() != d.data_ptr():
+            d.copy_(c)
+        return
+    if c is not None and c.data_ptr() != d.data_ptr() and c.stride() != d.stride():
+        d.copy_(c)
+        c = d
+    _backend().cdna4_fp8_gemm_nt(a, None, b, None, d, c, 1.0 if alpha is None else float(alpha), 0, 0)
+
+
+def bf16_gemm_nn(a, b, d, c=None, compiled_dims="nk", alpha=None, epilogue=None):
+    return bf16_gemm_nt(a, b.transpose(0, 1), d, c, compiled_dims, alpha, epilogue)
+
+
+def bf16_gemm_tn(a, b, d, c=None, compiled_dims="mn", alpha=None, epilogue=None):
+    return bf16_gemm_nt(a.transpose(0, 1), b.transpose(0, 1), d, c, compiled_dims, alpha, epilogue)
+
+
+def bf16_gemm_tt(a, b, d, c=None, compiled_dims="mn", alpha=None, epilogue=None):
+    return bf16_gemm_nt(a.transpose(0, 1), b, d, c, compiled_dims, alpha, epilogue)
+
+
+def m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims="nk", use_psum_layout=False,
+                                      ensure_zero_padding=True, expected_m_for_psum_layout=None,
+                                      epilogue=None) -> None:
+    """BF16 version of m_grouped_fp8_gemm_nt_contiguous (A [M, K], B [G, N, K], D [M, N] BF16)."""
+    del compiled_dims
+    if epilogue is not None:
+        raise NotImplementedError("custom epilogues are not supported by the CDNA4 backend")
+    if expected_m_for_psum_layout is not None and not use_psum_layout:
+        raise ValueError("expected_m_for_psum_layout requires the PSUM layout")
+    _check_bf16(a, "a", 2)
+    _check_bf16(b, "b", 3)
+    m, k = a.shape
+    num_groups, n, kb = b.shape
+    if k != kb or d.dim() != 2 or tuple(d.shape) != (m, n) or d.dtype != torch.bfloat16:
+        raise ValueError(f"shape mismatch: a={tuple(a.shape)}, b={tuple(b.shape)}, d={tuple(d.shape)} (bf16)")
+    _check_same_device(d, a, b, grouped_layout)
+    if m == 0 or n == 0:
+        return
+    _backend().cdna4_m_grouped_fp8_gemm_contiguous(
+        a, None, b, None, d, grouped_layout, 0, 0, use_psum_layout, ensure_zero_padding,
+        get_mk_alignment_for_contiguous_layout(), int(expected_m_for_psum_layout or 0))
+
+
+def m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims="nk", use_psum_layout=False,
+                                      ensure_zero_padding=True, epilogue=None) -> None:
+    return m_grouped_bf16_gemm_nt_contiguous(a, b.transpose(1, 2), d, grouped_layout, compiled_dims,
+                                             use_psum_layout, ensure_zero_padding, None, epilogue)
+
+
+def m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims="nk", epilogue=None) -> None:
+    """BF16 version of m_grouped_fp8_gemm_nt_masked."""
+    del compiled_dims
+    if epilogue is not None:
+        raise NotImplementedError("custom epilogues are not supported by the CDNA4 backend")
+    _check_bf16(a, "a", 3)
+    _check_bf16(b, "b", 3)
+    num_groups, max_m, k = a.shape
+    _, n, _ = b.shape
+    if (tuple(b.shape) != (num_groups, n, k) or d.dim() != 3 or tuple(d.shape) != (num_groups, max_m, n)
+            or d.dtype != torch.bfloat16):
+        raise ValueError(f"shape mismatch: a={tuple(a.shape)}, b={tuple(b.shape)}, d={tuple(d.shape)} (bf16)")
+    _check_same_device(d, a, b, masked_m)
+    _backend().cdna4_m_grouped_fp8_gemm_masked(a, None, b, None, d, masked_m, int(expected_m), 0, 0)
+
+
+def k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks_cpu, grouped_layout, c=None, compiled_dims="mn",
+                                      use_psum_layout=False, epilogue=None) -> None:
+    """D[g] (+)= A[K range of g, :]^T @ B[K range of g, :] for BF16 A [sum_k, M], B [sum_k, N]."""
+    del compiled_dims
+    if epilogue is not None:
+        raise NotImplementedError("custom epilogues are not supported by the CDNA4 backend")
+    _check_bf16(a, "a", 2)
+    _check_bf16(b, "b", 2)
+    k_alignment = get_mk_alignment_for_contiguous_layout()
+    if k_alignment % 128:
+        raise ValueError("the K alignment must be a multiple of 128")
+    if d.dim() != 3 or grouped_layout.numel() != d.size(0):
+        raise ValueError("d must be [G, M, N] with one grouped_layout entry per group")
+    if not use_psum_layout and not ks_cpu:
+        raise ValueError("ks_cpu is required without the PSUM layout")
+    if ks_cpu and not use_psum_layout and (sum(ks_cpu) != a.size(0) or any(k % k_alignment for k in ks_cpu)):
+        raise ValueError("ks_cpu must be K-aligned and add up to the rows of a")
+    _check_same_device(d, a, b, grouped_layout, *((c,) if c is not None else ()))
+    _backend().cdna4_k_grouped_fp8_gemm(a, None, b, None, d, c, grouped_layout, use_psum_layout, k_alignment, 0,
+                                        False)
 
 
 m_grouped_fp4_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous
