@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -22,8 +23,8 @@ namespace deep_gemm::cdna4 {
 
 struct JitModule {
     hipModule_t module = nullptr;
-    hipFunction_t gemm = nullptr;
-    hipFunction_t reduce = nullptr;
+    // the kernels in the order of the names they were loaded by
+    std::vector<hipFunction_t> kernels;
 
     ~JitModule() {
         if (module != nullptr)
@@ -52,7 +53,7 @@ public:
     // kernels take at most one workgroup per compute unit.
     int launch(GemmArgs& args, const KernelConfig& config, const int out_dtype,
                hipStream_t stream, const int num_cus, int tiles = 0) {
-        const auto jit = get_module(config, out_dtype);
+        const auto jit = get_gemm_module(config, out_dtype);
         if (tiles == 0)
             tiles = ceil_div(args.M, config.block_m) * ceil_div(args.N, config.block_n);
         if (tiles == 0)
@@ -70,16 +71,41 @@ public:
             grid = std::min(tiles, std::max(num_cus, 1));
 
         void* params[] = {&args};
-        auto error = hipModuleLaunchKernel(jit->gemm, grid, 1, 1, block, 1, 1, shared, stream, params, nullptr);
+        auto error = hipModuleLaunchKernel(jit->kernels[0], grid, 1, 1, block, 1, 1, shared, stream, params, nullptr);
         if (error != hipSuccess)
             return static_cast<int>(error);
         if (config.variant == KernelVariant::mfma_16x16x128_split_k) {
             const unsigned int bx = (args.N + 1023) / 1024;
             const unsigned int by = std::min(args.M, std::max(1, 4096 / static_cast<int>(std::max(bx, 1u))));
             void* reduce_params[] = {&args};
-            error = hipModuleLaunchKernel(jit->reduce, bx, by, 1, 256, 1, 1, 0, stream, reduce_params, nullptr);
+            error = hipModuleLaunchKernel(jit->kernels[1], bx, by, 1, 256, 1, 1, 0, stream, reduce_params, nullptr);
         }
         return static_cast<int>(error);
+    }
+
+    // A module compiled from source() on the first use of key (per device and architecture), with
+    // the kernels `names`; options are added to the compiler's
+    std::shared_ptr<JitModule> get_module(const std::string& key, const std::function<std::string()>& source,
+                                          const std::vector<std::string>& names,
+                                          const std::vector<std::string>& options = {}) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto [device, arch] = device_arch();
+        const std::string full_key = std::to_string(device) + ":" + arch + ":" + key;
+        auto found = modules_.find(full_key);
+        if (found != modules_.end())
+            return found->second;
+        auto module = compile(source(), arch, names, options);
+        modules_.emplace(full_key, module);
+        return module;
+    }
+
+    // Launch a kernel taking one argument struct by value
+    template <class Args>
+    static int launch_kernel(hipFunction_t kernel, Args& args, dim3 grid, dim3 block, unsigned int shared,
+                             hipStream_t stream) {
+        void* params[] = {&args};
+        return static_cast<int>(hipModuleLaunchKernel(kernel, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+                                                      shared, stream, params, nullptr));
     }
 
 private:
@@ -171,23 +197,24 @@ private:
         return source.str();
     }
 
-    std::shared_ptr<JitModule> get_module(const KernelConfig& config, const int out_dtype) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto [device, arch] = device_arch();
-        const std::string key = std::to_string(device) + ":" + arch + ":" +
-                                variant_name(config.variant) + ":" + std::to_string(out_dtype) + ":" +
-                                std::to_string(config.mn_major) + ":" + std::to_string(config.scale_gran_128) +
+    std::shared_ptr<JitModule> get_gemm_module(const KernelConfig& config, const int out_dtype) {
+        const std::string key = std::string("gemm:") + variant_name(config.variant) + ":" + std::to_string(out_dtype) +
+                                ":" + std::to_string(config.mn_major) + ":" + std::to_string(config.scale_gran_128) +
                                 ":" + type_name(config.type) + ":" + std::to_string(config.block_m) + "x" +
                                 std::to_string(config.block_n) + ":" + std::to_string(config.depth) + ":" +
                                 std::to_string(config.waves) + (config.k_tail ? ":tail" : "") + ":" +
                                 operand_name(config.a_type) + "x" + operand_name(config.b_type);
-        auto found = modules_.find(key);
-        if (found != modules_.end())
-            return found->second;
+        std::vector<std::string> names = {"dg_cdna4_gemm"};
+        if (config.variant == KernelVariant::mfma_16x16x128_split_k)
+            names.push_back("dg_cdna4_reduce");
+        return get_module(key, [&] { return source_for(config, out_dtype); }, names);
+    }
+
+    std::shared_ptr<JitModule> compile(const std::string& source, const std::string& arch,
+                                       const std::vector<std::string>& names,
+                                       const std::vector<std::string>& extra_options) const {
         if (include_root_.empty())
             throw std::runtime_error("CDNA4 HIP JIT runtime was not initialized");
-
-        const auto source = source_for(config, out_dtype);
         hiprtcProgram program = nullptr;
         auto status = hiprtcCreateProgram(&program, source.c_str(), "deep_gemm_cdna4.cpp", 0, nullptr, nullptr);
         if (status != HIPRTC_SUCCESS)
@@ -198,8 +225,10 @@ private:
         if (rocm == nullptr) rocm = "/opt/rocm";
         const std::string rocm_include = "-I" + (std::filesystem::path(rocm) / "include").string();
         const std::string arch_option = "--offload-arch=" + arch;
-        const char* options[] = {"--std=c++17", include.c_str(), rocm_include.c_str(), arch_option.c_str()};
-        status = hiprtcCompileProgram(program, 4, options);
+        std::vector<const char*> options = {"--std=c++17", include.c_str(), rocm_include.c_str(), arch_option.c_str()};
+        for (const auto& option : extra_options)
+            options.push_back(option.c_str());
+        status = hiprtcCompileProgram(program, static_cast<int>(options.size()), options.data());
         if (status != HIPRTC_SUCCESS) {
             size_t log_size = 0;
             hiprtcGetProgramLogSize(program, &log_size);
@@ -216,13 +245,14 @@ private:
         hiprtcDestroyProgram(&program);
 
         auto module = std::make_shared<JitModule>();
-        if (hipModuleLoadData(&module->module, code.data()) != hipSuccess ||
-            hipModuleGetFunction(&module->gemm, module->module, "dg_cdna4_gemm") != hipSuccess)
+        if (hipModuleLoadData(&module->module, code.data()) != hipSuccess)
             throw std::runtime_error("loading HIPRTC code object failed");
-        if (config.variant == KernelVariant::mfma_16x16x128_split_k &&
-            hipModuleGetFunction(&module->reduce, module->module, "dg_cdna4_reduce") != hipSuccess)
-            throw std::runtime_error("loading HIPRTC reduction kernel failed");
-        modules_.emplace(key, module);
+        for (const auto& name : names) {
+            hipFunction_t kernel = nullptr;
+            if (hipModuleGetFunction(&kernel, module->module, name.c_str()) != hipSuccess)
+                throw std::runtime_error("loading HIPRTC kernel " + name + " failed");
+            module->kernels.push_back(kernel);
+        }
         return module;
     }
 

@@ -5,6 +5,7 @@ The HIP backend has one pybind extension and a small runtime JIT layer:
 - `csrc/hip_python_api.cpp` validates tensors, asks the cost model for a configuration, and launches the cached HIPRTC module.
 - `csrc/cdna4/cost_model.hpp` maps a GEMM shape to a tile, pipeline, and split-K specialization.
 - `csrc/cdna4/jit_runtime.hpp` generates the wrapper source, compiles it with HIPRTC on first use, caches the code object, and launches it through the current PyTorch stream.
+- `csrc/cdna4/mqa_logits.hpp` plans the MQA logits kernels (tokens per wave, chunk of KV rows) and launches them.
 - `deep_gemm/include/deep_gemm/impls/cdna4/` contains the packaged device templates: the production FP8 pipeline, shared device helpers, and the plain `GemmArgs` ABI.
 - `deep_gemm/_hip_api.py` keeps quantization, scale packing, layout aliases, and the public Python interface aligned with the CUDA backend.
 
@@ -14,6 +15,8 @@ The packaged headers are organized by responsibility:
 | --- | --- |
 | `fp8_gemm_mfma_16x16x128.cuh` | 16×16×128 scaled MFMA on FP8 / FP4 operands (or two 16×16×32 BF16 MFMAs per 128-byte K step), direct global-to-LDS DMA, and interleaved instruction scheduling; data-parallel, persistent, and split-K execution |
 | `fp8_gemm_mfma_16x16x128_small_m.cuh` | Small-M FP8 / FP4 and BF16 GEMMs: operands streamed from global memory into registers, K split across the waves of a workgroup; dense and m-grouped |
+| `mqa_logits.cuh` | MQA logits (contiguous, paged and sparse KV): scaled-MFMA dot products with the weighted ReLU sum over the heads in the lanes |
+| `mqa_logits_args.h` | Argument layout, formats and KV sources of the MQA logits kernels |
 | `epilogue.cuh` | Output stores, accumulation, and boundary handling |
 | `split_k_reduce.cuh` | Deterministic reduction of split-K partials |
 | `tile_scheduler.cuh` | Output-tile ordering for the execution modes, and the mapping of tiles onto the groups (and K ranges) of grouped GEMMs |

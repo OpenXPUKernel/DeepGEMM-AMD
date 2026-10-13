@@ -37,6 +37,11 @@ __all__ = [
     "bf16_gemm_nt", "bf16_gemm_nn", "bf16_gemm_tn", "bf16_gemm_tt",
     "m_grouped_bf16_gemm_nt_contiguous", "m_grouped_bf16_gemm_nn_contiguous",
     "m_grouped_bf16_gemm_nt_masked", "k_grouped_bf16_gemm_tn_contiguous",
+    "shutdown", "set_num_sms", "get_num_sms", "set_tc_util", "get_tc_util", "set_ignore_compile_dims",
+    "set_block_size_multiple_of", "set_pdl", "get_pdl", "use_deterministic_algorithms",
+    "get_mqa_logits_metadata", "fp8_fp4_mqa_logits", "get_paged_mqa_logits_metadata", "fp8_fp4_paged_mqa_logits",
+    "get_sparse_mqa_logits_metadata", "get_paged_sparse_mqa_logits_metadata", "fp8_fp4_sparse_mqa_logits",
+    "fp8_fp4_paged_sparse_mqa_logits",
 ]
 
 def _backend():
@@ -708,3 +713,194 @@ def k_grouped_fp4_gemm_nt_contiguous(
     if not (_is_fp4(a[0]) and _is_fp4(b[0]) and a[0].dim() == 2 and b[0].dim() == 2):
         raise TypeError("a and b must be 2-D packed FP4 (torch.int8) tensors")
     _k_grouped_gemm(a, b, d, ks_cpu, grouped_layout, c, tuple(recipe), use_psum_layout, epilogue, True)
+
+
+# ---- Runtime configuration (CUDA API parity). The CDNA4 kernels size their grids from the compute
+# units, or from set_num_sms; the remaining switches have no CDNA4 counterpart and are recorded only.
+_config = {"num_sms": None, "tc_util": 100, "pdl": False, "deterministic": False}
+
+
+def shutdown() -> None:
+    pass
+
+
+def set_num_sms(num_sms: int) -> None:
+    if num_sms <= 0:
+        raise ValueError("the number of compute units must be positive")
+    _config["num_sms"] = int(num_sms)
+
+
+def get_num_sms() -> int:
+    if _config["num_sms"] is None:
+        return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return _config["num_sms"]
+
+
+def set_tc_util(tc_util: int) -> None:
+    _config["tc_util"] = int(tc_util)
+
+
+def get_tc_util() -> int:
+    return _config["tc_util"]
+
+
+def set_ignore_compile_dims(ignore: bool) -> None:
+    del ignore
+
+
+def set_block_size_multiple_of(multiple: int) -> None:
+    del multiple
+
+
+def set_pdl(enable: bool) -> None:
+    _config["pdl"] = bool(enable)
+
+
+def get_pdl() -> bool:
+    return _config["pdl"]
+
+
+def use_deterministic_algorithms(enable: bool = True) -> None:
+    _config["deterministic"] = bool(enable)
+
+
+# ---- MQA logits (the V3.2 indexer). FP8 Q (no scales) takes E4M3 KV with one float scale per
+# token, float weights and gives float logits; MXFP8 / packed MXFP4 Q and KV carry UE8M0 scales of
+# 32 values packed into one int32 per head / token, with BF16 weights and logits.
+_MQA_CONTIGUOUS, _MQA_PAGED, _MQA_SPARSE, _MQA_PAGED_SPARSE = 0, 1, 2, 3
+
+
+def _mqa_q(q, num_dims):
+    q_fp, q_sf = q
+    if q_fp.dim() != num_dims or not q_fp.is_contiguous():
+        raise ValueError(f"q must be a contiguous {num_dims}-D tensor")
+    if q_sf is None and q_fp.dtype != torch.float8_e4m3fn:
+        raise TypeError("Q without scales must be torch.float8_e4m3fn")
+    if q_sf is not None and (q_sf.dtype != torch.int32 or tuple(q_sf.shape) != tuple(q_fp.shape[:-1])):
+        raise ValueError("q scales must be packed int32, one per token and head")
+    head_dim = q_fp.size(-1) * (2 if _is_fp4(q_fp) else 1)
+    return q_fp, q_sf, head_dim
+
+
+def _mqa_logits_buffer(rows, columns, q_sf, device):
+    dtype = torch.float32 if q_sf is None else torch.bfloat16
+    storage = torch.empty((rows, align(max(columns, 1), 256)), device=device, dtype=dtype)
+    return storage[:, :columns]
+
+
+def get_mqa_logits_metadata(cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, num_heads):
+    """KV ranges of the groups of tokens the contiguous MQA logits kernel gives each wave."""
+    del num_kv_tokens
+    tokens = _backend().cdna4_mqa_logits_tokens_per_wave(int(num_heads))
+    num_q = cu_seq_len_k_start.numel()
+    groups = ceil_div(num_q, tokens)
+    pad = groups * tokens - num_q
+    ks = torch.nn.functional.pad(cu_seq_len_k_start, (0, pad), value=2**31 - 1).view(groups, tokens)
+    ke = torch.nn.functional.pad(cu_seq_len_k_end, (0, pad), value=-2**31).view(groups, tokens)
+    return torch.stack((ks.amin(1), ke.amax(1)), dim=1).to(torch.int32).contiguous()
+
+
+def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta=None):
+    """logits[i, j] = sum_h weights[i, h] relu(q[i, h] . kv[ks[i] + j]) for j < ke[i] - ks[i]
+    (times the KV scale with FP8 Q); entries past a row's span are not written."""
+    q_fp, q_sf, _ = _mqa_q(q, 3)
+    kv_fp, kv_sf = kv
+    if max_seqlen_k <= 0:
+        raise ValueError("max_seqlen_k must be positive")
+    if kv_fp.dim() != 2 or not kv_fp.is_contiguous() or kv_fp.dtype != q_fp.dtype or kv_fp.size(1) != q_fp.size(2):
+        raise ValueError("kv must be a contiguous [seq_len_kv, D] tensor of the dtype of q")
+    if kv_sf.dtype != (torch.float32 if q_sf is None else torch.int32) or kv_sf.numel() != kv_fp.size(0):
+        raise ValueError("kv scales must hold one float (FP8) or packed int32 (MX) per token")
+    logits = _mqa_logits_buffer(q_fp.size(0), int(max_seqlen_k), q_sf, q_fp.device)
+    _backend().cdna4_mqa_logits(q_fp, q_sf, kv_fp, kv_sf.contiguous(), weights, logits, _MQA_CONTIGUOUS,
+                                ks=cu_seq_len_k_start, ke=cu_seq_len_k_end, group_ranges=schedule_meta)
+    return logits
+
+
+def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None):
+    """With `indices` (the request of every token, one token per row): the first token of each
+    token's request. Without, requests are the rows of context_lens and need no metadata."""
+    del block_kv, num_sms
+    if indices is None:
+        return torch.zeros((1, 2), device=context_lens.device, dtype=torch.int32)
+    num_q = indices.numel()
+    first = torch.ones(num_q, device=indices.device, dtype=torch.bool)
+    first[1:] = indices[1:] != indices[:-1]
+    positions = torch.where(first, torch.arange(num_q, device=indices.device), 0)
+    return torch.cummax(positions, dim=0).values.to(torch.int32)
+
+
+def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len,
+                             indices=None):
+    """Paged MQA logits: q [batch, next_n, H, D], kv_cache [blocks, block_kv, 1, D + 4] (a block holds
+    block_kv rows, then their scales), token (i, j) takes positions [0, context_lens[i, j]) of
+    block_table row i (with `indices`: rows are tokens, next_n = 1)."""
+    q_fp, q_sf, head_dim = _mqa_q(q, 4)
+    batch, next_n, num_heads = q_fp.shape[:3]
+    if kv_cache.dim() != 4 or kv_cache.dtype != torch.uint8 or kv_cache.size(2) != 1:
+        raise ValueError("kv_cache must be a [blocks, block_kv, 1, D + 4] uint8 tensor")
+    row_bytes = head_dim // 2 if _is_fp4(q_fp) else head_dim
+    if kv_cache.size(3) != row_bytes + 4 or kv_cache.stride(3) != 1:
+        raise ValueError("kv_cache rows must hold D values and a 4-byte scale")
+    if indices is not None and next_n != 1:
+        raise ValueError("varlen requests take one token per row")
+    if tuple(context_lens.shape) != (batch, next_n) or block_table.size(0) != batch or block_table.stride(1) != 1:
+        raise ValueError("context_lens must be [batch, next_n] and block_table [batch, max_blocks]")
+    logits = _mqa_logits_buffer(batch * next_n, int(max_context_len), q_sf, q_fp.device)
+    _backend().cdna4_mqa_logits(q_fp.view(batch * next_n, num_heads, -1), q_sf, kv_cache, None, weights, logits,
+                                _MQA_PAGED, context_lens=context_lens.contiguous(), block_table=block_table,
+                                run_starts=schedule_meta if indices is not None else None, next_n=next_n,
+                                page_kv=kv_cache.size(1))
+    return logits
+
+
+def get_sparse_mqa_logits_metadata(cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, sparse_kv_block_indices,
+                                   qk_dtype, sparse_block_kv, use_unaligned_ks=False):
+    """The tokens' KV ranges and the first KV row of each selected block (block i of a token starts
+    at i * sparse_block_kv, plus ks % sparse_block_kv with unaligned ks)."""
+    del num_kv_tokens, qk_dtype
+    starts = sparse_kv_block_indices * sparse_block_kv
+    if use_unaligned_ks:
+        starts = starts + (cu_seq_len_k_start % sparse_block_kv)[:, None]
+    return torch.cat((cu_seq_len_k_start.int(), cu_seq_len_k_end.int(), starts.int().flatten()))
+
+
+def get_paged_sparse_mqa_logits_metadata(context_lens, block_table, indices, page_kv, sparse_kv_block_indices,
+                                         qk_dtype, sparse_block_kv):
+    """The tokens' context lengths and the physical row (page * page_kv + row) of each selected block."""
+    del indices, qk_dtype
+    positions = sparse_kv_block_indices.long() * sparse_block_kv
+    pages = block_table.long().gather(1, (positions // page_kv).clamp(max=block_table.size(1) - 1))
+    lens = context_lens.reshape(-1).int()
+    return torch.cat((lens, lens, (pages * page_kv + positions % page_kv).int().flatten()))
+
+
+def _sparse_logits(q_fp, q_sf, kv, kv_sf, weights, metadata, num_max_sparse_blocks, sparse_block_kv, source):
+    num_q = q_fp.size(0)
+    if metadata.numel() != num_q * (2 + num_max_sparse_blocks):
+        raise ValueError("the sparse metadata does not match q and num_max_sparse_blocks")
+    logits = _mqa_logits_buffer(num_q, num_max_sparse_blocks * sparse_block_kv, q_sf, q_fp.device)
+    paged = source == _MQA_PAGED_SPARSE
+    _backend().cdna4_mqa_logits(q_fp, q_sf, kv, kv_sf, weights, logits, source,
+                                ks=None if paged else metadata[:num_q], ke=None if paged else metadata[num_q:2 * num_q],
+                                context_lens=metadata[:num_q] if paged else None,
+                                page_kv=kv.size(1) if paged else 0, sparse_starts=metadata[2 * num_q:],
+                                num_max_sparse_blocks=num_max_sparse_blocks, sparse_block_kv=sparse_block_kv)
+    return logits
+
+
+def fp8_fp4_sparse_mqa_logits(q, kv, weights, metadata, num_max_sparse_blocks, sparse_block_kv,
+                              use_unaligned_ks=False):
+    """logits[i, b * sparse_block_kv + t]: token t of the b-th selected block of token i."""
+    del use_unaligned_ks  # folded into the metadata
+    q_fp, q_sf, _ = _mqa_q(q, 3)
+    kv_fp, kv_sf = kv
+    return _sparse_logits(q_fp, q_sf, kv_fp, kv_sf.contiguous(), weights, metadata, num_max_sparse_blocks,
+                          sparse_block_kv, _MQA_SPARSE)
+
+
+def fp8_fp4_paged_sparse_mqa_logits(q, kv_cache, weights, metadata, num_max_sparse_blocks, sparse_block_kv):
+    q_fp, q_sf, _ = _mqa_q(q, 4)
+    return _sparse_logits(q_fp.view(q_fp.size(0) * q_fp.size(1), q_fp.size(2), -1), q_sf.view(-1, q_sf.size(-1))
+                          if q_sf is not None else None, kv_cache, None, weights, metadata, num_max_sparse_blocks,
+                          sparse_block_kv, _MQA_PAGED_SPARSE)

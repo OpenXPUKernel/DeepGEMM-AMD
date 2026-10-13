@@ -5,6 +5,7 @@
 #include <c10/hip/HIPStream.h>
 
 #include "cdna4/jit_runtime.hpp"
+#include "cdna4/mqa_logits.hpp"
 #include "deep_gemm/impls/cdna4/gemm_args.h"
 
 #include <limits>
@@ -481,6 +482,82 @@ void cdna4_k_grouped_fp8_gemm(const torch::Tensor& a, const OptTensor& sfa,
     launch_or_throw(args, config, out_dtype, d, groups * ceil_div(m, kBlockMN) * ceil_div(n, kBlockMN));
 }
 
+// MQA logits of q [num_q, H, D] (packed FP4: D / 2 bytes) against KV rows from `source`
+// (MqaLogitsSource) into the preallocated logits. The Python wrappers validate shapes and build the
+// per-source tensors (metadata).
+void cdna4_mqa_logits(const torch::Tensor& q, const OptTensor& q_sf, const torch::Tensor& kv, const OptTensor& kv_sf,
+                      const torch::Tensor& weights, const torch::Tensor& logits, int source,
+                      const OptTensor& ks, const OptTensor& ke, const OptTensor& group_ranges,
+                      const OptTensor& context_lens, const OptTensor& block_table, const OptTensor& run_starts,
+                      int next_n, int page_kv, const OptTensor& sparse_starts, int num_max_sparse_blocks,
+                      int sparse_block_kv) {
+    using deep_gemm::cdna4::MqaLogitsFormat;
+    using deep_gemm::cdna4::MqaLogitsSource;
+    const auto src = static_cast<MqaLogitsSource>(source);
+    const bool paged = src == MqaLogitsSource::Paged || src == MqaLogitsSource::PagedSparse;
+    const bool fp4 = is_packed_fp4(q);
+    const auto format = !q_sf.has_value() ? MqaLogitsFormat::Fp8 : fp4 ? MqaLogitsFormat::MxFp4 : MqaLogitsFormat::MxFp8;
+    TORCH_CHECK(q.dim() == 3 && q.is_contiguous() && (fp4 || q.scalar_type() == torch::kFloat8_e4m3fn),
+                "q must be a contiguous [num_q, H, D] FP8 or packed FP4 tensor");
+    TORCH_CHECK(format != MqaLogitsFormat::Fp8 || !fp4, "FP4 Q needs scales");
+    const int num_q = q.size(0), num_heads = q.size(1), head_dim = q.size(2) * (fp4 ? 2 : 1);
+    TORCH_CHECK(head_dim == 32 || head_dim == 64 || head_dim == 128, "head dims of 32, 64 or 128 values");
+    TORCH_CHECK(!fp4 || head_dim >= 64, "FP4 heads hold 64 or 128 values");
+    if (q_sf.has_value())
+        TORCH_CHECK(q_sf->scalar_type() == torch::kInt32 && q_sf->is_contiguous() && q_sf->numel() == int64_t(num_q) * num_heads,
+                    "q_sf must hold one packed int32 per token and head");
+    TORCH_CHECK(weights.dim() == 2 && weights.size(0) == num_q && weights.size(1) == num_heads && weights.stride(1) == 1 &&
+                weights.scalar_type() == (format == MqaLogitsFormat::Fp8 ? torch::kFloat : torch::kBFloat16),
+                "weights must be [num_q, H] with contiguous rows, float with FP8 Q, BF16 with MX Q");
+    TORCH_CHECK(logits.dim() == 2 && logits.size(0) == num_q && logits.stride(1) == 1 &&
+                logits.scalar_type() == (format == MqaLogitsFormat::Fp8 ? torch::kFloat : torch::kBFloat16),
+                "logits must be [num_q, columns] with contiguous rows");
+    const c10::hip::HIPGuard device_guard(q.get_device());
+    if (num_q == 0 || logits.size(1) == 0)
+        return;
+
+    deep_gemm::cdna4::MqaLogitsArgs args{};
+    args.q = reinterpret_cast<const std::uint8_t*>(q.data_ptr());
+    args.q_sf = q_sf.has_value() ? q_sf->data_ptr<std::int32_t>() : nullptr;
+    args.kv = reinterpret_cast<const std::uint8_t*>(kv.data_ptr());
+    args.kv_sf = kv_sf.has_value() ? kv_sf->data_ptr() : nullptr;
+    args.weights = weights.data_ptr();
+    args.ld_weights = stride_as_int(weights, 0, "weights");
+    args.logits = logits.data_ptr();
+    args.ld_logits = logits.stride(0);
+    args.num_q = num_q;
+    const auto ptr = [](const OptTensor& t) { return t.has_value() ? t->data_ptr<std::int32_t>() : nullptr; };
+    args.ks = ptr(ks), args.ke = ptr(ke), args.group_ranges = ptr(group_ranges);
+    args.context_lens = ptr(context_lens), args.block_table = ptr(block_table), args.run_starts = ptr(run_starts);
+    args.sparse_starts = ptr(sparse_starts);
+    args.next_n = std::max(next_n, 1), args.page_kv = page_kv;
+    args.num_max_sparse_blocks = num_max_sparse_blocks, args.sparse_block_kv = sparse_block_kv;
+    if (paged) {
+        args.page_stride = kv.stride(0) * kv.element_size();
+        args.block_table_stride = block_table.has_value() ? stride_as_int(*block_table, 0, "block_table") : 0;
+        TORCH_CHECK(page_kv > 0, "pages need rows");
+    } else {
+        args.num_kv = kv.size(0);
+        TORCH_CHECK(args.num_kv > 0 && kv_sf.has_value(), "contiguous KV needs rows and scales");
+    }
+    const auto plan = deep_gemm::cdna4::plan_mqa_logits(format, src, head_dim, num_heads,
+                                                       run_starts.has_value() ? 4 : args.next_n);
+    // Paged: a workgroup per token, the first of each group of a request's tokens works
+    const int waves = src == MqaLogitsSource::Paged ? num_q : ceil_div(num_q, plan.tokens_per_wave());
+    TORCH_CHECK(!group_ranges.has_value() || group_ranges->numel() == 2 * int64_t(waves),
+                "the MQA logits metadata does not match the number of heads");
+    const auto stream = c10::hip::getCurrentHIPStream(q.get_device()).stream();
+    const int error = deep_gemm::cdna4::launch_mqa_logits(args, plan, waves, logits.size(1), stream);
+    TORCH_CHECK(error == 0, "CDNA4 MQA logits launch failed with code ", error);
+}
+
+// Tokens per wave of the contiguous MQA logits kernel (the group size of its metadata)
+int cdna4_mqa_logits_tokens_per_wave(int num_heads) {
+    return deep_gemm::cdna4::plan_mqa_logits(deep_gemm::cdna4::MqaLogitsFormat::MxFp8,
+                                             deep_gemm::cdna4::MqaLogitsSource::Contiguous, 128, num_heads)
+        .tokens_per_wave();
+}
+
 std::tuple<int64_t, int> cdna4_fp8_gemm_plan(int m, int n, int k) {
     TORCH_CHECK(m >= 0 && n >= 0 && k >= 0, "GEMM dimensions must be nonnegative");
     if (m == 0 || n == 0 || k == 0) return {0, 0};
@@ -513,4 +590,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("d"), py::arg("c"),
           py::arg("grouped_layout"), py::arg("use_psum_layout"), py::arg("k_alignment"), py::arg("gran_k"),
           py::arg("k_major"));
+    m.def("cdna4_mqa_logits", &cdna4_mqa_logits,
+          py::arg("q"), py::arg("q_sf"), py::arg("kv"), py::arg("kv_sf"), py::arg("weights"), py::arg("logits"),
+          py::arg("source"), py::arg("ks") = std::nullopt, py::arg("ke") = std::nullopt,
+          py::arg("group_ranges") = std::nullopt, py::arg("context_lens") = std::nullopt,
+          py::arg("block_table") = std::nullopt, py::arg("run_starts") = std::nullopt, py::arg("next_n") = 1,
+          py::arg("page_kv") = 0, py::arg("sparse_starts") = std::nullopt, py::arg("num_max_sparse_blocks") = 0,
+          py::arg("sparse_block_kv") = 0);
+    m.def("cdna4_mqa_logits_tokens_per_wave", &cdna4_mqa_logits_tokens_per_wave, py::arg("num_heads"));
 }
