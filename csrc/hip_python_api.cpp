@@ -4,6 +4,9 @@
 #include <c10/hip/HIPGuard.h>
 #include <c10/hip/HIPStream.h>
 
+#include <uni_symm/backend/hip/backend.hpp>
+#include <uni_symm/python_api.hpp>
+
 #include "cdna4/jit_runtime.hpp"
 #include "cdna4/mqa_logits.hpp"
 #include "deep_gemm/impls/cdna4/gemm_args.h"
@@ -847,6 +850,7 @@ std::tuple<int64_t, int> cdna4_fp8_gemm_plan(int m, int n, int k) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "DeepGEMM HIP extension";
+    uni_symm::register_python_api<uni_symm::HIP>(m);
     m.def("cdna4_init", &cdna4_init, py::arg("root"));
     m.def("cdna4_fp8_gemm_nt", &cdna4_fp8_gemm_nt,
           py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("d"),

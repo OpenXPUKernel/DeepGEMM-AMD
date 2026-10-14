@@ -40,6 +40,13 @@ public:
         include_root_ = std::filesystem::exists(std::filesystem::path(root_) / "include")
             ? (std::filesystem::path(root_) / "include").string()
             : (std::filesystem::path(root_) / "deep_gemm" / "include").string();
+        // uni_symm device headers: copied into the package include root by the wheel build, in
+        // third-party/ of a source checkout
+        const auto checkout_symm = std::filesystem::path(include_root_) / ".." / ".." / "third-party" / "uni_symm" / "include";
+        symm_include_root_ = !std::filesystem::exists(std::filesystem::path(include_root_) / "uni_symm") &&
+                std::filesystem::exists(checkout_symm)
+            ? std::filesystem::canonical(checkout_symm).string()
+            : include_root_;
     }
 
     size_t workspace_size(const KernelConfig& config, const int m, const int n) const {
@@ -220,13 +227,14 @@ private:
         auto status = hiprtcCreateProgram(&program, source.c_str(), "deep_gemm_cdna4.cpp", 0, nullptr, nullptr);
         if (status != HIPRTC_SUCCESS)
             throw std::runtime_error("hiprtcCreateProgram failed");
-        const std::string include = "-I" + include_root_;
+        const std::string include = "-I" + include_root_, symm_include = "-I" + symm_include_root_;
         const char* rocm = std::getenv("ROCM_PATH");
         if (rocm == nullptr) rocm = std::getenv("ROCM_HOME");
         if (rocm == nullptr) rocm = "/opt/rocm";
         const std::string rocm_include = "-I" + (std::filesystem::path(rocm) / "include").string();
         const std::string arch_option = "--offload-arch=" + arch;
-        std::vector<const char*> options = {"--std=c++17", include.c_str(), rocm_include.c_str(), arch_option.c_str()};
+        std::vector<const char*> options = {"--std=c++17", include.c_str(), symm_include.c_str(), rocm_include.c_str(),
+                                            arch_option.c_str()};
         for (const auto& option : extra_options)
             options.push_back(option.c_str());
         status = hiprtcCompileProgram(program, static_cast<int>(options.size()), options.data());
@@ -259,7 +267,7 @@ private:
 
     std::mutex mutex_;
     std::string root_;
-    std::string include_root_;
+    std::string include_root_, symm_include_root_;
     std::unordered_map<std::string, std::shared_ptr<JitModule>> modules_;
 };
 

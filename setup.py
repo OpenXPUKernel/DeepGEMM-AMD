@@ -52,10 +52,12 @@ if IS_ROCM:
         'csrc',
         'deep_gemm/include',
         'csrc/cdna4',
+        'third-party/uni_symm/include',
     ]
     build_libraries = ['amdhip64', 'hiprtc', 'c10_hip', 'torch_hip']
     build_library_dirs = [f'{ROCM_HOME}/lib']
-    third_party_include_dirs = []
+    # the kernels include the uni_symm device fabric through the JIT
+    third_party_include_dirs = ['third-party/uni_symm/include/uni_symm']
 
 # Release
 base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag_name}/{wheel_name}'
@@ -236,12 +238,14 @@ if __name__ == '__main__':
     setuptools.setup(
         name='deep_gemm',
         version=get_package_version(),
-        packages=find_packages('.'),
+        packages=find_packages('.') + (['uni_symm'] if IS_ROCM else []),
+        package_dir={'uni_symm': 'third-party/uni_symm/uni_symm'} if IS_ROCM else {},
         package_data={
             'deep_gemm': [
                 'include/deep_gemm/**/*',
                 'include/cute/**/*',
                 'include/cutlass/**/*',
+                'include/uni_symm/**/*',
             ]
         },
         exclude_package_data={'deep_gemm': ['**/*_hip.cuh', '**/*_hip.hpp', '**/*_hip.cpp']},
