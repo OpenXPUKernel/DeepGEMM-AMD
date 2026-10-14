@@ -20,5 +20,6 @@ if getattr(torch.version, "hip", None) is not None:
     from . import utils
     from .utils import *
     from ._hip_api import *
+    from ._hip_mega_moe import *
 else:
     from ._cuda_api import *
