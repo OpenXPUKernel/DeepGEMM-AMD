@@ -312,13 +312,14 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
     a_step = Cfg::A_K_ROWS * NW * lda;
     b_step = Cfg::B_K_ROWS * NW * ldb;
   };
-  // size = min(end - base, 2^32 - 1) from the high word. 64-bit compares are VALU only, and the
-  // compiler turns hi != 0 back into one unless hi is opaque.
+  // size = clamp(end - base, 0, 2^32 - 1) from the high word (negative: a prefetched K tile past
+  // the operand reads nothing). 64-bit compares are VALU only, and the compiler turns hi != 0 back
+  // into one unless hi is opaque.
   auto rsrc_at = [&](const uint8_t *base, const uint8_t *end) {
     const uint64_t n = (uint64_t)end - (uint64_t)base;
     uint32_t hi = (uint32_t)(n >> 32);
     asm("" : "+s"(hi));
-    return make_rsrc(base, hi ? 0xffffffffu : (uint32_t)n);
+    return make_rsrc(base, (int32_t)hi < 0 ? 0u : hi ? 0xffffffffu : (uint32_t)n);
   };
   // Group bases of A, B and their packed scales
   auto a_group = [&](const Src &s) -> const uint8_t * {

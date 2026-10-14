@@ -210,6 +210,22 @@ def test_k_grouped_tn(groups, m, n, expected_k, gran_k, k_alignment, use_psum_la
             assert torch.equal(again, out)
 
 
+@pytest.mark.parametrize("use_psum_layout", [False, True])
+def test_k_grouped_tn_single_step_operands(use_psum_layout):
+    """One nonempty group whose K pads to a single K step: the prefetched K tiles lie past the
+    operands and must read nothing (their reads faulted where they crossed into unmapped memory,
+    hence fresh allocations every round)."""
+    ks = [0, 0, 0, 0, 94, 0, 0, 0]
+    deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+    for _ in range(10):
+        total_k, a, b, c, d, ref, layout, host_ks = generate_k_grouped_contiguous(
+            len(ks), 768, 2048, MajorTypeAB.MNMajor, MajorTypeAB.MNMajor, ks, use_ue8m0=True, gran_k=32,
+            use_psum_layout=use_psum_layout, k_alignment=128, accumulate=True, out_dtype=torch.float)
+        deep_gemm.k_grouped_fp8_gemm_tn_contiguous(a, b, d, host_ks, layout, d, recipe=(1, 1, 32),
+                                                   use_psum_layout=use_psum_layout)
+        assert calc_diff(d, ref) < MAX_DIFF
+
+
 @pytest.mark.parametrize("groups,m,n,expected_k", [(4, 512, 1024, 1024), (6, 256, 768, 384)])
 def test_k_grouped_nt(groups, m, n, expected_k):
     deep_gemm.set_mk_alignment_for_contiguous_layout(128)
