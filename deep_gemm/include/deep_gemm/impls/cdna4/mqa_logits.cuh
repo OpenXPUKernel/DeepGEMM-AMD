@@ -10,8 +10,8 @@
 // straight into registers: no LDS, no barriers. Column 4 r16 + j of a step of 64 is column r16 of
 // MFMA j, so after a step every lane holds four adjacent logits of a row.
 #pragma once
-#include "device_common.h"
-#include "mqa_logits_args.h"
+#include <deep_gemm/impls/cdna4/device_common.h>
+#include <deep_gemm/impls/cdna4/mqa_logits_args.h>
 
 using deep_gemm::cdna4::MqaLogitsArgs;
 using deep_gemm::cdna4::MqaLogitsFormat;

@@ -3,8 +3,10 @@
 // Direct global-to-LDS loads feed two software-pipelined stages. MN-major
 // operands stay in their original layout and use transposing LDS reads.
 #pragma once
-#include "epilogue.cuh"
-#include "tile_scheduler.cuh"
+#include <deep_gemm/impls/cdna4/epilogue.cuh>
+#include <deep_gemm/impls/cdna4/moe_epilogue.cuh>
+#include <deep_gemm/impls/cdna4/moe_tile_combine.cuh>
+#include <deep_gemm/impls/cdna4/tile_scheduler.cuh>
 #include <type_traits>
 
 enum class Mfma16x16x128GemmMode { DataParallel, Persistent, SplitK };
@@ -16,8 +18,16 @@ enum class Mfma16x16x128GemmMode { DataParallel, Persistent, SplitK };
 // MFMAs per slot, in place of one scaled MFMA.
 template <Mfma16x16x128GemmMode Mode, int MN_MAJOR = 0, int SF_GRAN_128 = 0,
           GemmType TYPE = GemmType::Normal, OperandType A_TYPE = OperandType::Fp8,
-          OperandType B_TYPE = OperandType::Fp8>
+          OperandType B_TYPE = OperandType::Fp8, int FUSED_SWIGLU = 0, int DIRECT_COMBINE = 0, int TILE_GROUP_M = 8, int COPY_CACHE_POLICY = 16, int PUBLISH_CACHE_POLICY = 0, int MOE_SPECIAL_EPILOGUE = 0>
 struct Mfma16x16x128GemmConfig {
+  static constexpr bool PRELOAD_OUTPUT_PTRS = MOE_SPECIAL_EPILOGUE == 2;
+  static constexpr bool MOE_EPILOGUE = MOE_SPECIAL_EPILOGUE != 0;
+  static constexpr int PUBLISH_CACHE = PUBLISH_CACHE_POLICY;
+  static constexpr int COPY_CACHE = COPY_CACHE_POLICY;
+  static constexpr bool PIPELINE_COMBINE = DIRECT_COMBINE >= 2;
+  static constexpr bool PIPELINE_PROFILE = DIRECT_COMBINE == 3;
+  static constexpr bool COMBINE = DIRECT_COMBINE == 1;
+  static constexpr bool FUSE_SWIGLU = FUSED_SWIGLU != 0;
   static constexpr bool BF16 = A_TYPE == OperandType::Bf16, SCALED = !BF16;
   static_assert(BF16 == (B_TYPE == OperandType::Bf16), "BF16 operands come in pairs");
   static constexpr bool A_FP4 = A_TYPE == OperandType::Fp4, B_FP4 = B_TYPE == OperandType::Fp4;
@@ -29,7 +39,7 @@ struct Mfma16x16x128GemmConfig {
   // bytes of n values of A / B
   __host__ __device__ static constexpr int64_t a_bytes(int64_t n) { return A_FP4 ? (n + 1) / 2 : n * ES; }
   __host__ __device__ static constexpr int64_t b_bytes(int64_t n) { return B_FP4 ? (n + 1) / 2 : n * ES; }
-  static constexpr int GROUP_M = 8;
+  static constexpr int GROUP_M = TILE_GROUP_M;
   static constexpr bool PERSISTENT = Mode == Mfma16x16x128GemmMode::Persistent;
   static constexpr bool SPLIT_K = Mode == Mfma16x16x128GemmMode::SplitK;
   static constexpr GemmType kType = TYPE;
@@ -241,6 +251,22 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   const int tid = threadIdx.x, lane = tid % 64, g = lane / 16, r16 = lane % 16;
   const int wave = __builtin_amdgcn_readfirstlane(tid / 64);
   const int wm = wave / 2, wn = wave % 2;
+  int workgroup = blockIdx.x;
+  if constexpr (Cfg::PIPELINE_COMBINE) {
+    int communication = -1;
+    if (p.moe_comm_grouped) {
+      const int stripe = blockIdx.x % 8, local = blockIdx.x / 8;
+      if (stripe == 0 || (p.moe_comm_blocks == 64 && stripe == 4))
+        communication = local + (stripe == 4 ? 32 : 0);
+      else workgroup = (stripe - 1 - (p.moe_comm_blocks == 64 && stripe > 4)) * 32 + local;
+    } else {
+      if (blockIdx.x < p.moe_comm_blocks) communication = blockIdx.x;
+      workgroup -= p.moe_comm_blocks;
+    }
+    if (communication >= 0) { moe_tile_combine<Cfg>(p, communication); return; }
+    if (p.moe_skip_compute) return;
+  }
+  const int workgroups = gridDim.x - (Cfg::PIPELINE_COMBINE ? p.moe_comm_blocks : 0);
   // ---- K range of the current tile. A K-grouped GEMM takes it from the tile's group; its K-major
   // operands are [M, kg] / [N, kg] blocks, whose row strides are kg.
   int K = p.K, lda = p.lda, ldb = p.ldb;
@@ -251,8 +277,9 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   int lid0 = 0, ntiles = 1, split = 0, kb = 0, nkt = KT, full = 0, rest = 0;
   // Spread the partial last round across the participating workgroups.
   auto lid_of = [&](int t) {
-    return Cfg::PERSISTENT && t == full ? full * (int)gridDim.x + xcd_remap(blockIdx.x, rest)
-                                        : lid0 + t * (int)gridDim.x;
+    return Cfg::PERSISTENT && t == full ? full * workgroups +
+          (Cfg::PIPELINE_COMBINE && p.moe_comm_grouped ? workgroup : xcd_remap(workgroup, rest))
+                                        : lid0 + t * workgroups;
   };
   auto src_of = [&](int t) { return Scheduler::tile(p, lid_of(t)); };
   // a partial last K tile is processed first (not with PERSISTENT)
@@ -318,7 +345,8 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   auto rsrc_at = [&](const uint8_t *base, const uint8_t *end) {
     const uint64_t n = (uint64_t)end - (uint64_t)base;
     uint32_t hi = (uint32_t)(n >> 32);
-    asm("" : "+s"(hi));
+    if constexpr (Cfg::PIPELINE_COMBINE) hi = __builtin_amdgcn_readfirstlane(hi);
+    else asm("" : "+s"(hi));
     return make_rsrc(base, (int32_t)hi < 0 ? 0u : hi ? 0xffffffffu : (uint32_t)n);
   };
   // Group bases of A, B and their packed scales
@@ -662,6 +690,15 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
   const uint32_t epi_out =
       ((uint32_t)((wave / 2) * 128 + 8 * (wave % 2) + lane / 32) * p.ldd + (lane % 32) * 8) * 2;
   auto store_tile_lds = [&](const Src &s, auto unit_alpha) {
+    uint32_t pointer_lo=0,pointer_hi=0;
+    if constexpr(Cfg::COMBINE && Cfg::PRELOAD_OUTPUT_PTRS) {
+      uint32_t output_tid=threadIdx.x;
+      asm volatile("v_mov_b32 %0, %0" : "+v"(output_tid) :: "memory");
+      const int ow=output_tid/64,ol=output_tid%64;
+      const int row=s.m0+(ow/2)*128+(ol/8)*16+(ow%2)*8+ol%8;
+      uint64_t pointer=row<s.m_end?uint64_t(p.moe_output_rows[row]):0;
+      pointer_lo=uint32_t(pointer);pointer_hi=uint32_t(pointer>>32);
+    }
     uint8_t *const dg = d_group(s);
     const __amdgpu_buffer_rsrc_t rout =
         rsrc_at(dg + (size_t)s.m0 * p.ldd * sizeof(OutT), dg + (size_t)p.M * p.ldd * sizeof(OutT));
@@ -689,17 +726,45 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
         });
       }
       asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
-      static_for<0, 4>([&](auto S) {
-        constexpr int ss = decltype(S)::value;
-        const v4u v = *(const v4u *)(smem + epi_rd + 2 * ss * Cfg::EPI_PITCH);
-        const int soff = (int)(((uint32_t)(16 * i + 2 * ss) * p.ldd + s.n0) * 2);
-        buffer_store16(v, rout, epi_out, soff);
-      });
+      if constexpr (Cfg::FUSE_SWIGLU) {
+        moe_swiglu_epilogue<Cfg::BF16>(p, smem + Cfg::EPI_OFF, Cfg::EPI_PITCH,
+                                        s.m0, s.m_end, s.n0, i, tid);
+      } else {
+        static_for<0, 4>([&](auto S) {
+          constexpr int ss = decltype(S)::value;
+          const v4u v = *(const v4u *)(smem + epi_rd + 2 * ss * Cfg::EPI_PITCH);
+          const int soff = (int)(((uint32_t)(16 * i + 2 * ss) * p.ldd + s.n0) * 2);
+          if constexpr (Cfg::COMBINE) {
+            const int row = s.m0 + (wave / 2) * 128 + 8 * (wave % 2) + lane / 32 + 16 * i + 2 * ss;
+            uint64_t destination=0;
+            if constexpr(Cfg::PRELOAD_OUTPUT_PTRS) {
+              const int owner=i*8+2*ss+lane/32;
+              destination=uint32_t(__shfl(int(pointer_lo),owner))|(uint64_t(uint32_t(__shfl(int(pointer_hi),owner)))<<32);
+            }
+            if (row < s.m_end) {
+              auto* out = reinterpret_cast<uint16_t*>(Cfg::PRELOAD_OUTPUT_PTRS?destination:uint64_t(p.moe_output_rows[row]));
+              *reinterpret_cast<v4u*>(out + s.n0 + (lane % 32) * 8) = v;
+            }
+          } else if constexpr (Cfg::MOE_EPILOGUE) {
+            uint32_t row;
+            const uint32_t lane_row = (wave / 2) * 128 + 8 * (wave % 2) + lane / 32;
+            asm volatile("v_add_u32 %0, %1, %2" : "=v"(row) : "s"(s.m0 + 16 * i + 2 * ss), "v"(lane_row));
+            if (row < uint32_t(s.m_end))
+              buffer_store16<Cfg::PIPELINE_COMBINE ? Cfg::PUBLISH_CACHE : 0>(v, rout, epi_out, soff);
+          } else buffer_store16<Cfg::PIPELINE_COMBINE ? Cfg::PUBLISH_CACHE : 0>(v, rout, epi_out, soff);
+        });
+      }
       asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
     });
   };
   auto store_persistent_tile = [&](const Src &s) {
-    if (fast_ok && s.m0 + BM <= s.m_end && s.n0 + BN <= p.N) {
+    if constexpr (Cfg::MOE_EPILOGUE) {
+      // Selected only by the MoE host path: BF16 output, no C, alpha=1,
+      // aligned strides and full N tiles. Partial M rows are explicitly masked.
+      store_tile_lds(s, std::true_type{});
+      return;
+    }
+    if (fast_ok && (Cfg::FUSE_SWIGLU || Cfg::COMBINE || s.m0 + BM <= s.m_end) && s.n0 + BN <= p.N) {
       if constexpr (Cfg::PERSISTENT && std::is_same<OutT, uint16_t>::value) {
         if (p.alpha == 1.f)
           store_tile_lds(s, std::true_type{});
@@ -765,27 +830,57 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p) {
     set_geometry();
     nkt = KT;
     const int tiles = Scheduler::num_tiles(p);
-    lid0 = xcd_remap(blockIdx.x, gridDim.x);
-    full = tiles / gridDim.x;
-    rest = tiles - full * gridDim.x;
-    ntiles = full + (blockIdx.x < rest);
+    lid0 = Cfg::PIPELINE_COMBINE && p.moe_comm_grouped ? workgroup : xcd_remap(workgroup, workgroups);
+    full = tiles / workgroups;
+    rest = tiles - full * workgroups;
+    ntiles = full + (workgroup < rest);
     if (ntiles == 0)
       return;
     Src src = src_of(0), src_nx = src_of(min(1, ntiles - 1));
     prologue(src, src_nx);
     int s = 0;
+    uint64_t profile_start = 0, compute_ticks = 0, publish_ticks = 0, phase_start = 0;
+    if constexpr (Cfg::PIPELINE_PROFILE) profile_start = wall_clock64();
     for (int t = 0; t < ntiles; ++t) {
       if (t > 0) {
         src = src_nx;
         src_nx = src_of(min(t + 1, ntiles - 1));
       }
+      if constexpr (Cfg::PIPELINE_PROFILE) phase_start = wall_clock64();
       iter(s++, 0, src, src_nx, not_last, first);
       for (int k = 1; k < nkt - 1; ++k, ++s)
         iter(s, k, src, src_nx, not_last, not_first);
       iter(s++, nkt - 1, src, src_nx, last, not_first);
+      if constexpr (Cfg::PIPELINE_PROFILE) {
+        const uint64_t now = wall_clock64(); compute_ticks += now - phase_start; phase_start = now;
+      }
       store_persistent_tile(src);
+      if constexpr (Cfg::PIPELINE_COMBINE) {
+        // Drain every wave's stores before the workgroup rendezvous. The leader's
+        // cumulative release RMW publishes all of them; four separate agent-wide
+        // writebacks followed by a fifth writeback are unnecessary.
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        __syncthreads();
+        if (tid == 0) __hip_atomic_fetch_add(p.moe_tile_ready + (p.moe_peer_order ? src.group : src.m0 / BM), 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+      }
+      if constexpr (Cfg::PIPELINE_PROFILE) publish_ticks += wall_clock64() - phase_start;
       if (t + 1 < ntiles)
         read_first_step_fragments_0_to_3((s & 1) * Cfg::STAGE_BYTES);
+    }
+    if constexpr (Cfg::COMBINE) {
+      if (p.moe_release_control ? *p.moe_release_control : p.moe_single_release) {
+        asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
+        __syncthreads();
+        if (tid == 0) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      } else __threadfence_system();
+    }
+    if constexpr (Cfg::PIPELINE_PROFILE) {
+      const uint64_t end = wall_clock64();
+      if (tid == 0) {
+        auto* r = moe_pipeline_trace<Cfg>(p);
+        r[0] = 2; r[1] = ntiles; r[2] = compute_ticks; r[3] = publish_ticks;
+        r[4] = profile_start; r[5] = end; r[6] = 0; r[7] = 0;
+      }
     }
     return;
   }

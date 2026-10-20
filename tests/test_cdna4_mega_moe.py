@@ -64,6 +64,8 @@ def run(rank: int, world_size: int, mma_type: str) -> None:
     from deep_gemm.testing import calc_diff
 
     num_experts, num_topk, hidden, inter, num_shared = 6 * world_size, 6, 1024, 512, 1
+    hidden = int(os.getenv("DG_MEGA_MOE_TEST_HIDDEN", hidden))
+    inter = int(os.getenv("DG_MEGA_MOE_TEST_INTER", inter))
     num_max_tokens, clamp, with_sf = 512, 10.0, mma_type != "bf16xbf16"
     experts_per_rank = num_experts // world_size
     group = dist.group.WORLD
@@ -94,7 +96,7 @@ def run(rank: int, world_size: int, mma_type: str) -> None:
     l1_w, l2_w = deep_gemm.transform_weights_for_mega_moe(l1_w, l2_w)
     s1_w, s2_w = deep_gemm.transform_weights_for_mega_moe(s1_w, s2_w)
 
-    for iteration in range(3):
+    for iteration in range(5 if os.getenv("DG_MEGA_MOE_TEST_SKEW") else 3):
         # this rank's tokens
         torch.manual_seed(100 * rank + iteration)
         # the last iteration leaves the last rank without tokens (it still routes and serves experts)
@@ -108,6 +110,12 @@ def run(rank: int, world_size: int, mma_type: str) -> None:
         masked = torch.rand_like(topk_weights) < 0.1
         topk_idx = topk_idx.masked_fill(masked, -1)
         topk_weights = topk_weights.masked_fill(masked, 0)
+        if iteration == 3:
+            # Every routed token goes to rank zero; all other ranks have empty local experts.
+            topk_idx = torch.arange(num_topk, device="cuda").expand(num_tokens, -1).contiguous()
+        elif iteration == 4:
+            topk_idx.fill_(-1)
+            topk_weights.zero_()
         if with_sf:
             x_fp8, x_sf = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
             from deep_gemm.utils.math import cast_back_from_fp8
@@ -154,6 +162,61 @@ def run(rank: int, world_size: int, mma_type: str) -> None:
         (deep_gemm.fp8_fp4_mega_moe if with_sf else deep_gemm.bf16_mega_moe)(y2, l1_w, l2_w, buffer, **kwargs)
         torch.cuda.synchronize()
         assert torch.equal(y, y2), f"rank {rank} {mma_type}: not repeatable"
+        if os.getenv("DG_MEGA_MOE_COMPARE_SERIAL"):
+            keys = ("DG_MEGA_MOE_CHUNKS", "DG_MEGA_MOE_CUMASK", "DG_MEGA_MOE_FUSE_SWIGLU",
+                    "DG_MEGA_MOE_ORDERED_PUSH", "DG_MEGA_MOE_DIRECT_COMBINE", "DG_MEGA_MOE_TILE_GROUP_M",
+                    "DG_MEGA_MOE_PIPELINE_COMBINE", "DG_MEGA_MOE_PIPELINE_CUS",
+                    "DG_MEGA_MOE_SPECIAL_EPILOGUE")
+            saved = {key: os.environ.pop(key, None) for key in keys}
+            try:
+                os.environ["DG_MEGA_MOE_CHUNKS"] = "1"
+                os.environ["DG_MEGA_MOE_DIRECT_COMBINE"] = "0"
+                os.environ["DG_MEGA_MOE_TILE_GROUP_M"] = "8"
+                (deep_gemm.fp8_fp4_mega_moe if with_sf else deep_gemm.bf16_mega_moe)(
+                    y2, l1_w, l2_w, buffer, **kwargs)
+                torch.cuda.synchronize()
+                assert torch.equal(y, y2), f"rank {rank} {mma_type}: serial path differs"
+            finally:
+                for key, value in saved.items():
+                    if value is not None:
+                        os.environ[key] = value
+                    else:
+                        os.environ.pop(key, None)
+        # A captured multi-stream call must preserve output and accumulated receive statistics.
+        if os.getenv("DG_MEGA_MOE_TEST_GRAPH"):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                (deep_gemm.fp8_fp4_mega_moe if with_sf else deep_gemm.bf16_mega_moe)(
+                    y2, l1_w, l2_w, buffer, **kwargs)
+            before_replay = stats.clone()
+            for _ in range(3):
+                graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(y, y2), f"rank {rank} {mma_type}: graph differs"
+            assert torch.equal((stats - before_replay).cpu(), expected.to(torch.int32) * 3)
+            if os.getenv("DG_MEGA_MOE_TEST_GRAPH_UPDATES"):
+                # Reuse graph-private output allocations with different data.
+                # An unchanged-input replay cannot expose stale payload caches.
+                expected_y = torch.empty_like(y)
+                saved_pipe = os.environ.get("DG_MEGA_MOE_PIPELINE_COMBINE")
+                saved_direct = os.environ.get("DG_MEGA_MOE_DIRECT_COMBINE")
+                try:
+                    for scale in (0.0, 0.5, 1.0):
+                        buffer.topk_weights[:num_tokens].copy_(topk_weights * scale)
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        os.environ["DG_MEGA_MOE_PIPELINE_COMBINE"] = "0"
+                        os.environ["DG_MEGA_MOE_DIRECT_COMBINE"] = "0"
+                        (deep_gemm.fp8_fp4_mega_moe if with_sf else deep_gemm.bf16_mega_moe)(
+                            expected_y, l1_w, l2_w, buffer, **kwargs)
+                        torch.cuda.synchronize()
+                        assert torch.equal(y2, expected_y), f"rank {rank}: stale graph output at weight scale {scale}"
+                finally:
+                    buffer.topk_weights[:num_tokens].copy_(topk_weights)
+                    for key, value in (("DG_MEGA_MOE_PIPELINE_COMBINE", saved_pipe),
+                                       ("DG_MEGA_MOE_DIRECT_COMBINE", saved_direct)):
+                        if value is None: os.environ.pop(key, None)
+                        else: os.environ[key] = value
         if rank == 0:
             print(f"  {mma_type} iteration {iteration}: tokens {num_tokens}, diff {diff:.2e}", flush=True)
     buffer.destroy()

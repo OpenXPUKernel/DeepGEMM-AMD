@@ -65,6 +65,7 @@ class BuildSelectionTests(unittest.TestCase):
         self.assertFalse({"cuda", "cudart", "c10_cuda", "torch_cuda"}
                          .intersection(extension.libraries))
         self.assertIn("/opt/test-rocm/include", extension.include_dirs)
+        self.assertTrue(any(path.endswith("third-party/deep_jit/include") for path in extension.include_dirs))
         self.assertIn("/opt/test-rocm/lib", extension.library_dirs)
         self.assertFalse(any("cutlass" in path or "test-cuda" in path
                              for path in extension.include_dirs))
@@ -74,10 +75,13 @@ class BuildSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             command = setup.CustomBuildPy(Distribution())
             command.build_lib = str(Path(directory) / "build")
-            # A source root without third-party submodules is sufficient on HIP.
+            # HIP packages the vendored uni_symm device headers, but needs no CUTLASS.
+            headers = Path(directory) / "third-party/uni_symm/include/uni_symm"
+            headers.mkdir(parents=True)
+            (headers / "sentinel.hpp").write_text("// packaged device dependency\n")
             with patch.object(setup, "current_dir", directory):
                 command.prepare_includes()
-            self.assertTrue((Path(command.build_lib) / "deep_gemm/include").is_dir())
+            self.assertTrue((Path(command.build_lib) / "deep_gemm/include/uni_symm/sentinel.hpp").is_file())
 
     def test_rocm_builds_from_source_without_cuda_wheel_lookup(self):
         setup, _ = load_setup(rocm=True)

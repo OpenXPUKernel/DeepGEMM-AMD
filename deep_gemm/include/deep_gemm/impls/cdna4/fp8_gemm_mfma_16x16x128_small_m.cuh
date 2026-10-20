@@ -5,8 +5,8 @@
 // so the result does not depend on timing. Grouped GEMMs (contiguous, PSUM and masked layouts)
 // map tiles onto groups with the shared tile scheduler.
 #pragma once
-#include "epilogue.cuh"
-#include "tile_scheduler.cuh"
+#include <deep_gemm/impls/cdna4/epilogue.cuh>
+#include <deep_gemm/impls/cdna4/tile_scheduler.cuh>
 
 // FM A fragments (M <= 16 FM per tile), NF B fragments (16 NF output columns per workgroup),
 // DEPTH K steps in flight per wave, WAVES waves splitting the K range of a workgroup.
@@ -75,6 +75,8 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p)
   const uint64_t b_k4 = (uint64_t)((Cfg::b_bytes(p.K) + 3) & ~3);
   const int sa_words = (k_steps + (1 << Cfg::SFA_SHIFT) - 1) >> Cfg::SFA_SHIFT;
   const int sb_words = (k_steps + (1 << Cfg::SFB_SHIFT) - 1) >> Cfg::SFB_SHIFT;
+  const bool wide_sa = (uint64_t(sa_words - 1) * p.lda_sf + BM) * 4 > 0xffffffffu;
+  const bool wide_sb = (uint64_t(sb_words - 1) * p.ldb_sf + BN) * 4 > 0xffffffffu;
 
   // ---- buffer descriptors: rows past the tile's valid rows, past N and past the matrix read 0
   auto rsrc_at = [&](const uint8_t *base, uint64_t bytes) {
@@ -114,11 +116,25 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p)
       const int step = wave_begin + s;
       const __amdgpu_buffer_rsrc_t ar = in_range ? a_rsrc : empty_rsrc;
       const __amdgpu_buffer_rsrc_t br = in_range ? b_rsrc : empty_rsrc;
-      const __amdgpu_buffer_rsrc_t sar = in_range ? sa_rsrc : empty_rsrc;
-      const __amdgpu_buffer_rsrc_t sbr = in_range ? sb_rsrc : empty_rsrc;
+      __amdgpu_buffer_rsrc_t sar = in_range ? sa_rsrc : empty_rsrc;
+      __amdgpu_buffer_rsrc_t sbr = in_range ? sb_rsrc : empty_rsrc;
       const int a_koff = step * Cfg::A_STEP, b_koff = step * Cfg::B_STEP;
-      const int sa_off = (step >> Cfg::SFA_SHIFT) * p.lda_sf * 4;
-      const int sb_off = (step >> Cfg::SFB_SHIFT) * p.ldb_sf * 4;
+      uint32_t sa_off = uint64_t(step >> Cfg::SFA_SHIFT) * p.lda_sf * 4;
+      uint32_t sb_off = uint64_t(step >> Cfg::SFB_SHIFT) * p.ldb_sf * 4;
+      if constexpr (!Cfg::BF16) {
+        // Buffer instruction offsets are only 32 bits. Rebase a very wide scale plane with
+        // 64-bit pointer arithmetic instead of wrapping back to its first K-group's scale.
+        if (wide_sa) {
+          sar = in_range ? rsrc_at(reinterpret_cast<const uint8_t*>(p.sfa + ga * p.sfa_group_stride +
+              m0 + uint64_t(step >> Cfg::SFA_SHIFT) * p.lda_sf), uint64_t(rows) * 4) : empty_rsrc;
+          sa_off = 0;
+        }
+        if (wide_sb) {
+          sbr = in_range ? rsrc_at(reinterpret_cast<const uint8_t*>(p.sfb + gb * p.sfb_group_stride +
+              n0 + uint64_t(step >> Cfg::SFB_SHIFT) * p.ldb_sf), uint64_t(p.N - n0) * 4) : empty_rsrc;
+          sb_off = 0;
+        }
+      }
 #pragma unroll
       for (int j = 0; j < NF; ++j) {
         const uint32_t row = (uint32_t)(16 * j + r16) * p.ldb + 16 * g;

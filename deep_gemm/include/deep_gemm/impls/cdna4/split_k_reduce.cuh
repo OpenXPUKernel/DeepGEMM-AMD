@@ -1,7 +1,7 @@
 // Deterministic split-K reduction; generated only for the split-K path.
 #pragma once
 #include <type_traits>
-#include "device_common.h"
+#include <deep_gemm/impls/cdna4/device_common.h>
 
 // D = alpha * sum_s ws[s] (+ C), partials added in split order so the result does not depend on
 // which workgroup finished first. One thread per 4 columns; blockIdx.y walks the rows.

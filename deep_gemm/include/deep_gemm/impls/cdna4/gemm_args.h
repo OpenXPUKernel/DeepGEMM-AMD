@@ -47,6 +47,8 @@ struct GemmArgs {
   // FP8 operands, int32 words for packed scales, outputs for D and C).
   const std::int32_t* grouped_layout;
   int num_groups;
+  // Optional expert window for a pipelined PSUM GEMM; zero count means all groups.
+  int group_begin, group_count;
   int k_alignment;
   // row alignment of the group starts of a PSUM layout
   int m_alignment;
@@ -54,6 +56,22 @@ struct GemmArgs {
   // every group_m_slots-th m tile of the group
   int group_m_slots;
   int zero_padding;
+  // Optional fused Mega MoE L1 epilogue. Gate/up columns are interleaved by eight.
+  std::uint8_t* moe_acts;
+  std::int32_t* moe_sf;
+  const std::int32_t* moe_records;
+  int moe_record_stride, moe_weight_word, moe_sf_pitch;
+  float moe_clamp;
+  int moe_fast_math;
+  const int64_t* moe_output_rows;
+  int* moe_tile_ready;
+  int moe_comm_blocks;
+  int moe_comm_grouped;
+  const int* moe_source_counts;
+  int moe_rank, moe_ranks, moe_peer_order;
+  const int* moe_release_control;
+  int moe_single_release;
+  int moe_skip_compute; // diagnostic: same resident kernel, completed local GEMM input
   // KBatched: K tiles per batch
   int k_batch_tiles;
   std::int64_t a_group_stride, b_group_stride;

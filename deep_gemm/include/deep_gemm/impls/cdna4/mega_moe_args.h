@@ -22,8 +22,9 @@ struct MegaMoeLayout {
     // weight and the source (rank * max tokens + token) * topk + slot
     int record_ints;
 
-    int64_t barrier;       // the cross-rank barrier: counter (uint32), then two signals (int32)
+    int64_t barrier;       // two 128-byte slots: counter (uint32), signals (int32) at byte +64
     int64_t send_counts;   // [experts] int32: this rank's rows for every expert (route; zeroed after)
+    int64_t send_lists;    // [expert][max_tokens * topk] token-slot entries ordered by route positions
     int64_t positions;     // [max tokens * topk] int32: each slot's position among its expert's rows from this rank
     int64_t counts;        // [ranks][experts] int32: every rank's rows for every expert (published by each rank)
     int64_t dst_rows;      // [experts] int32: this rank's first row in every expert's rows (on the expert's rank)
@@ -32,6 +33,7 @@ struct MegaMoeLayout {
     int64_t shared_l1_sf, shared_l2_acts, shared_l2_sf;
     int64_t l1_acts, l1_records, l1_sf;
     int64_t l2_acts, l2_sf;
+    int64_t output_rows;   // [max rows] peer BF16 destination pointers for direct L2 combine
     int64_t combine;       // [topk][max tokens][hidden] BF16: the routed results of every slot
     int64_t bytes;
 };
@@ -64,6 +66,7 @@ inline MegaMoeLayout make_mega_moe_layout(const int num_ranks, const int num_exp
     l.barrier = take(256);
     l.send_counts = take(int64_t(num_experts) * 4);
     l.positions = take(t * num_topk * 4);
+    l.send_lists = take(int64_t(num_experts) * t * num_topk * 4);
     l.counts = take(int64_t(num_ranks) * num_experts * 4);
     l.dst_rows = take(int64_t(num_experts) * 4);
     l.psum_ends = take(er * 4);
@@ -79,6 +82,7 @@ inline MegaMoeLayout make_mega_moe_layout(const int num_ranks, const int num_exp
     l.l1_sf = take(sf * int64_t(hidden / 128) * l.sf_pitch * 4);
     l.l2_acts = take(rows * intermediate * l.act_bytes);
     l.l2_sf = take(sf * int64_t(intermediate / 128) * l.sf_pitch * 4);
+    l.output_rows = take(rows * 8);
     l.combine = take(int64_t(num_topk) * t * hidden * 2);
     l.bytes = offset;
     return l;
@@ -98,6 +102,10 @@ struct MegaMoeArgs {
     int* stats;                  // [experts per rank] received rows, accumulated (or null)
     float activation_clamp;      // +inf: none
     int fast_math;
+    int ordered_push;
+    int direct_combine;
+    int barrier_slot; // independent dispatch/combine phases on different streams
+    int expert_begin, expert_count; // zero count means all local experts
     int shared_part;             // finish / swiglu: the shared expert's rows (else the routed rows)
 };
 

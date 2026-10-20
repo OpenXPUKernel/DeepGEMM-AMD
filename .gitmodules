@@ -3,4 +3,4 @@
 	url = https://github.com/NVIDIA/cutlass.git
 [submodule "third-party/deep_jit"]
 	path = third-party/deep_jit
-	url = https://github.com/deepseek-ai/DeepJIT.git
+	url = https://github.com/OpenXPUKernel/DeepJIT.git

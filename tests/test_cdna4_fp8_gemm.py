@@ -399,14 +399,14 @@ def test_split_normalization_with_uneven_k_tiles():
 
 
 @pytest.mark.skipif(os.environ.get("DG_TEST_LARGE") != "1", reason="set DG_TEST_LARGE=1 for >4 GiB allocations")
-@pytest.mark.parametrize("large_tensor", ["a", "b", "a_mn", "b_mn", "d", "scales"])
+@pytest.mark.parametrize("large_tensor", ["a", "b", "a_mn", "b_mn", "d", "scales", "b_scales"])
 def test_offsets_beyond_four_gib(large_tensor):
     """Touch a few logical elements beyond 32-bit offsets, without a huge GEMM."""
     recipe = (1, 32)
     m, n, k = (258, 4, 4) if large_tensor == "a" else (4, 258, 4)
     if large_tensor == "d":
         m, n, k = 3, 4, 4
-    elif large_tensor == "scales":
+    elif large_tensor in ("scales", "b_scales"):
         m, n, k = 4, 4, 640
     elif large_tensor in ("a_mn", "b_mn"):
         m, n, k = 4, 4, 258
@@ -416,6 +416,8 @@ def test_offsets_beyond_four_gib(large_tensor):
     sb = torch.ones((n, deep_gemm.ceil_div(k, 32)), device="cuda")
     if large_tensor == "scales":
         sa[:, -1] = 2.0  # A wrapped scale address would incorrectly read one.
+    elif large_tensor == "b_scales":
+        sb[:, -1] = 2.0
     sa = deep_gemm.transform_sf_into_required_layout(sa, m, k, recipe)
     sb = deep_gemm.transform_sf_into_required_layout(sb, n, k, recipe)
     out = torch.empty((m, n), device="cuda", dtype=torch.float32)
@@ -449,11 +451,15 @@ def test_offsets_beyond_four_gib(large_tensor):
         qa.fill_(1.0)
         assert out.untyped_storage().nbytes() > 1 << 32
     else:
-        large = torch.empty_strided(sa.shape, (1, 1 << 28), device="cuda", dtype=torch.int32)
-        large.copy_(sa)
-        sa = large
+        scales = sa if large_tensor == "scales" else sb
+        large = torch.empty_strided(scales.shape, (1, 1 << 28), device="cuda", dtype=torch.int32)
+        large.copy_(scales)
+        if large_tensor == "scales":
+            sa = large
+        else:
+            sb = large
         qa[:, -32:].fill_(1.0)
-        assert sa.untyped_storage().nbytes() > 1 << 32
+        assert large.untyped_storage().nbytes() > 1 << 32
     deep_gemm.fp8_gemm_nt((qa, sa), (qb, sb), out, recipe_a=recipe, recipe_b=recipe)
     torch.cuda.synchronize()
     if large_tensor == "a":
@@ -465,4 +471,4 @@ def test_offsets_beyond_four_gib(large_tensor):
     elif large_tensor in ("a_mn", "b_mn"):
         assert bool((out == 1).all())
     else:
-        assert bool((out == (64 if large_tensor == "scales" else k)).all())
+        assert bool((out == (64 if large_tensor in ("scales", "b_scales") else k)).all())

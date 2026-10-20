@@ -39,14 +39,25 @@ exponential and reciprocal.
 | barrier | every row arrived |
 | finish | the records' scales become the MN-major layout of the grouped GEMM |
 | grouped GEMMs | L1 over the experts' rows (the PSUM layout of their end rows), SwiGLU, L2 |
-| combine | each row's result is written into its slot of its token on the source rank |
+| combine | FP8/mixed L2 GEMMs with full-width tiles write directly into each token's slot on its source rank; other shapes use the standalone combine |
 | barrier, reduce | every result arrived; `y` is the sum of the token's slots and the shared experts in FP32 |
+
+The direct-combine path builds a per-row output-address table in `finish`. The L2 epilogue stages
+BF16 through LDS as before, but coalesced stores target the source GPU instead of a local scratch
+followed by a separate copy. A system-scope release at the end of every producer workgroup and
+the final cross-rank barrier precede the reduction's system-scope acquire. Partial M tiles keep
+their bounds checks. Hidden sizes not divisible by 256 and short K retain the standalone path.
+Generic grouped GEMMs are unchanged; Mega MoE uses groups of four M tiles for scheduling.
 
 The shared experts' GEMMs and SwiGLU run on a side stream joined before the reduction. Readers of
 memory written by peers acquire at system scope first: every XCD's L2 is invalidated by its own
 acquire. A row's position within its expert does not change its result (the grouped GEMMs are
 row-independent), so results are bitwise repeatable although the route takes positions with
 atomics. The barriers are device kernels, so a call can be captured in a CUDA graph.
+
+Runtime correction (2026-10-16): the optional expert-window stream masks must not be interpreted
+as verified CU isolation, especially inside an outer graph. See the
+[measured CU sets and graph limitation](cdna4-kernel-layout.md).
 
 Two properties of the fabric shape the dispatch. Remote reads reach about half the all-to-all rate
 of remote writes, so tokens are pushed rather than pulled. And the push and combine are bound by
@@ -66,11 +77,63 @@ experts from one seed) that rounds where the kernels do, checks the received-row
 against all ranks' top-k, and checks bitwise repeatability, for fp8xfp4, fp8xfp8 and bf16xbf16 with
 masked slots, a shared expert, and a rank without tokens. The host exchanges go through gloo.
 
-On the default shapes of `tests/test_mega_moe.py` (8192 tokens per rank, top-6 of 384 experts and a
-shared expert, 8 ranks), the push and combine move rows at about 0.8 of the node's all-to-all
-remote-write rate, measured with the same row size. In this version the stages run one after
-the other: the routed expert GEMMs and the push plus combine take about 40% of a call each. Next are
-overlapping them (a compute-unit partition between a communication and a compute stream,
-pipelined over groups of experts) and a persistent kernel that fuses the stages; the activation
-buffers are sized for the worst case (every token on every rank), which the pipelined version
-will turn into a ring.
+The benchmark reports **end-to-end MFU**, using useful, unpadded routed/shared expert GEMM FLOPs
+summed across ranks, divided by the slowest rank's complete-call latency and the aggregate dense
+peak. The default convention is 5000 TFLOPS/GPU for FP8 and FP8×FP4 (the mixed instruction runs at
+the FP8 rate), 2500 for BF16; `--peak-tflops` makes the denominator explicit. This is not the FP4×FP4
+peak, a sparse peak, or an isolated-GEMM utilization. `--graph` includes every layer stage in graph
+replay. `--json-output` records shapes, timing, effective FLOPs, the denominator, and overrides.
+`--target-mfu` defaults to 0.50 and controls the reported target latency and `target_met`.
+`--compare-serial` checks the full benchmark workload bitwise against the standalone path before timing.
+
+The default 8-rank shape has 8192 tokens/rank, hidden 7168, intermediate 3072, top-6 of 384 experts,
+and one shared expert. At the 5000-TFLOPS convention, **50% MFU requires 3.031 ms**
+(the original 60% target requires 2.525 ms). Neither target has been reached.
+The current no-shared-expert workload has a different FLOPs numerator and is
+reported separately in [AMD validation](amd-validation.md). The cooperative
+pipeline and other scheduling experiments remain opt-in; they do not change
+the default implementation.
+
+## Experimental paths and regression controls
+
+All ranks must use identical options. Defaults select one expert window, the original token-major
+dispatch, standalone SwiGLU, and direct combine for eligible FP8/mixed shapes. BF16 keeps its
+standalone combine unless requested. Options are read before enqueueing kernels, including capture.
+
+| Environment variable | Behavior |
+| --- | --- |
+| `DG_MEGA_MOE_DIRECT_COMBINE=0/1` | Disable/enable direct peer stores from L2; incompatible shapes fall back |
+| `DG_MEGA_MOE_TILE_GROUP_M=1/2/4/8/16` | M-tile scheduling group for MoE; default 4 |
+| `DG_MEGA_MOE_CHUNKS=N` | Expert windows on dispatch/compute/combine streams; default 1 |
+| `DG_MEGA_MOE_CUMASK=1` | Experimental 256-CU MI355X stream partition for multiple windows |
+| `DG_MEGA_MOE_COMM_CUS=N` | Reserve 8–128 CUs in multiples of eight; default 32 |
+| `DG_MEGA_MOE_ORDERED_PUSH=1` | Destination/expert-major send lists instead of scanning tokens per window |
+| `DG_MEGA_MOE_FUSE_SWIGLU=1` | Fuse BF16 rounding, clamp/SwiGLU and FP8/BF16 cast into L1's LDS epilogue |
+
+The last three algorithmic experiments are opt-in; their composition was not faster than the
+selected default on the measured shape. Separate dispatch/combine barrier phases are used for
+multi-stream launches. The tests compare experimental and standalone paths bitwise, and cover
+graph replay, empty experts, entirely masked routes and routing concentrated on one rank:
+
+```bash
+DG_MEGA_MOE_TEST_GRAPH=1 DG_MEGA_MOE_TEST_SKEW=1 DG_MEGA_MOE_COMPARE_SERIAL=1 \
+  python tests/test_cdna4_mega_moe.py
+```
+
+`--gemm-ceiling` measures routed GEMMs separately as a diagnostic and labels them explicitly;
+those measurements are never substituted into the end-to-end MFU. Intermediate storage still
+uses worst-case sizing. A bounded-memory persistent pipeline and the current 50% MFU objective remain
+unfinished.
+
+An NV-style resident block pipeline is now available through
+`DG_MEGA_MOE_NV_PIPELINE=1`, default off. It overlaps dispatch, routed expert
+compute and output writeback, but the controlled full workload regresses from
+5.42 ms to 6.76 ms. See the [pipeline correctness regression](../tests/test_cdna4_mega_moe_pipeline.py).
+The 50% MFU objective remains unmet.
+
+For the matched **no-shared-expert** EP8 workload (8192 tokens/rank, H7168,
+I3072, 384 experts, top-6, FP8×FP4, BF16 return), the newer
+`DG_MEGA_MOE_STAGE1_QUEUE=1` path lowers end-to-end latency by 10.36–10.86%
+against aiter's matched BF16 generic Stage2 configuration across three seeds
+and a main-tree check. See [current validation and reproduction](amd-validation.md).
+This is a separate target from the earlier shared-expert 50% MFU objective.

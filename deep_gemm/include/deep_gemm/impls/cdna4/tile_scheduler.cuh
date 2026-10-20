@@ -1,7 +1,7 @@
 // Output-tile ordering shared by the GEMM execution modes, and the mapping of
 // logical tile ids onto the groups of grouped GEMMs.
 #pragma once
-#include "gemm_args.h"
+#include <deep_gemm/impls/cdna4/gemm_args.h>
 #include <hip/hip_runtime.h>
 
 using deep_gemm::cdna4::GemmType;
@@ -113,7 +113,8 @@ template <GemmType TYPE, int BM, int BN, int GROUP_M> struct TileScheduler {
     if constexpr (DYNAMIC) {
       int group, before;
       find_group(
-          p.num_groups, 0x7fffffff, [&](int g) { return group_tiles_m(p, g) * tiles_n; }, group,
+          p.group_count ? p.group_count : p.num_groups, 0x7fffffff,
+          [&](int g) { return group_tiles_m(p, g + p.group_begin) * tiles_n; }, group,
           before);
       return before;
     } else if constexpr (K_GROUPED) {
@@ -130,12 +131,14 @@ template <GemmType TYPE, int BM, int BN, int GROUP_M> struct TileScheduler {
     if constexpr (DYNAMIC) {
       int before;
       find_group(
-          p.num_groups, lid, [&](int g) { return group_tiles_m(p, g) * tiles_n; }, t.group,
-          before);
-      if (t.group >= p.num_groups) {
+          p.group_count ? p.group_count : p.num_groups, lid,
+          [&](int g) { return group_tiles_m(p, g + p.group_begin) * tiles_n; }, t.group, before);
+      const int groups = p.group_count ? p.group_count : p.num_groups;
+      if (t.group >= groups) {
         t.group = -1;
         return t;
       }
+      t.group += p.group_begin;
       tile_coords<GROUP_M>(lid - before, group_tiles_m(p, t.group), tiles_n, tm, tn);
       t.m0 = tm * BM;
       if constexpr (MASKED) {

@@ -56,6 +56,8 @@ extern "C" uint32_t cublasLtDestroy(void* handle) {
 class TestNativeRuntimeShutdown(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if torch.version.hip is not None:
+            raise unittest.SkipTest("cuBLASLt shutdown probes require the CUDA backend")
         cls.repo = Path(__file__).resolve().parents[1]
         if not list((cls.repo / 'deep_gemm').glob('_C*.so')):
             raise unittest.SkipTest('requires the locally built DeepGEMM extension')

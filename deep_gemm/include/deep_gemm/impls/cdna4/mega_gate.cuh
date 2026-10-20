@@ -10,8 +10,8 @@
 // re-ranking its experts only when it wins again. Without a bias the ranking is on the raw logits
 // (sqrt-softplus is monotonic) and only the selected experts get the activation.
 #pragma once
-#include "device_common.h"
-#include "mega_gate_args.h"
+#include <deep_gemm/impls/cdna4/device_common.h>
+#include <deep_gemm/impls/cdna4/mega_gate_args.h>
 
 using deep_gemm::cdna4::MegaGateArgs;
 

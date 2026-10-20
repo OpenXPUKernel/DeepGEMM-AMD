@@ -1,6 +1,6 @@
 // Vectorized output stores with optional accumulation and edge handling.
 #pragma once
-#include "device_common.h"
+#include <deep_gemm/impls/cdna4/device_common.h>
 #include <type_traits>
 
 // Out[row][col .. col + 7] = v (+ C[row][col .. col + 7]) for the columns < N

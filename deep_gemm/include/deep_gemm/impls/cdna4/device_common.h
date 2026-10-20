@@ -1,6 +1,6 @@
 // Device types, conversions and memory primitives shared by the CDNA4 kernels.
 #pragma once
-#include "gemm_args.h"
+#include <deep_gemm/impls/cdna4/gemm_args.h>
 #include <cstdint>
 #include <hip/hip_runtime.h>
 #include <type_traits>
@@ -89,9 +89,10 @@ __device__ __forceinline__ v2i ds_read_tr16(const __attribute__((address_space(3
 }
 
 // The second half of a 16-byte buffer store is read one cycle after issue.
+template <int CACHE_POLICY = 0>
 __device__ __forceinline__ void buffer_store16(v4u v, __amdgpu_buffer_rsrc_t r, uint32_t voff,
                                                int soff) {
-  __builtin_amdgcn_raw_buffer_store_b128(v, r, voff, soff, 0);
+  __builtin_amdgcn_raw_buffer_store_b128(v, r, voff, soff, CACHE_POLICY);
   __builtin_amdgcn_sched_barrier(0);
   asm volatile("s_nop 0");
   __builtin_amdgcn_sched_barrier(0);

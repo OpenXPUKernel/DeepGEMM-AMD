@@ -52,6 +52,7 @@ if IS_ROCM:
         'csrc',
         'deep_gemm/include',
         'csrc/cdna4',
+        'third-party/deep_jit/include',
         'third-party/uni_symm/include',
     ]
     build_libraries = ['amdhip64', 'hiprtc', 'c10_hip', 'torch_hip']

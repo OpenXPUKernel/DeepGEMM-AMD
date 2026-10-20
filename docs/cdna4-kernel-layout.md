@@ -1,10 +1,11 @@
 # CDNA4 kernel layout
 
-The HIP backend has one pybind extension and a small runtime JIT layer:
+The HIP backend has one pybind extension, a kernel-specific planner, and the shared DeepJIT HIP runtime:
 
 - `csrc/hip_python_api.cpp` validates tensors, asks the cost model for a configuration, and launches the cached HIPRTC module.
 - `csrc/cdna4/cost_model.hpp` maps a GEMM shape to a tile, pipeline, and split-K specialization.
-- `csrc/cdna4/jit_runtime.hpp` generates the wrapper source, compiles it with HIPRTC on first use, caches the code object, and launches it through the current PyTorch stream.
+- `csrc/cdna4/jit_runtime.hpp` generates GEMM wrappers, plans launch dimensions, and maintains a per-device specialization lookup. It delegates compilation, code-object caching, loading, and native launches to `deep_jit::Runtime<deep_jit::HIP>`.
+- `third-party/deep_jit/include/deep_jit/backend/hip/` owns the HIPRTC compiler, module lifetime, exported entry points, and regular/cooperative launches. DeepJIT tracks include contents and compiler options for its cross-process disk cache.
 - `csrc/cdna4/mqa_logits.hpp` plans the MQA logits kernels (tokens per wave, chunk of KV rows) and launches them.
 - `deep_gemm/include/deep_gemm/impls/cdna4/` contains the packaged device templates: the production FP8 pipeline, shared device helpers, and the plain `GemmArgs` ABI.
 - `deep_gemm/_hip_api.py` keeps quantization, scale packing, layout aliases, and the public Python interface aligned with the CUDA backend.
@@ -19,6 +20,7 @@ The packaged headers are organized by responsibility:
 | `mqa_logits.cuh` | MQA logits (contiguous, paged and sparse KV): scaled-MFMA dot products with the weighted ReLU sum over the heads in the lanes |
 | `mqa_logits_args.h` | Argument layout, formats and KV sources of the MQA logits kernels |
 | `mega_moe.cuh`, `mega_moe_args.h` | Mega MoE across the GPUs of a node (uni_symm buffers): routing, push dispatch, SwiGLU, combine and reduction around the grouped GEMMs |
+| `moe_epilogue.cuh` | Optional L1 GEMM epilogue consuming BF16 gate/up LDS tiles for SwiGLU and quantization; L2 direct peer stores are in the GEMM's persistent epilogue |
 | `mega_mhc.cuh` | Mega mHC: the residual update with the mix GEMM from registers, the mixes (sigmoids, Sinkhorn), and the RMSNorm with the FP8 cast |
 | `mega_gate.cuh`, `mega_gate_args.h` | MoE gate routing from FP32 logits: top-k by wave reductions, weights, shared experts, physical replicas and the routing controls |
 | `epilogue.cuh` | Output stores, accumulation, and boundary handling |
@@ -62,3 +64,24 @@ width. C is copied into D only when their row strides differ. Split-K workspace
 contains exactly the required FP32 partials; it is not zero-filled.
 
 The normal `develop.sh`/`setup.py` build compiles the pybind extension. No separate HIP shared library is required.
+
+## Shared HIP JIT
+
+The HIP backend uses the same DeepJIT `Runtime`, `Config`, parser and disk cache
+as the other backends. `DG_JIT_CACHE_DIR` selects a writable cache (or a colon-
+separated writable root and read-only lookup roots); `DJ_JIT_CACHE_DIR` is the
+fallback. Cache entries contain HIP source, HSACO, exported names and metadata.
+The default location is `$HOME/.dj`. A process-local runtime is created lazily
+for each current device. `deep_gemm._C.get_jit()` exposes that runtime.
+
+The GEMM front cache includes the specialization, exported names, compiler
+options and device. The persistent cache additionally hashes actual source,
+tracked `deep_gemm/` and `uni_symm/` includes, and the HIPRTC/runtime version.
+Device includes use canonical angle-bracket paths so changes invalidate the
+cache correctly. Configuration and include digests are process snapshots;
+restart the process after editing device headers.
+
+The consumer retains launch planning, occupancy checks, split-K workspace and
+cooperative residency decisions. Runtime access is serialized, releasing the
+Python GIL before acquiring the cache mutex. All compilation must be warmed up
+before graph capture; loaded modules stay alive for the process lifetime.

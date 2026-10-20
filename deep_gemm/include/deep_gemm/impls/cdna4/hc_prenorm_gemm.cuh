@@ -8,7 +8,7 @@
 // tiles in LDS in wave order. MFMA q of a step takes K = 32 q .. + 31 (lane group g: 32 q + 8 g
 // .. + 7), so one load instruction reads 64 adjacent bytes of a row of A.
 #pragma once
-#include "device_common.h"
+#include <deep_gemm/impls/cdna4/device_common.h>
 
 using deep_gemm::cdna4::HcPrenormGemmArgs;
 

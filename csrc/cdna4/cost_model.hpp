@@ -37,6 +37,14 @@ struct KernelConfig {
     int depth = 0;
     int waves = 4;
     bool k_tail = false;
+    bool fused_swiglu = false;
+    bool direct_combine = false;
+    bool pipeline_combine = false;
+    bool pipeline_profile = false;
+    int copy_cache_policy = 16;
+    int publish_cache_policy = 0;
+    int moe_special_epilogue = 0;
+    int tile_group_m = 8;
     OperandType a_type = OperandType::Fp8, b_type = OperandType::Fp8;
 };
 

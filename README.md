@@ -35,12 +35,22 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - PyTorch 2.3 or higher
 - CUTLASS 4.0 or higher (could be cloned by Git submodule)
 
+### AMD / ROCm requirements
+
+For the AMD backend use MI355X / CDNA4, ROCm PyTorch and a ROCm development
+installation providing HIPRTC. The host extension requires C++20, `libdw-dev`
+and `libelf-dev` headers; GCC 12 additionally uses fmt headers (`libfmt-dev`, or
+those included with PyTorch) for formatting. CUDA is not required for this path.
+Initialize the pinned DeepJIT fork with `git submodule update --init --recursive`.
+Both GPU backends now use DeepJIT for compilation and caching; see the
+[AMD runtime layout](docs/cdna4-kernel-layout.md) and [validation guide](docs/amd-validation.md).
+
 ### Development
 
 ```bash
 # Submodule must be cloned
 git clone --recursive git@github.com:OpenXPUKernel/DeepGEMM-AMD.git
-cd DeepGEMM
+cd DeepGEMM-AMD
 
 # Link some essential includes and build the C++ extension
 cat develop.sh

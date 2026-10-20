@@ -16,7 +16,7 @@
 // normalizes the norm input (normal mHC: new_residual weighted by the new previous mix) into BF16
 // and FP8.
 #pragma once
-#include "device_common.h"
+#include <deep_gemm/impls/cdna4/device_common.h>
 
 using deep_gemm::cdna4::MegaMhcArgs;
 

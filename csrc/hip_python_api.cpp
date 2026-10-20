@@ -10,12 +10,15 @@
 #include <uni_symm/python_api.hpp>
 
 #include "cdna4/jit_runtime.hpp"
+#include "cdna4/mega_moe_pipeline.hpp"
 #include "cdna4/mqa_logits.hpp"
 #include "deep_gemm/impls/cdna4/gemm_args.h"
 #include "deep_gemm/impls/cdna4/mega_gate_args.h"
 #include "deep_gemm/impls/cdna4/mega_moe_args.h"
 
 #include <limits>
+#include <map>
+#include <array>
 #include <optional>
 #include <tuple>
 
@@ -107,6 +110,8 @@ int scale_stride(const torch::Tensor& t, int rows, int k, int gran_k, const char
 }
 
 using OptTensor = std::optional<torch::Tensor>;
+thread_local torch::Tensor pipeline_diagnostics;
+thread_local OptTensor single_release_control;
 
 GemmArgs make_args(const torch::Tensor& a, const OptTensor& sfa, const torch::Tensor& b,
                    const OptTensor& sfb, const torch::Tensor& d, const void* c,
@@ -204,7 +209,7 @@ void cdna4_fp8_gemm_nt(const torch::Tensor& a, const std::optional<torch::Tensor
     args.ws = workspace.defined() ? workspace.data_ptr<float>() : nullptr;
     args.ldw = ceil_div(n, 4) * 4;
     const auto stream = c10::hip::getCurrentHIPStream(d.get_device()).stream();
-    const int error = jit_runtime.launch(args, config, out_dtype, stream, deep_gemm::cdna4::num_compute_units());
+    const int error = jit_runtime.launch(args, config, out_dtype, stream, deep_gemm::cdna4::nv_pipeline_host::dense_cu_limit?deep_gemm::cdna4::nv_pipeline_host::dense_cu_limit:deep_gemm::cdna4::num_compute_units());
     TORCH_CHECK(error == 0, "CDNA4 FP8 GEMM JIT launch failed with code ", error);
 }
 
@@ -292,11 +297,14 @@ int set_group_m_slots(GemmArgs& args, const deep_gemm::cdna4::KernelConfig& conf
 }
 
 // D[M, N] = A[M, K] @ B[group(m), N, K]^T with per-row groups or PSUM group ends.
-void cdna4_m_grouped_fp8_gemm_contiguous(const torch::Tensor& a, const OptTensor& sfa,
+void cdna4_m_grouped_fp8_gemm_contiguous_range(const torch::Tensor& a, const OptTensor& sfa,
                                          const torch::Tensor& b, const OptTensor& sfb,
                                          const torch::Tensor& d, const torch::Tensor& grouped_layout,
                                          int gran_k_a, int gran_k_b, bool use_psum_layout,
-                                         bool ensure_zero_padding, int m_alignment, int expected_m) {
+                                         bool ensure_zero_padding, int m_alignment, int expected_m,
+                                         int group_begin, int group_count, int compute_cus,
+                                         const deep_gemm::cdna4::MegaMoeArgs* moe = nullptr, const int64_t* output_rows = nullptr,
+                                         const deep_gemm::cdna4::MegaMoeArgs* combine_moe = nullptr) {
     const auto device = d.device();
     const bool bf16 = !sfa.has_value();
     TORCH_CHECK(sfa.has_value() == sfb.has_value(), "pass scales for both operands or for none");
@@ -353,7 +361,123 @@ void cdna4_m_grouped_fp8_gemm_contiguous(const torch::Tensor& a, const OptTensor
     int tiles = ceil_div(m, config.block_m) * ceil_div(n, config.block_n);
     if (small_m && use_psum_layout)
         tiles = set_group_m_slots(args, config, expected_m > 0 ? expected_m : m / groups, m, groups, n);
-    launch_or_throw(args, config, MXFP8_OUT_BF16, d, tiles);
+    if (moe != nullptr) {
+        TORCH_CHECK(!small_m && config.variant == deep_gemm::cdna4::KernelVariant::mfma_16x16x128_persistent && n % 256 == 0);
+        config.fused_swiglu = true;
+        auto* base = reinterpret_cast<uint8_t*>(moe->view.base);
+        const auto& l = moe->layout;
+        args.moe_acts = base + l.l2_acts;
+        args.moe_sf = reinterpret_cast<int32_t*>(base + l.l2_sf);
+        args.moe_records = reinterpret_cast<const int32_t*>(base + l.l1_records);
+        args.moe_record_stride = l.record_ints;
+        args.moe_weight_word = l.with_sf ? l.hidden / 128 : 0;
+        args.moe_sf_pitch = l.sf_pitch;
+        args.moe_clamp = moe->activation_clamp;
+        args.moe_fast_math = moe->fast_math;
+    }
+    // MoE ranges use groups of four M tiles; generic grouped GEMMs keep their planner default.
+    if (group_count > 0) config.tile_group_m = 4;
+    if (const char* grouping = std::getenv("DG_MEGA_MOE_TILE_GROUP_M")) {
+        if (moe != nullptr || output_rows != nullptr || group_count > 0) {
+            const int value = std::atoi(grouping);
+            TORCH_CHECK(value == 1 || value == 2 || value == 4 || value == 8 || value == 16);
+            config.tile_group_m = value;
+        }
+    }
+    config.moe_special_epilogue = group_count > 0 && n % 256 == 0 &&
+        config.variant == deep_gemm::cdna4::KernelVariant::mfma_16x16x128_persistent &&
+        std::getenv("DG_MEGA_MOE_SPECIAL_EPILOGUE") && std::string(std::getenv("DG_MEGA_MOE_SPECIAL_EPILOGUE")) == "1";
+    const char* preload=std::getenv("DG_MEGA_MOE_PRELOAD_OUTPUT_PTRS");
+    const bool stage1_queue=std::getenv("DG_MEGA_MOE_STAGE1_QUEUE") && std::string(std::getenv("DG_MEGA_MOE_STAGE1_QUEUE"))=="1";
+    if(output_rows && (preload ? std::string(preload)=="1" : stage1_queue))config.moe_special_epilogue=2;
+    args.moe_output_rows = output_rows;
+    if (output_rows && single_release_control.has_value()) {
+        TORCH_CHECK(single_release_control->device() == d.device());
+        args.moe_release_control = single_release_control->data_ptr<int>();
+    }
+    args.moe_single_release = !std::getenv("DG_MEGA_MOE_SINGLE_RELEASE") ||
+        std::string(std::getenv("DG_MEGA_MOE_SINGLE_RELEASE")) == "1";
+    config.direct_combine = output_rows != nullptr;
+    TORCH_CHECK(!output_rows || (!small_m && n % 256 == 0 &&
+        config.variant == deep_gemm::cdna4::KernelVariant::mfma_16x16x128_persistent),
+        "direct combine needs full-N persistent tiles");
+    args.group_begin = group_begin;
+    args.group_count = group_count;
+    TORCH_CHECK(group_begin >= 0 && group_count >= 0 && group_begin + group_count <= groups);
+    TORCH_CHECK(!group_count || (use_psum_layout && !small_m), "expert ranges need the PSUM tiled kernel");
+    const auto stream = c10::hip::getCurrentHIPStream(d.get_device()).stream();
+    torch::Tensor tile_ready;
+    if (output_rows && n % 512 == 0 && std::getenv("DG_MEGA_MOE_PIPELINE_COMBINE") &&
+        std::string(std::getenv("DG_MEGA_MOE_PIPELINE_COMBINE")) == "1") {
+        const int cus = deep_gemm::cdna4::num_compute_units();
+        TORCH_CHECK(compute_cus == cus, "pipeline combine currently requires one expert window");
+        config.pipeline_combine = true;
+        if (combine_moe) {
+            args.moe_source_counts = reinterpret_cast<const int*>(reinterpret_cast<const uint8_t*>(combine_moe->view.base) + combine_moe->layout.counts);
+            args.moe_rank = combine_moe->view.rank;
+            args.moe_ranks = combine_moe->layout.num_ranks;
+        }
+        args.moe_peer_order = std::getenv("DG_MEGA_MOE_PEER_ORDER") && std::string(std::getenv("DG_MEGA_MOE_PEER_ORDER")) == "1";
+        TORCH_CHECK(!args.moe_peer_order || combine_moe);
+        if (const char* value = std::getenv("DG_MEGA_MOE_COPY_CACHE")) config.copy_cache_policy = std::atoi(value);
+        TORCH_CHECK(config.copy_cache_policy == 0 || config.copy_cache_policy == 16);
+        if (const char* value = std::getenv("DG_MEGA_MOE_PUBLISH_CACHE")) config.publish_cache_policy = std::atoi(value);
+        TORCH_CHECK(config.publish_cache_policy == 0 || config.publish_cache_policy == 16 || config.publish_cache_policy == 18);
+        args.moe_comm_blocks = 32;
+        if (const char* value = std::getenv("DG_MEGA_MOE_PIPELINE_CUS"))
+            args.moe_comm_blocks = std::clamp(std::atoi(value), 8, 128);
+        TORCH_CHECK(args.moe_comm_blocks < cus);
+        args.moe_comm_grouped = std::getenv("DG_MEGA_MOE_PIPELINE_GROUPED") &&
+            std::string(std::getenv("DG_MEGA_MOE_PIPELINE_GROUPED")) == "1";
+        TORCH_CHECK(!args.moe_comm_grouped || (cus == 256 &&
+            (args.moe_comm_blocks == 32 || args.moe_comm_blocks == 64)),
+            "grouped communication needs 32 or 64 blocks on a 256-CU device");
+        config.pipeline_profile = std::getenv("DG_MEGA_MOE_PIPELINE_PROFILE") &&
+            std::string(std::getenv("DG_MEGA_MOE_PIPELINE_PROFILE")) == "1";
+        tile_ready = torch::zeros({int64_t(tiles) + (config.pipeline_profile ? 256 * 16 + 2 : 0)}, d.options().dtype(torch::kInt32));
+        if (config.pipeline_profile) pipeline_diagnostics = tile_ready;
+        args.moe_tile_ready = tile_ready.data_ptr<int>();
+    }
+    int copy_probe = 0;
+    if (config.pipeline_combine) {
+        if (const char* value = std::getenv("DG_MEGA_MOE_PIPELINE_COPY_ONLY")) copy_probe = std::atoi(value);
+        TORCH_CHECK(copy_probe >= 0 && copy_probe <= 3);
+        if (copy_probe) {
+            auto local_config = config;
+            local_config.pipeline_combine = local_config.pipeline_profile = local_config.direct_combine = false;
+            TORCH_CHECK(jit_runtime.launch(args, local_config, MXFP8_OUT_BF16, stream, compute_cus, tiles) == 0);
+            tile_ready.fill_(std::numeric_limits<int>::max());
+            args.moe_skip_compute = 1;
+        }
+        if (copy_probe >= 2) {
+            const auto key = std::string("moe_copy_probe:") + std::to_string(config.pipeline_profile) + ":" + std::to_string(config.copy_cache_policy);
+            const auto module = jit_runtime.get_module(key, [&] {
+                return std::string("#include <deep_gemm/impls/cdna4/fp8_gemm_mfma_16x16x128.cuh>\n") +
+                    "using Cfg = Mfma16x16x128GemmConfig<Mfma16x16x128GemmMode::Persistent,0,0,GemmType::MGroupedContiguousPsum,OperandType::Fp8,OperandType::Fp4,0," +
+                    std::to_string(config.pipeline_profile ? 3 : 2) + ",4," + std::to_string(config.copy_cache_policy) + ">;\n"
+                    "extern \"C\" __global__ __launch_bounds__(256) void dg_moe_copy_probe(GemmArgs p) {\n"
+                    "int worker = -1;\n"
+                    "if (p.moe_comm_grouped) { int stripe = blockIdx.x % 8; if (stripe == 0 || (p.moe_comm_blocks == 64 && stripe == 4)) worker = blockIdx.x / 8 + (stripe == 4 ? 32 : 0); }\n"
+                    "else if (blockIdx.x < p.moe_comm_blocks) worker = blockIdx.x;\n"
+                    "if (worker >= 0) moe_tile_combine<Cfg>(p, worker); }\n";
+            }, {"dg_moe_copy_probe"});
+            const int smem = copy_probe == 2 ? 2 * (256 * 128 * 2 + 256 * 4 * 2) + 32 * (512 + 16) : 256 * 8;
+            TORCH_CHECK(deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[0], args,
+                dim3(compute_cus), dim3(256), smem, stream) == 0);
+            return;
+        }
+    }
+    const int error = jit_runtime.launch(args, config, MXFP8_OUT_BF16, stream,
+        compute_cus > 0 ? compute_cus : deep_gemm::cdna4::num_compute_units(), tiles);
+    TORCH_CHECK(error == 0, "CDNA4 grouped GEMM launch failed: ", error);
+}
+
+void cdna4_m_grouped_fp8_gemm_contiguous(const torch::Tensor& a, const OptTensor& sfa,
+                                         const torch::Tensor& b, const OptTensor& sfb,
+                                         const torch::Tensor& d, const torch::Tensor& layout,
+                                         int ga, int gb, bool psum, bool zero, int alignment, int expected) {
+    cdna4_m_grouped_fp8_gemm_contiguous_range(a, sfa, b, sfb, d, layout, ga, gb, psum, zero, alignment,
+                                             expected, 0, 0, 0);
 }
 
 // D[g, :masked_m[g]] = A[g, :masked_m[g]] @ B[g]^T
@@ -642,6 +766,13 @@ void cdna4_mega_mhc(const torch::Tensor& x, const torch::Tensor& residual, const
 // Mega MoE (mega_moe.cuh): the regions of the symmetric buffer, for the Python views
 constexpr int kMegaMoeAlignment = 256;
 
+bool mega_moe_option(const char* name, bool fallback = false) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return fallback;
+    TORCH_CHECK(std::string(value) == "0" || std::string(value) == "1", name, " must be 0 or 1");
+    return value[0] == '1';
+}
+
 py::dict cdna4_mega_moe_layout(int num_ranks, int num_experts, int num_max_tokens, int num_topk, int hidden,
                                int intermediate, int shared_intermediate, bool with_sf) {
     TORCH_CHECK(num_ranks > 0 && num_ranks <= uni_symm::kMaxRanks && num_experts % num_ranks == 0,
@@ -703,6 +834,48 @@ void cdna4_mega_moe(const torch::Tensor& y, const torch::Tensor& l1_weights, con
     args.shared_l1_out = shared_tokens ? u16(shared_l1_out) : nullptr;
     args.shared_out = shared_tokens ? u16(shared_out) : nullptr;
 
+    if(mega_moe_option("DG_MEGA_MOE_NV_PIPELINE") || mega_moe_option("DG_MEGA_MOE_STAGE1_QUEUE")) {
+        TORCH_CHECK(with_sf && is_packed_fp4(l1_weights) && is_packed_fp4(l2_weights),
+                    "NV-style pipeline requires FP8 x FP4");
+        auto dense=[](const torch::Tensor& a,const torch::Tensor& sa,const torch::Tensor& b,
+                      const torch::Tensor& sb,const torch::Tensor& d){
+            cdna4_fp8_gemm_nt(a,sa,b,sb,d,std::nullopt,1.0,32,32);
+        };
+        deep_gemm::cdna4::nv_pipeline_host::run(args,buffer,y,l1_weights,*l1_weights_sf,l2_weights,*l2_weights_sf,
+            shared_l1_weights,shared_l1_weights_sf,shared_l2_weights,shared_l2_weights_sf,
+            l1_out,l2_out,shared_l1_out,shared_out,dense);
+        if(mega_moe_option("DG_MEGA_MOE_STAGE1_QUEUE")) {
+            TORCH_CHECK(!shared_l1_weights.has_value());
+            auto* base=static_cast<uint8_t*>(buffer.data_ptr());
+            auto l2acts=torch::from_blob(base+l.l2_acts,{l.max_rows,intermediate},buffer.options().dtype(torch::kFloat8_e4m3fn));
+            auto l2sf=torch::from_blob(base+l.l2_sf,{l.max_rows,intermediate/128},{1,l.sf_pitch},buffer.options().dtype(torch::kInt32));
+            auto ends=torch::from_blob(base+l.psum_ends,{l.num_experts_per_rank},buffer.options().dtype(torch::kInt32));
+            const bool coherent_reduce=mega_moe_option("DG_MEGA_MOE_COHERENT_REDUCE",true);
+            const bool compact_barrier=mega_moe_option("DG_MEGA_MOE_COMPACT_BARRIER",true);
+            const bool reduce_fast=mega_moe_option("DG_MEGA_MOE_VECTOR_REDUCE",true);
+            const bool pointers_only=mega_moe_option("DG_MEGA_MOE_STAGE1_POINTERS",true);
+            auto tail=jit_runtime.get_module("stage1_queue_tail_v5:"+std::to_string(coherent_reduce)+":"+std::to_string(compact_barrier)+":"+std::to_string(reduce_fast)+":"+std::to_string(pointers_only)+":"+std::to_string(hidden)+":"+std::to_string(num_topk),[&]{return std::string(
+                "#define DG_MOE_COHERENT_REDUCE ")+std::to_string(coherent_reduce)+"\n"
+                "#define DG_MOE_COMPACT_BARRIER "+std::to_string(compact_barrier)+"\n"
+                "#define DG_MOE_VECTOR_REDUCE "+std::to_string(reduce_fast)+"\n"
+                "#include <deep_gemm/impls/cdna4/moe_pointwise.cuh>\n"
+                "extern \"C\" __global__ __launch_bounds__(256) void tail_finish(MegaMoeArgs p){"+(pointers_only?"moe_pointwise::output_pointers(p);":"mega_moe_finish_impl(p);")+" }\n"
+                "extern \"C\" __global__ __launch_bounds__(256) void tail_barrier(MegaMoeArgs p){mega_moe_barrier_impl<false>(p); }\n"
+                "extern \"C\" __global__ __launch_bounds__(256) void tail_reduce(MegaMoeArgs p){moe_pointwise::reduce<"+std::to_string(hidden)+","+std::to_string(num_topk)+">(p); }\n";
+            },{"tail_finish","tail_barrier","tail_reduce"});
+            args.direct_combine=1;
+            if(!mega_moe_option("DG_MEGA_MOE_STAGE1_EARLY_POINTERS",true))TORCH_CHECK(deep_gemm::cdna4::JitRuntime::launch_kernel(tail->kernels[0],args,dim3(4*cus),dim3(256),l.num_experts_per_rank*4,stream)==0);
+            deep_gemm::cdna4::nv_pipeline_host::phase(3,stream);
+            cdna4_m_grouped_fp8_gemm_contiguous_range(l2acts,l2sf,l2_weights,l2_weights_sf,l2_out,ends,32,32,true,false,kMegaMoeAlignment,0,0,l.num_experts_per_rank,cus,nullptr,reinterpret_cast<const int64_t*>(base+l.output_rows),&args);
+            deep_gemm::cdna4::nv_pipeline_host::phase(4,stream);
+            TORCH_CHECK(deep_gemm::cdna4::JitRuntime::launch_kernel(tail->kernels[1],args,dim3(1),dim3(128),0,stream)==0);
+            deep_gemm::cdna4::nv_pipeline_host::phase(5,stream);
+            if(tokens)TORCH_CHECK(deep_gemm::cdna4::JitRuntime::launch_kernel(tail->kernels[2],args,dim3(std::min(ceil_div(tokens,4),4*cus)),dim3(256),0,stream)==0);
+            deep_gemm::cdna4::nv_pipeline_host::phase(6,stream);
+        }
+        return;
+    }
+
     const auto module = jit_runtime.get_module("mega_moe", [] {
         return "#include <deep_gemm/impls/cdna4/mega_moe.cuh>\n"
                "#define DG_KERNEL(name, body) extern \"C\" __global__ __launch_bounds__(256) "
@@ -711,16 +884,17 @@ void cdna4_mega_moe(const torch::Tensor& y, const torch::Tensor& l1_weights, con
                "DG_KERNEL(publish_barrier, mega_moe_barrier_impl<true>(p))\n"
                "DG_KERNEL(barrier, mega_moe_barrier_impl<false>(p))\n"
                "DG_KERNEL(push, mega_moe_push_impl(p))\n"
+               "DG_KERNEL(push_ordered, mega_moe_push_ordered_impl(p))\n"
                "DG_KERNEL(finish, mega_moe_finish_impl(p))\n"
                "DG_KERNEL(swiglu_fp8, mega_moe_swiglu_impl<true>(p))\n"
                "DG_KERNEL(swiglu_bf16, mega_moe_swiglu_impl<false>(p))\n"
                "DG_KERNEL(combine, mega_moe_combine_impl(p))\n"
                "DG_KERNEL(reduce, mega_moe_reduce_impl(p))\n";
     }, {"dg_cdna4_mega_moe_route", "dg_cdna4_mega_moe_publish_barrier", "dg_cdna4_mega_moe_barrier",
-        "dg_cdna4_mega_moe_push", "dg_cdna4_mega_moe_finish",
+        "dg_cdna4_mega_moe_push", "dg_cdna4_mega_moe_push_ordered", "dg_cdna4_mega_moe_finish",
         "dg_cdna4_mega_moe_swiglu_fp8", "dg_cdna4_mega_moe_swiglu_bf16", "dg_cdna4_mega_moe_combine",
         "dg_cdna4_mega_moe_reduce"});
-    enum { kRoute, kPublishBarrier, kBarrier, kPush, kFinish, kSwigluFp8, kSwigluBf16, kCombine, kReduce };
+    enum { kRoute, kPublishBarrier, kBarrier, kPush, kPushOrdered, kFinish, kSwigluFp8, kSwigluBf16, kCombine, kReduce };
     const auto launch = [&](const deep_gemm::cdna4::MegaMoeArgs& a, int kernel, int blocks, int threads, int lds,
                             const char* name, hipStream_t on) {
         auto kernel_args = a;
@@ -775,27 +949,106 @@ void cdna4_mega_moe(const torch::Tensor& y, const torch::Tensor& l1_weights, con
         TORCH_CHECK(hipEventRecord(join_event, side.stream()) == hipSuccess);
     }
 
-    // dispatch
+    // Each expert window is independent. Dispatch, compute, and combine use separate streams;
+    // Dispatch and combine have separate reusable barrier slots: their workgroups may execute
+    // on different XCDs/streams. The caller's stream joins every side stream before returning.
+    int chunks = 1;
+    if (const char* env = std::getenv("DG_MEGA_MOE_CHUNKS"))
+        chunks = std::clamp(std::atoi(env), 1, experts);
+    // Full-width coalesced epilogues are required; partial-N and short-K shapes keep the
+    // standalone combine. FP8/mixed weights are the measured default; BF16 is opt-in.
+    const bool direct_combine = mega_moe_option("DG_MEGA_MOE_DIRECT_COMBINE", with_sf) &&
+        hidden % 256 == 0 && intermediate * (with_sf ? 1 : 2) >= 256;
+    args.ordered_push = mega_moe_option("DG_MEGA_MOE_ORDERED_PUSH");
+    args.direct_combine = direct_combine;
+    const int per_chunk = ceil_div(experts, chunks);
+    const bool fuse_swiglu = mega_moe_option("DG_MEGA_MOE_FUSE_SWIGLU") &&
+        hidden * (with_sf ? 1 : 2) >= 256;
+    const int device = y.get_device();
+    static std::map<std::pair<int, int>, std::array<hipStream_t, 3>> partition_streams;
+    const bool partition = chunks > 1 && mega_moe_option("DG_MEGA_MOE_CUMASK");
+    int reserved = 32;
+    if (const char* value = std::getenv("DG_MEGA_MOE_COMM_CUS")) reserved = std::clamp(std::atoi(value), 8, 128);
+    reserved = std::min(cus / 2, (reserved + 7) / 8 * 8);
+    auto compute = at::hip::getStreamFromPoolMasqueradingAsCUDA(false, device);
+    auto combine_stream = at::hip::getStreamFromPoolMasqueradingAsCUDA(false, device);
+    hipStream_t dispatch_stream = stream;
+    if (partition) {
+        TORCH_CHECK(cus == 256, "experimental CU partition is tuned for 256-CU MI355X");
+        auto& streams = partition_streams[{device, reserved}];
+        if (!streams[0]) {
+            std::vector<uint32_t> compute_mask(ceil_div(cus, 32)), comm_mask(ceil_div(cus, 32));
+            for (int cu = 0; cu < cus; ++cu)
+                ((cu % 32 < reserved / 8) ? comm_mask : compute_mask)[cu / 32] |= uint32_t(1) << (cu % 32);
+            TORCH_CHECK(hipExtStreamCreateWithCUMask(&streams[0], compute_mask.size(), compute_mask.data()) == hipSuccess);
+            TORCH_CHECK(hipExtStreamCreateWithCUMask(&streams[1], comm_mask.size(), comm_mask.data()) == hipSuccess);
+            TORCH_CHECK(hipExtStreamCreateWithCUMask(&streams[2], comm_mask.size(), comm_mask.data()) == hipSuccess);
+        }
+        compute = at::hip::getStreamFromExternalMasqueradingAsCUDA(streams[0], device);
+        combine_stream = at::hip::getStreamFromExternalMasqueradingAsCUDA(streams[1], device);
+        dispatch_stream = streams[2];
+    }
+    struct Events {
+        std::vector<hipEvent_t> values;
+        hipEvent_t make() {
+            hipEvent_t e;
+            TORCH_CHECK(hipEventCreateWithFlags(&e, hipEventDisableTiming) == hipSuccess);
+            values.push_back(e);
+            return e;
+        }
+        ~Events() { for (auto e : values) (void)hipEventDestroy(e); }
+    } events;
+    const auto record = [](hipEvent_t e, hipStream_t s) { TORCH_CHECK(hipEventRecord(e, s) == hipSuccess); };
+    const auto wait = [](hipStream_t s, hipEvent_t e) { TORCH_CHECK(hipStreamWaitEvent(s, e, 0) == hipSuccess); };
+    const auto cs = chunks > 1 ? compute.stream() : stream;
+    const auto bs = chunks > 1 ? combine_stream.stream() : stream;
+    if (chunks > 1) {
+        const auto start = events.make();
+        record(start, stream); wait(cs, start); wait(bs, start); wait(dispatch_stream, start);
+        l1_out.record_stream(compute); l2_out.record_stream(compute); l2_out.record_stream(combine_stream);
+    }
     const int table_lds = (3 * ranks * experts + ranks + 2 * experts + 2) * 4;
-    launch(args, kRoute, std::max(1, std::min(ceil_div(tokens * num_topk, 256), grid)), 256, 0, "route", stream);
-    launch(args, kPublishBarrier, 1, 256, ranks * num_experts * 4, "barrier", stream);
-    launch(args, kPush, comm_grid, 256, 0, "push", stream);
-    launch(args, kBarrier, 1, 128, 0, "barrier", stream);
-    if (with_sf)
-        launch(args, kFinish, grid, 256, experts * 4, "finish", stream);
-
-    // the routed experts
+    launch(args, kRoute, std::max(1, std::min(ceil_div(tokens * num_topk, 256), grid)), 256, 0, "route", dispatch_stream);
+    launch(args, kPublishBarrier, 1, 256, ranks * num_experts * 4, "barrier", dispatch_stream);
     const auto ends = view(l.psum_ends, {experts}, torch::kInt32);
-    cdna4_m_grouped_fp8_gemm_contiguous(view(l.l1_acts, {l.max_rows, hidden}, act_dtype),
-                                        scales(l.l1_sf, l.max_rows, hidden, l.sf_pitch), l1_weights, l1_weights_sf,
-                                        l1_out, ends, 32, 32, true, false, kMegaMoeAlignment, 0);
-    launch(args, with_sf ? kSwigluFp8 : kSwigluBf16, grid, 256, experts * 4, "swiglu", stream);
-    cdna4_m_grouped_fp8_gemm_contiguous(view(l.l2_acts, {l.max_rows, intermediate}, act_dtype),
-                                        scales(l.l2_sf, l.max_rows, intermediate, l.sf_pitch), l2_weights,
-                                        l2_weights_sf, l2_out, ends, 32, 32, true, false, kMegaMoeAlignment, 0);
-
-    // combine
-    launch(args, kCombine, comm_grid, 256, table_lds, "combine", stream);
+    for (int begin = 0; begin < experts; begin += per_chunk) {
+        auto part = args;
+        part.expert_begin = begin;
+        part.expert_count = std::min(per_chunk, experts - begin);
+        const bool ordered = args.ordered_push;
+        launch(part, ordered ? kPushOrdered : kPush, comm_grid, 256,
+            ordered ? (ranks * (experts + 1) + 1) * 4 : 0, "push", dispatch_stream);
+        launch(part, kBarrier, 1, 128, 0, "barrier", dispatch_stream);
+        if (chunks > 1) {
+            auto ready = events.make(); record(ready, dispatch_stream); wait(cs, ready);
+        }
+        {
+            const at::hip::HIPStreamGuardMasqueradingAsCUDA guard(
+                chunks > 1 ? compute : at::hip::getCurrentHIPStreamMasqueradingAsCUDA(device));
+            if (with_sf || direct_combine)
+                launch(part, kFinish, grid, 256, experts * 4, "finish", cs);
+            cdna4_m_grouped_fp8_gemm_contiguous_range(view(l.l1_acts, {l.max_rows, hidden}, act_dtype),
+                scales(l.l1_sf, l.max_rows, hidden, l.sf_pitch), l1_weights, l1_weights_sf,
+                l1_out, ends, 32, 32, true, false, kMegaMoeAlignment, 0, begin, part.expert_count,
+                chunks > 1 ? cus - reserved : cus, fuse_swiglu ? &part : nullptr);
+            if (!fuse_swiglu)
+                launch(part, with_sf ? kSwigluFp8 : kSwigluBf16, grid, 256, experts * 4, "swiglu", cs);
+            cdna4_m_grouped_fp8_gemm_contiguous_range(view(l.l2_acts, {l.max_rows, intermediate}, act_dtype),
+                scales(l.l2_sf, l.max_rows, intermediate, l.sf_pitch), l2_weights, l2_weights_sf,
+                l2_out, ends, 32, 32, true, false, kMegaMoeAlignment, 0, begin, part.expert_count,
+                chunks > 1 ? cus - reserved : cus, nullptr,
+                direct_combine ? reinterpret_cast<const int64_t*>(base + l.output_rows) : nullptr, &part);
+        }
+        if (chunks > 1) {
+            auto done = events.make(); record(done, cs); wait(bs, done);
+        }
+        if (!direct_combine)
+            launch(part, kCombine, comm_grid, 256, table_lds, "combine", bs);
+    }
+    if (chunks > 1) {
+        auto joined = events.make(); record(joined, bs); wait(stream, joined);
+    }
+    args.barrier_slot = chunks > 1 ? 1 : 0;
     launch(args, kBarrier, 1, 128, 0, "barrier", stream);
     if (join != nullptr)
         TORCH_CHECK(hipStreamWaitEvent(stream, join, 0) == hipSuccess);
@@ -1017,8 +1270,24 @@ std::tuple<int64_t, int> cdna4_fp8_gemm_plan(int m, int n, int k) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "DeepGEMM HIP extension";
+    py::class_<deep_gemm::cdna4::HipJit, std::shared_ptr<deep_gemm::cdna4::HipJit>>(m, "Runtime", py::module_local());
+    m.def("get_jit", [] { return jit_runtime.get_runtime(); });
+    m.def("cdna4_pipeline_diagnostics", [] { return pipeline_diagnostics; });
+    m.def("cdna4_set_release_control", [](const OptTensor& value) {
+        if (value) TORCH_CHECK(value->is_cuda() && value->scalar_type() == torch::kInt32 && value->numel() == 1 && value->is_contiguous());
+        single_release_control = value;
+    });
     uni_symm::register_python_api<uni_symm::HIP>(m);
     m.def("cdna4_init", &cdna4_init, py::arg("root"));
+    m.def("cdna4_stage1_phase_times", &deep_gemm::cdna4::nv_pipeline_host::phase_times);
+    m.def("cdna4_nv_pipeline_clear_metrics", [] {
+        deep_gemm::cdna4::nv_pipeline_host::task_trace.reset();
+        deep_gemm::cdna4::nv_pipeline_host::communication_trace.reset();
+        deep_gemm::cdna4::nv_pipeline_host::worker_trace.reset();
+    });
+    m.def("cdna4_nv_pipeline_metrics", [] {return deep_gemm::cdna4::nv_pipeline_host::task_trace;});
+    m.def("cdna4_nv_pipeline_comm_metrics", [] {return deep_gemm::cdna4::nv_pipeline_host::communication_trace;});
+    m.def("cdna4_nv_pipeline_worker_ids", [] {return deep_gemm::cdna4::nv_pipeline_host::worker_trace;});
     m.def("cdna4_fp8_gemm_nt", &cdna4_fp8_gemm_nt,
           py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("alpha") = 1.0,
