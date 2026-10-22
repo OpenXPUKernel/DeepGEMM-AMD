@@ -35,12 +35,22 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - PyTorch 2.3 or higher
 - CUTLASS 4.0 or higher (could be cloned by Git submodule)
 
+### AMD / ROCm requirements
+
+For the AMD backend use an AMD GPU, ROCm PyTorch and a ROCm development
+installation providing HIPRTC. The host extension requires C++20, `libdw-dev`
+and `libelf-dev` headers; GCC 12 additionally uses fmt headers (`libfmt-dev`, or
+those included with PyTorch) for formatting. CUDA is not required for this path.
+Initialize the pinned DeepJIT fork with `git submodule update --init --recursive`.
+Both GPU backends now use DeepJIT for compilation and caching; see the
+[AMD runtime layout](docs/cdna4-kernel-layout.md) and [validation guide](docs/amd-validation.md).
+
 ### Development
 
 ```bash
 # Submodule must be cloned
-git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
-cd DeepGEMM
+git clone --recursive git@github.com:OpenXPUKernel/DeepGEMM-AMD.git
+cd DeepGEMM-AMD
 
 # Link some essential includes and build the C++ extension
 cat develop.sh
@@ -72,6 +82,15 @@ Please note that operations like input transposition or FP8 casting must be hand
 #### Normal dense GEMMs (non-grouped)
 
 To perform a basic non-grouped FP8 GEMM, call the `fp8_gemm_{nt, nn, tn, tt}` function. For more details, please refer to the function documentation.
+
+#### AMD GPU HIP FP8, FP4 and BF16 GEMMs
+
+For AMD GPU architecture GPUs running ROCm, the HIP backend provides the same dense FP8 entry points: `fp8_gemm_nt`, `fp8_gemm_nn`, `fp8_gemm_tn`, and `fp8_gemm_tt`. Run `bash install.sh` in a ROCm PyTorch environment; the normal build automatically selects HIP and installs one `deep_gemm._C` extension. Use `bash develop.sh` for a source checkout. The pybind extension uses a shape cost model to JIT and cache the selected HIP template specialization, and importing `deep_gemm` on a ROCm installation selects this backend automatically. The implementation supports native K-/MN-major OCP FP8 E4M3 operands, packed UE8M0 scales with independent 32/128-element K granularities, BF16 or FP32 output, accumulation, `alpha`, and the dense layout aliases. The grouped FP8 GEMMs `m_grouped_fp8_gemm_{nt,nn}_contiguous` (per-row and PSUM layouts), `m_grouped_fp8_gemm_nt_masked` and `k_grouped_fp8_gemm_{tn,nt}_contiguous` keep the CUDA signatures; contiguous layouts align groups to 256 rows by default (`get_mk_alignment_for_contiguous_layout()`), and smaller multiples of 16 run narrower tiles. The BF16 GEMMs `bf16_gemm_{nt,nn,tn,tt}`, `m_grouped_bf16_gemm_{nt,nn}_contiguous`, `m_grouped_bf16_gemm_nt_masked` and `k_grouped_bf16_gemm_tn_contiguous` run the same kernels without scales. Packed FP4 (E2M1, int8) operands go through the `fp8_fp4_*` / `fp4_*` entry points in any FP8/FP4 combination, and `k_grouped_fp4_gemm_nt_contiguous` covers K-grouped FP4. `einsum` and `fp8_einsum` run their expressions on the same kernels over strided views, `tf32_hc_prenorm_gemm` runs its FP32 B as two BF16 terms, `bf16_mega_gate` routes the BF16 GEMM's logits with the CUDA gate's semantics, and `mega_mhc` runs the hyper-connection residual update, the next mixes and the RMSNorm (BF16 / FP8) in three kernels. Custom epilogues are outside this backend. See [the AMD GPU FP8 GEMM guide](docs/cdna4-fp8-gemm.md) for correctness and performance scripts.
+
+The expert-parallel `fp8_fp4_mega_moe` and `bf16_mega_moe` (with `get_symm_buffer_for_mega_moe` and `transform_weights_for_mega_moe`) run across the GPUs of a node on symmetric buffers from [uni_symm](third-party/uni_symm/README.md), a header-only symmetric memory library with the interface of `torch.distributed._symmetric_memory` for ROCm and CUDA; see [the AMD GPU Mega MoE guide](docs/cdna4-mega-moe.md).
+
+The V3.2 indexer kernels (`fp8_fp4_mqa_logits`, `fp8_fp4_paged_mqa_logits`, `fp8_fp4_sparse_mqa_logits`, `fp8_fp4_paged_sparse_mqa_logits` and their metadata functions) take both the FP8 format of SM90 (float per-token KV scales, float weights and logits) and the MXFP8 / MXFP4 formats of SM100, see [the AMD GPU MQA logits guide](docs/cdna4-mqa-logits.md). The runtime configuration functions (`get_num_sms`, `set_num_sms`, ...) are available as well.
+
 
 #### Grouped GEMMs (contiguous layout)
 

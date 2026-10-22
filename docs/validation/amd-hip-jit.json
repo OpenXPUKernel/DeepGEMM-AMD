@@ -1,0 +1,80 @@
+{
+  "mma_type": "fp8xfp4",
+  "ranks": 8,
+  "tokens_per_rank": 8192,
+  "hidden": 7168,
+  "intermediate": 3072,
+  "experts": 384,
+  "topk": 6,
+  "shared_experts": 0,
+  "graph": true,
+  "iterations": 200,
+  "latency_ms": 4.48212158203125,
+  "useful_flops": 51951924412416,
+  "overrides": {
+    "DG_MEGA_MOE_STAGE1_QUEUE": "1"
+  },
+  "deepjit_commit": "12c1003",
+  "environment": {
+    "gpu": "AMD GPU",
+    "rocm": "7.2.4",
+    "torch": "2.8.0+rocm7.2.4.git6bea3e0b",
+    "host_compiler": "GCC 12.2",
+    "date": "2026-10-20"
+  },
+  "validation": {
+    "fp8_gemm": {
+      "passed": 147,
+      "skipped": 7
+    },
+    "other_cdna4_operators": {
+      "passed": 678,
+      "skipped": 9
+    },
+    "build_and_lazy_init": {
+      "passed": 9,
+      "skipped": 3
+    },
+    "stage1_queue": {
+      "ranks": 8,
+      "cases": 5,
+      "result": "PASS"
+    },
+    "default_mega_moe": {
+      "ranks": 8,
+      "precisions": [
+        "fp8xfp4",
+        "fp8xfp8",
+        "bf16xbf16"
+      ],
+      "cases_per_precision": 5,
+      "result": "PASS"
+    },
+    "resident_pipeline": {
+      "ranks": 2,
+      "cases": 5,
+      "result": "PASS"
+    },
+    "serial_output_bitwise": true,
+    "phase_graph_output_bitwise": true,
+    "jit_concurrency_and_device_identity": {
+      "passed": 2,
+      "skipped": 0
+    }
+  },
+  "phase_diagnostics": {
+    "stage1": {
+      "latency_ms": 2.3194099366664886,
+      "useful_flops": 34634616274944.0
+    },
+    "stage2": {
+      "latency_ms": 2.232889987528324,
+      "useful_flops": 17317308137472.0
+    },
+    "total": {
+      "latency_ms": 4.4694379542488605,
+      "useful_flops": 51951924412416
+    }
+  },
+  "note": "Timing uses prequantized inputs and all dispatch/GEMM/activation/return/combine work. Phase diagnostics use separate external HIP event nodes; uninstrumented end-to-end latency is reported at the top level."
+}

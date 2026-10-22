@@ -4,3 +4,6 @@
 [submodule "third-party/deep_jit"]
 	path = third-party/deep_jit
 	url = https://github.com/deepseek-ai/DeepJIT.git
+[submodule "third-party/deep_jit_hip"]
+	path = third-party/deep_jit_hip
+	url = https://github.com/OpenXPUKernel/DeepJIT.git

@@ -14,14 +14,14 @@ from setuptools import find_packages
 from setuptools.command.build_py import build_py
 from packaging.version import parse
 from pathlib import Path
-from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
+from torch.utils.cpp_extension import CppExtension, CUDAExtension, CUDA_HOME, ROCM_HOME
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
-from scripts.generate_pyi import generate_pyi_file
 
 
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
+IS_ROCM = bool(getattr(torch.version, 'hip', None))
 
 # Compiler flags
 cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
@@ -43,6 +43,21 @@ third_party_include_dirs = [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
 ]
+
+if IS_ROCM:
+    sources = ['csrc/hip_python_api.cpp']
+    build_include_dirs = [
+        f'{ROCM_HOME}/include',
+        'csrc',
+        'deep_gemm/include',
+        'csrc/cdna4',
+        'third-party/deep_jit_hip/include',
+        'third-party/uni_symm/include',
+    ]
+    build_libraries = ['amdhip64', 'hiprtc', 'c10_hip', 'torch_hip']
+    build_library_dirs = [f'{ROCM_HOME}/lib']
+    # the kernels include the uni_symm device fabric through the JIT
+    third_party_include_dirs = ['third-party/uni_symm/include/uni_symm']
 
 # Release
 base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag_name}/{wheel_name}'
@@ -100,12 +115,30 @@ def get_ext_modules():
     if DG_SKIP_CUDA_BUILD:
         return []
 
-    return [CUDAExtension(name='deep_gemm._C',
-                          sources=sources,
-                          include_dirs=build_include_dirs,
-                          libraries=build_libraries,
-                          library_dirs=build_library_dirs,
-                          extra_compile_args=cxx_flags)]
+    # The HIP extension contains host C++ only; device templates are compiled
+    # by HIPRTC at runtime. CUDAExtension would hipify these native HIP sources,
+    # including header names embedded in the generated JIT source strings.
+    extension = CUDAExtension
+    options = {}
+    if IS_ROCM:
+        if ROCM_HOME is None:
+            raise RuntimeError('ROCm PyTorch was detected, but the ROCm development toolkit was not found. '
+                               'Set ROCM_HOME to its installation directory.')
+        extension = CppExtension
+        # CppExtension does not add BuildExtension's ROCm compatibility macro.
+        # Newer PyTorch HIP headers expose old HIP stream aliases under it.
+        options['define_macros'] = [('__HIP_PLATFORM_AMD__', '1'), ('USE_ROCM', '1')]
+        options['runtime_library_dirs'] = build_library_dirs
+
+    return [extension(
+        name='deep_gemm._C',
+        sources=sources,
+        include_dirs=[os.path.abspath(os.path.join(current_dir, path)) for path in build_include_dirs],
+        libraries=build_libraries,
+        library_dirs=build_library_dirs,
+        extra_compile_args=cxx_flags,
+        **options,
+    )]
 
 
 class CustomBuildPy(build_py):
@@ -117,7 +150,8 @@ class CustomBuildPy(build_py):
         self.generate_default_envs()
 
         # Third, generate and copy .pyi file to build root directory
-        self.generate_pyi_file()
+        if not IS_ROCM:
+            self.generate_pyi_file()
 
         # Fourth, copy csrc and docs into the wheel for agent-side error lookup
         self.prepare_agent_files()
@@ -131,9 +165,11 @@ class CustomBuildPy(build_py):
         for name in ('csrc', 'docs'):
             dst = os.path.join(package_dir, name)
             shutil.rmtree(dst, ignore_errors=True)
-            shutil.copytree(os.path.join(current_dir, name), dst)
+            shutil.copytree(os.path.join(current_dir, name), dst,
+                            ignore=shutil.ignore_patterns('*_hip.cpp', '*_hip.hpp', '*_hip.cuh'))
 
     def generate_pyi_file(self):
+        from scripts.generate_pyi import generate_pyi_file
         generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')
         pyi_source = os.path.join(current_dir, 'stubs', '_C.pyi')
         pyi_target = os.path.join(self.build_lib, 'deep_gemm', '_C.pyi')
@@ -175,7 +211,7 @@ class CustomBuildPy(build_py):
 
 class CachedWheelsCommand(_bdist_wheel):
     def run(self):
-        if DG_FORCE_BUILD or DG_USE_LOCAL_VERSION:
+        if IS_ROCM or DG_FORCE_BUILD or DG_USE_LOCAL_VERSION:
             return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()
@@ -201,18 +237,22 @@ class CachedWheelsCommand(_bdist_wheel):
 
 
 if __name__ == '__main__':
+    print('Building DeepGEMM for ROCm/HIP' if IS_ROCM else 'Building DeepGEMM for CUDA')
     # noinspection PyTypeChecker
     setuptools.setup(
         name='deep_gemm',
         version=get_package_version(),
-        packages=find_packages('.'),
+        packages=find_packages('.') + (['uni_symm'] if IS_ROCM else []),
+        package_dir={'uni_symm': 'third-party/uni_symm/uni_symm'} if IS_ROCM else {},
         package_data={
             'deep_gemm': [
                 'include/deep_gemm/**/*',
                 'include/cute/**/*',
                 'include/cutlass/**/*',
+                'include/uni_symm/**/*',
             ]
         },
+        exclude_package_data={'deep_gemm': ['**/*_hip.cuh', '**/*_hip.hpp', '**/*_hip.cpp']},
         ext_modules=get_ext_modules(),
         zip_safe=False,
         cmdclass={
