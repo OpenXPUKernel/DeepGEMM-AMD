@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 # Change current directory into project root
 original_dir=$(pwd)
 script_dir=$(realpath "$(dirname "$0")")
@@ -7,7 +10,7 @@ cd "$script_dir"
 rm -rf build dist
 rm -rf *.egg-info
 python setup.py bdist_wheel
-pip install dist/*.whl --force-reinstall
+python -m pip install dist/*.whl --force-reinstall
 
 # Open users' original directory
 cd "$original_dir"

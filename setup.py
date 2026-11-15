@@ -1,86 +1,111 @@
 import ast
 import os
+import platform
 import re
 import shutil
-import setuptools
 import subprocess
 import sys
-import torch
-import platform
 import urllib
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+import setuptools
+import torch
+from packaging.version import parse
 from setuptools import find_packages
 from setuptools.command.build_py import build_py
-from packaging.version import parse
-from pathlib import Path
-from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
+from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME, CppExtension, CUDAExtension
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
-from scripts.generate_pyi import generate_pyi_file
 
-
-DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
-DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
-DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
+DG_SKIP_CUDA_BUILD = int(os.getenv("DG_SKIP_CUDA_BUILD", "0")) == 1
+DG_FORCE_BUILD = int(os.getenv("DG_FORCE_BUILD", "0")) == 1
+DG_USE_LOCAL_VERSION = int(os.getenv("DG_USE_LOCAL_VERSION", "1")) == 1
+IS_ROCM = bool(getattr(torch.version, "hip", None))
 
 # Compiler flags
-cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
-             f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
+cxx_flags = [
+    "-std=c++20",
+    "-O3",
+    "-fPIC",
+    "-Wno-psabi",
+    "-Wno-deprecated-declarations",
+    f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
+]
 
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
-sources = ['csrc/python_api.cpp']
+sources = ["csrc/python_api.cpp"]
 build_include_dirs = [
-    f'{CUDA_HOME}/include',
-    f'{CUDA_HOME}/include/cccl',
-    'deep_gemm/include',
-    'third-party/deep_jit/include',
-    'third-party/cutlass/include',
+    f"{CUDA_HOME}/include",
+    f"{CUDA_HOME}/include/cccl",
+    "deep_gemm/include",
+    "third-party/deep_jit/include",
+    "third-party/cutlass/include",
 ]
-build_libraries = ['cudart']
-build_library_dirs = [f'{CUDA_HOME}/lib64']
+build_libraries = ["cudart"]
+build_library_dirs = [f"{CUDA_HOME}/lib64"]
 third_party_include_dirs = [
-    'third-party/cutlass/include/cute',
-    'third-party/cutlass/include/cutlass',
+    "third-party/cutlass/include/cute",
+    "third-party/cutlass/include/cutlass",
 ]
 
+if IS_ROCM:
+    sources = ["csrc/hip_python_api.cpp"]
+    build_include_dirs = [
+        f"{ROCM_HOME}/include",
+        "csrc",
+        "deep_gemm/include",
+        "csrc/cdna4",
+        "third-party/deep_jit_hip/include",
+        "third-party/uni_symm/include",
+    ]
+    build_libraries = ["amdhip64", "hiprtc", "c10_hip", "torch_hip"]
+    build_library_dirs = [f"{ROCM_HOME}/lib"]
+    # the kernels include the uni_symm device fabric through the JIT
+    third_party_include_dirs = ["third-party/uni_symm/include/uni_symm"]
+
 # Release
-base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag_name}/{wheel_name}'
+base_wheel_url = (
+    "https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag_name}/{wheel_name}"
+)
 
 
 def get_package_version():
-    with open(Path(current_dir) / 'deep_gemm' / '__init__.py', 'r') as f:
-        version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
+    with open(Path(current_dir) / "deep_gemm" / "__init__.py", "r") as f:
+        version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
 
-    revision = ''
+    revision = ""
     if DG_USE_LOCAL_VERSION:
         # noinspection PyBroadException
         try:
-            status_cmd = ['git', 'status', '--porcelain']
-            status_output = subprocess.check_output(status_cmd).decode('ascii').strip()
+            status_cmd = ["git", "status", "--porcelain"]
+            status_output = subprocess.check_output(status_cmd).decode("ascii").strip()
             if status_output:
-                print(f'Warning: Git working directory is not clean. Uncommitted changes:\n{status_output}')
-                assert False, 'Git working directory is not clean'
+                print(
+                    f"Warning: Git working directory is not clean. Uncommitted changes:\n{status_output}"
+                )
+                assert False, "Git working directory is not clean"
 
-            cmd = ['git', 'rev-parse', '--short', 'HEAD']
-            revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
+            cmd = ["git", "rev-parse", "--short", "HEAD"]
+            revision = "+" + subprocess.check_output(cmd).decode("ascii").rstrip()
         except Exception:
-            revision = '+local'
-    return f'{public_version}{revision}'
+            revision = "+local"
+    return f"{public_version}{revision}"
 
 
 def get_platform():
-    if sys.platform.startswith('linux'):
-        return f'linux_{platform.uname().machine}'
+    if sys.platform.startswith("linux"):
+        return f"linux_{platform.uname().machine}"
     else:
-        raise ValueError('Unsupported platform: {}'.format(sys.platform))
+        raise ValueError("Unsupported platform: {}".format(sys.platform))
 
 
 def get_wheel_url():
     torch_version = parse(torch.__version__)
-    torch_version = f'{torch_version.major}.{torch_version.minor}'
-    python_version = f'cp{sys.version_info.major}{sys.version_info.minor}'
+    torch_version = f"{torch_version.major}.{torch_version.minor}"
+    python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
     platform_name = get_platform()
     deep_gemm_version = get_package_version()
     cxx11_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
@@ -88,11 +113,13 @@ def get_wheel_url():
     # Determine the version numbers that will be used to determine the correct wheel
     # We're using the CUDA version used to build torch, not the one currently installed
     cuda_version = parse(torch.version.cuda)
-    cuda_version = f'{cuda_version.major}'
+    cuda_version = f"{cuda_version.major}"
 
     # Determine wheel URL based on CUDA version, torch version, python version and OS
-    wheel_filename = f'deep_gemm-{deep_gemm_version}+cu{cuda_version}-torch{torch_version}-cxx11abi{cxx11_abi}-{python_version}-{platform_name}.whl'
-    wheel_url = base_wheel_url.format(tag_name=f'v{deep_gemm_version}', wheel_name=wheel_filename)
+    wheel_filename = f"deep_gemm-{deep_gemm_version}+cu{cuda_version}-torch{torch_version}-cxx11abi{cxx11_abi}-{python_version}-{platform_name}.whl"
+    wheel_url = base_wheel_url.format(
+        tag_name=f"v{deep_gemm_version}", wheel_name=wheel_filename
+    )
     return wheel_url, wheel_filename
 
 
@@ -100,12 +127,37 @@ def get_ext_modules():
     if DG_SKIP_CUDA_BUILD:
         return []
 
-    return [CUDAExtension(name='deep_gemm._C',
-                          sources=sources,
-                          include_dirs=build_include_dirs,
-                          libraries=build_libraries,
-                          library_dirs=build_library_dirs,
-                          extra_compile_args=cxx_flags)]
+    # The HIP extension contains host C++ only; device templates are compiled
+    # by HIPRTC at runtime. CUDAExtension would hipify these native HIP sources,
+    # including header names embedded in the generated JIT source strings.
+    extension = CUDAExtension
+    options = {}
+    if IS_ROCM:
+        if ROCM_HOME is None:
+            raise RuntimeError(
+                "ROCm PyTorch was detected, but the ROCm development toolkit was not found. "
+                "Set ROCM_HOME to its installation directory."
+            )
+        extension = CppExtension
+        # CppExtension does not add BuildExtension's ROCm compatibility macro.
+        # Newer PyTorch HIP headers expose old HIP stream aliases under it.
+        options["define_macros"] = [("__HIP_PLATFORM_AMD__", "1"), ("USE_ROCM", "1")]
+        options["runtime_library_dirs"] = build_library_dirs
+
+    return [
+        extension(
+            name="deep_gemm._C",
+            sources=sources,
+            include_dirs=[
+                os.path.abspath(os.path.join(current_dir, path))
+                for path in build_include_dirs
+            ],
+            libraries=build_libraries,
+            library_dirs=build_library_dirs,
+            extra_compile_args=cxx_flags,
+            **options,
+        )
+    ]
 
 
 class CustomBuildPy(build_py):
@@ -117,7 +169,8 @@ class CustomBuildPy(build_py):
         self.generate_default_envs()
 
         # Third, generate and copy .pyi file to build root directory
-        self.generate_pyi_file()
+        if not IS_ROCM:
+            self.generate_pyi_file()
 
         # Fourth, copy csrc and docs into the wheel for agent-side error lookup
         self.prepare_agent_files()
@@ -127,16 +180,22 @@ class CustomBuildPy(build_py):
 
     def prepare_agent_files(self):
         # Copy csrc and docs into the wheel for agent-side error lookup
-        package_dir = os.path.join(self.build_lib, 'deep_gemm')
-        for name in ('csrc', 'docs'):
+        package_dir = os.path.join(self.build_lib, "deep_gemm")
+        for name in ("csrc", "docs"):
             dst = os.path.join(package_dir, name)
             shutil.rmtree(dst, ignore_errors=True)
-            shutil.copytree(os.path.join(current_dir, name), dst)
+            shutil.copytree(
+                os.path.join(current_dir, name),
+                dst,
+                ignore=shutil.ignore_patterns("*_hip.cpp", "*_hip.hpp", "*_hip.cuh"),
+            )
 
     def generate_pyi_file(self):
-        generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')
-        pyi_source = os.path.join(current_dir, 'stubs', '_C.pyi')
-        pyi_target = os.path.join(self.build_lib, 'deep_gemm', '_C.pyi')
+        from scripts.generate_pyi import generate_pyi_file
+
+        generate_pyi_file(name="_C", root="./csrc", output_dir="./stubs")
+        pyi_source = os.path.join(current_dir, "stubs", "_C.pyi")
+        pyi_target = os.path.join(self.build_lib, "deep_gemm", "_C.pyi")
 
         if os.path.exists(pyi_source):
             print(f"Copying .pyi file from {pyi_source} to {pyi_target}")
@@ -146,22 +205,30 @@ class CustomBuildPy(build_py):
             print(f"Warning: .pyi file not found at {pyi_source}")
 
     def generate_default_envs(self):
-        code = '# Pre-installed environment variables\n'
-        code += 'persistent_envs = dict()\n'
-        for name in ('DG_JIT_CACHE_DIR', 'DG_JIT_PRINT_COMPILER_COMMAND', 'DG_JIT_CPP_STANDARD'):
-            code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
+        code = "# Pre-installed environment variables\n"
+        code += "persistent_envs = dict()\n"
+        for name in (
+            "DG_JIT_CACHE_DIR",
+            "DG_JIT_PRINT_COMPILER_COMMAND",
+            "DG_JIT_CPP_STANDARD",
+        ):
+            code += (
+                f"persistent_envs['{name}'] = '{os.environ[name]}'\n"
+                if name in os.environ
+                else ""
+            )
 
-        with open(os.path.join(self.build_lib, 'deep_gemm', 'envs.py'), 'w') as f:
+        with open(os.path.join(self.build_lib, "deep_gemm", "envs.py"), "w") as f:
             f.write(code)
 
     def prepare_includes(self):
         # Create temporary build directory instead of modifying package directory
-        build_include_dir = os.path.join(self.build_lib, 'deep_gemm/include')
+        build_include_dir = os.path.join(self.build_lib, "deep_gemm/include")
         os.makedirs(build_include_dir, exist_ok=True)
 
         # Copy third-party includes to the build directory
         for d in third_party_include_dirs:
-            dirname = d.split('/')[-1]
+            dirname = d.split("/")[-1]
             src_dir = os.path.join(current_dir, d)
             dst_dir = os.path.join(build_include_dir, dirname)
 
@@ -175,15 +242,15 @@ class CustomBuildPy(build_py):
 
 class CachedWheelsCommand(_bdist_wheel):
     def run(self):
-        if DG_FORCE_BUILD or DG_USE_LOCAL_VERSION:
+        if IS_ROCM or DG_FORCE_BUILD or DG_USE_LOCAL_VERSION:
             return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()
-        print(f'Try to download wheel from URL: {wheel_url}')
+        print(f"Try to download wheel from URL: {wheel_url}")
         # noinspection PyBroadException
         try:
             with urllib.request.urlopen(wheel_url, timeout=1) as response:
-                with open(wheel_filename, 'wb') as out_file:
+                with open(wheel_filename, "wb") as out_file:
                     data = response.read()
                     out_file.write(data)
 
@@ -191,32 +258,38 @@ class CachedWheelsCommand(_bdist_wheel):
             if not os.path.exists(self.dist_dir):
                 os.makedirs(self.dist_dir)
             impl_tag, abi_tag, plat_tag = self.get_tag()
-            archive_basename = f'{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}'
-            wheel_path = os.path.join(self.dist_dir, archive_basename + '.whl')
+            archive_basename = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
+            wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
             os.rename(wheel_filename, wheel_path)
         except (urllib.error.HTTPError, urllib.error.URLError):
-            print('Precompiled wheel not found. Building from source...')
+            print("Precompiled wheel not found. Building from source...")
             # If the wheel could not be downloaded, build from source
             super().run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    print("Building DeepGEMM for ROCm/HIP" if IS_ROCM else "Building DeepGEMM for CUDA")
     # noinspection PyTypeChecker
     setuptools.setup(
-        name='deep_gemm',
+        name="deep_gemm",
         version=get_package_version(),
-        packages=find_packages('.'),
+        packages=find_packages(".") + (["uni_symm"] if IS_ROCM else []),
+        package_dir={"uni_symm": "third-party/uni_symm/uni_symm"} if IS_ROCM else {},
         package_data={
-            'deep_gemm': [
-                'include/deep_gemm/**/*',
-                'include/cute/**/*',
-                'include/cutlass/**/*',
+            "deep_gemm": [
+                "include/deep_gemm/**/*",
+                "include/cute/**/*",
+                "include/cutlass/**/*",
+                "include/uni_symm/**/*",
             ]
+        },
+        exclude_package_data={
+            "deep_gemm": ["**/*_hip.cuh", "**/*_hip.hpp", "**/*_hip.cpp"]
         },
         ext_modules=get_ext_modules(),
         zip_safe=False,
         cmdclass={
-            'build_py': CustomBuildPy,
-            'bdist_wheel': CachedWheelsCommand,
+            "build_py": CustomBuildPy,
+            "bdist_wheel": CachedWheelsCommand,
         },
     )
