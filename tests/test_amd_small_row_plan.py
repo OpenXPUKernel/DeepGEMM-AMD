@@ -1,4 +1,5 @@
 """Explicit plan lookup, precedence and graph replay on AMD GPU."""
+
 import pytest
 import torch
 
@@ -20,8 +21,10 @@ def matrices(monkeypatch):
 
 def test_exact_key_and_graph_replay(monkeypatch, matrices):
     a, b, output = matrices
-    monkeypatch.setenv("DG_CDNA4_GEMM_TUNE_MAP",
-                      "1320,128,1024,2,2,0=invalid;320,128,1024,2,2,0=2,2,2,4")
+    monkeypatch.setenv(
+        "DG_CDNA4_GEMM_TUNE_MAP",
+        "1320,128,1024,2,2,0=invalid;320,128,1024,2,2,0=2,2,2,4",
+    )
     deep_gemm.bf16_gemm_nt(a, b, output)
     assert torch.equal(output, (a.float() @ b.float().T).bfloat16())
     graph = torch.cuda.CUDAGraph()
