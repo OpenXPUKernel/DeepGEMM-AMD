@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <stdexcept>
 
 #include "deep_gemm/impls/cdna4/gemm_args.h"
 
@@ -58,7 +59,8 @@ inline int plan_splits(const int m, const int n, const int k, const int compute_
         return 0;
     const auto tiles = int64_t(ceil_div(m, 256)) * ceil_div(n, 256);
     const int k_tiles = ceil_div(k, 128);
-    int splits = 2 * tiles > compute_units ? 1 : std::min(static_cast<int>(compute_units / tiles), k_tiles / 2);
+    int splits =
+        2 * tiles > compute_units ? 1 : std::min(static_cast<int>(compute_units / tiles), k_tiles / 2);
     while (splits > 1 && splits * double(m) * n * 8 / 5e12 + 5e-6 > 10.5e-9 * k * (1 - 1.0 / splits))
         --splits;
     splits = std::clamp(splits, 1, k_tiles);
@@ -118,12 +120,59 @@ inline bool small_m_eligible(const int rows, const int n, const int k, const int
 }
 
 // The planners take k = 128 x the K steps: K, or 2 K with BF16 operands (64 K values per step).
-inline int planner_k(const int k, const OperandType a_type) { return a_type == OperandType::Bf16 ? 2 * k : k; }
+inline int planner_k(const int k, const OperandType a_type) {
+    return a_type == OperandType::Bf16 ? 2 * k : k;
+}
 
-inline KernelConfig get_best_config(const int m, const int n, const int k, const int out_dtype, const bool has_c,
-                                    const int ldd, const bool d_aligned16, const int mn_major = 0,
-                                    const int scale_gran_128 = 0, const OperandType a_type = OperandType::Fp8,
+inline KernelConfig get_best_config(const int m, const int n, const int k, const int out_dtype,
+                                    const bool has_c, const int ldd, const bool d_aligned16,
+                                    const int mn_major = 0, const int scale_gran_128 = 0,
+                                    const OperandType a_type = OperandType::Fp8,
                                     const OperandType b_type = OperandType::Fp8) {
+    // Explicit experimental plan for normal, small-row matrices. The tiled
+    // scheduler retains masked M tails; the default path is unchanged.
+    const char *plan = std::getenv("DG_CDNA4_GEMM_TUNE");
+    std::string selected_plan;
+    if (!plan && !has_c) {
+        if (const char *table = std::getenv("DG_CDNA4_GEMM_TUNE_MAP")) {
+            const std::string entries(table);
+            if (entries.size() > 32768)
+                throw std::invalid_argument("DG_CDNA4_GEMM_TUNE_MAP is too long");
+            const std::string key = std::to_string(m) + "," + std::to_string(n) + "," + std::to_string(k) + "," +
+                std::to_string(static_cast<int>(a_type)) + "," + std::to_string(static_cast<int>(b_type)) + "," +
+                std::to_string(out_dtype) + "=";
+            auto pos = entries.find(key);
+            while (pos != std::string::npos && pos != 0 && entries[pos - 1] != ';')
+                pos = entries.find(key, pos + 1);
+            if (pos != std::string::npos) {
+                const auto start = pos + key.size();
+                selected_plan = entries.substr(start, entries.find(';', start) - start);
+                plan = selected_plan.c_str();
+            }
+        }
+    }
+    if (plan) {
+        if (m > 0 && m <= 512 && mn_major == 0 && std::string(plan) != "off") {
+            int fm = 0, nf = 0, depth = 0, waves = 0;
+            char tail = 0;
+            if (std::sscanf(plan, "%d,%d,%d,%d%c", &fm, &nf, &depth, &waves, &tail) != 4 ||
+                !(fm == 1 || fm == 2 || fm == 4 || fm == 8) ||
+                !(nf == 1 || nf == 2 || nf == 4) || depth < 1 || depth > 4 ||
+                !(waves == 1 || waves == 2 || waves == 4) ||
+                waves * (16 * fm) * (16 * nf + 4) * 4 > 65536)
+                throw std::invalid_argument("invalid DG_CDNA4_GEMM_TUNE FM,NF,DEPTH,WAVES");
+            KernelConfig config{KernelVariant::mfma_16x16x128_small_m};
+            config.a_type = a_type;
+            config.b_type = b_type;
+            config.scale_gran_128 = scale_gran_128;
+            config.block_m = 16 * fm;
+            config.block_n = 16 * nf;
+            config.depth = depth;
+            config.waves = waves;
+            config.k_tail = k % 128 != 0;
+            return config;
+        }
+    }
     if (small_m_eligible(m, n, k, mn_major)) {
         auto config = get_small_m_config(m, n, k, scale_gran_128);
         config.a_type = a_type;
@@ -145,8 +194,8 @@ inline KernelConfig get_best_config(const int m, const int n, const int k, const
 }
 
 // m-grouped GEMMs (contiguous, PSUM and masked layouts; masked layouts may accumulate into FP32)
-inline KernelConfig get_m_grouped_config(const GemmType type, const int k, const int ldd, const bool d_aligned16,
-                                         const int mn_major, const int scale_gran_128,
+inline KernelConfig get_m_grouped_config(const GemmType type, const int k, const int ldd,
+                                         const bool d_aligned16, const int mn_major, const int scale_gran_128,
                                          const int out_dtype = MXFP8_OUT_BF16, const bool has_c = false) {
     KernelConfig config{KernelVariant::mfma_16x16x128_data_parallel};
     config.type = type;
