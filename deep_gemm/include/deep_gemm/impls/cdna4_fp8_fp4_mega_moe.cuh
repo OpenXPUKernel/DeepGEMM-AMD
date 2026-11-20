@@ -1,8 +1,8 @@
 #pragma once
-#include <deep_gemm/impls/cdna4_mega_moe_gemm.cuh>
 #include <deep_gemm/impls/cdna4_mega_moe_epilogue.cuh>
-#include <deep_gemm/scheduler/cdna4_mega_moe.cuh>
+#include <deep_gemm/impls/cdna4_mega_moe_gemm.cuh>
 #include <deep_gemm/layout/cdna4_mega_moe.cuh>
+#include <deep_gemm/scheduler/cdna4_mega_moe.cuh>
 
 namespace resident_moe {
 __device__ __forceinline__ void record_phase(const MegaMoeKernelArgs &q, int phase) {
@@ -201,11 +201,8 @@ __device__ __forceinline__ void run_gather_actor(const MegaMoeKernelArgs &q, int
         const int index = __builtin_amdgcn_readfirstlane(job[0]);
         if (index >= q.state[BlockCount])
             break;
-        ;
-        gather<H>(q, index);
 
-        ;
-        ;
+        gather<H>(q, index);
     }
     // In the metadata-first policy, make row maps available before this
     // actor starts sending its source packets. Matrix consumers retain the
@@ -234,38 +231,75 @@ __device__ __forceinline__ void run(const MegaMoeKernelArgs &q) {
     }
     // Route stores on every CU must precede the system release in the leader.
 
-    ;
-    ;
-    grid_sync(q, epoch + 1u);
-    record_phase(q, 1);
-    ;
-    ;
-
-    if (blockIdx.x == 0)
-        mega_moe_barrier_impl<true>(p);
-    grid_sync_control(q, epoch + 2u);
-    record_phase(q, 2);
-    ;
-    ;
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        int count = 0, routed = 0;
-        // Shared input is already local and needs only scale-layout preparation.
-        // Admit it early so its wider FP8 weights do not form a final drain wave
-        // after most routed compute actors have become idle.
-        for (int row = 0; row < q.shared_tokens; row += M)
-            q.blocks[count++] = {0, row, min(row + M, q.shared_tokens), 1};
-        const auto *ends = region<const int>(p, p.layout.psum_ends);
-        {
-            for (int e = 0; e < p.layout.num_experts_per_rank; ++e) {
-                const int start = expert_start(ends, e, p.layout.alignment), end = ends[e];
-                for (int row = start; row < end; row += M) {
-                    q.blocks[count++] = {e, row, min(row + M, end), 0};
-                    ++routed;
-                }
-            }
+    // Only the metadata producer needs route counts at this point. All other
+    // workgroups wait at the task-table publication below, avoiding an
+    // all-to-all scan of the same arrival flags.
+    fence_release<Scope::system>();
+    __syncthreads();
+    auto *route_flags = reinterpret_cast<uint32_t *>(q.k_ready);
+    if (threadIdx.x == 0)
+        store_release<Scope::system>(route_flags + blockIdx.x, epoch + 1u);
+    __syncthreads();
+    if (blockIdx.x == 0) {
+        for (int peer = threadIdx.x; peer < int(gridDim.x); peer += blockDim.x) {
+            uint32_t observed;
+            do {
+                observed = load_relaxed<Scope::system>(route_flags + peer);
+                if (!observed || int32_t(observed - (epoch + 1u)) < 0)
+                    __builtin_amdgcn_s_sleep(4);
+            } while (!observed || int32_t(observed - (epoch + 1u)) < 0);
         }
+        __syncthreads();
+        fence_acquire<Scope::system>();
+        __syncthreads();
+    }
+    record_phase(q, 1);
 
-        q.state[BlockCount] = count;
+    if (blockIdx.x == 0) {
+        mega_moe_barrier_impl<true>(p);
+        // Only this producer consumes the count metadata before publishing
+        // the task table. Join its writers locally; readers wait at tag 3.
+        fence_release<Scope::system>();
+        asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        fence_acquire<Scope::system>();
+    }
+    record_phase(q, 2);
+
+    if (blockIdx.x == 0) {
+        const int shared_blocks = (q.shared_tokens + M - 1) / M;
+        for (int i = threadIdx.x; i < shared_blocks; i += blockDim.x)
+            q.blocks[i] = {0, i * M, min((i + 1) * M, q.shared_tokens), 1};
+        const auto *ends = region<const int>(p, p.layout.psum_ends);
+        if (p.layout.num_experts_per_rank <= 64) {
+            if (threadIdx.x < 64) {
+                const int expert = threadIdx.x;
+                const bool valid = expert < p.layout.num_experts_per_rank;
+                const int start = valid ? expert_start(ends, expert, p.layout.alignment) : 0;
+                const int end = valid ? ends[expert] : 0;
+                const int count = (end - start + M - 1) / M;
+                int inclusive = count;
+#pragma unroll
+                for (int offset = 1; offset < 64; offset *= 2) {
+                    const int previous = __shfl_up(inclusive, offset, 64);
+                    if (expert >= offset)
+                        inclusive += previous;
+                }
+                const int base = shared_blocks + inclusive - count;
+                for (int i = 0; i < count; ++i)
+                    q.blocks[base + i] = {expert, start + i * M, min(start + (i + 1) * M, end), 0};
+                const int total = __shfl(inclusive, 63, 64);
+                if (expert == 0)
+                    q.state[BlockCount] = shared_blocks + total;
+            }
+        } else if (threadIdx.x == 0) {
+            int count = shared_blocks;
+            for (int expert = 0; expert < p.layout.num_experts_per_rank; ++expert) {
+                const int start = expert_start(ends, expert, p.layout.alignment), end = ends[expert];
+                for (int row = start; row < end; row += M)
+                    q.blocks[count++] = {expert, row, min(row + M, end), 0};
+            }
+            q.state[BlockCount] = count;
+        }
     }
     grid_sync_control(q, epoch + 3u);
     record_phase(q, 3);
@@ -277,7 +311,6 @@ __device__ __forceinline__ void run(const MegaMoeKernelArgs &q) {
         // Coarse M-tile tasks keep both GEMMs on the same workgroup. Different
         // row tiles still overlap gather, first GEMM, second GEMM and peer return,
         // but avoid a global atomic queue operation for every 256-column slice.
-        const int workers = gridDim.x;
 
         for (;;) {
             if (threadIdx.x == 0) {
@@ -333,9 +366,6 @@ __device__ __forceinline__ void run(const MegaMoeKernelArgs &q) {
             // before the peer barrier and reduction. Never use this policy with an
             // asynchronous row consumer or a dedicated local-to-peer return actor.
             __syncthreads();
-
-            ;
-            ;
         }
     }
     // Every peer-return writer releases its stores before the local join. Only
@@ -343,20 +373,35 @@ __device__ __forceinline__ void run(const MegaMoeKernelArgs &q) {
     // retains coherent system-scope payload reads after the peer barrier.
 
     constexpr unsigned final_offset = 0;
-    ;
-    ;
-    grid_sync<true, (1)>(q, epoch + 4u + final_offset);
-    record_phase(q, 4);
-    ;
-    ;
-    if (blockIdx.x == 0)
+
+    // All coherent result stores must complete before this workgroup arrives.
+    // The last arriving workgroup performs the peer barrier; other workgroups
+    // wait on one committed epoch instead of scanning every writer's flag.
+    asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)\n\ts_barrier" ::: "memory");
+    if (threadIdx.x == 0)
+        job[0] = atomic_add_release<Scope::system>(q.state + SecondDone, 1);
+    __syncthreads();
+    auto *committed = reinterpret_cast<uint32_t *>(q.k_ready) + ControlRelayWord;
+    const uint32_t completed_epoch = epoch + 5u + final_offset;
+    if (job[0] == int(gridDim.x) - 1) {
+        fence_acquire<Scope::system>();
+        __syncthreads();
         mega_moe_barrier_impl<false>(p);
-    // The preceding writer join already acquired the local shared payload.
-    // Routed reduction uses system-coherent reads after the peer barrier.
-    grid_sync_control<false>(q, epoch + 5u + final_offset);
+        fence_release<Scope::system>();
+        __syncthreads();
+        if (threadIdx.x == 0)
+            store_release<Scope::system>(committed, completed_epoch);
+    } else if (threadIdx.x == 0) {
+        while (load_relaxed<Scope::system>(committed) != completed_epoch)
+            __builtin_amdgcn_s_sleep(4);
+    }
+    __syncthreads();
+    fence_acquire<Scope::system>();
+    __syncthreads();
+    // These two diagnostic markers now both follow the combined completion.
+    record_phase(q, 4);
     record_phase(q, 5);
-    ;
-    ;
+
     moe_pointwise::reduce<H, TopK>(p);
     record_phase(q, 6);
 

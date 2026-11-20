@@ -1,6 +1,7 @@
-// Fixed-contract Q-up specialization; all other shapes use the general GEMM API.
-#include <hip/hip_runtime.h>
+// Fixed-contract Q-up specialization with buffer-bounded row tails.
+// Full N tiles and immutable weight-scale blocks retain the original contract.
 #include <deep_gemm/impls/cdna4/selected_q_up_args.h>
+#include <hip/hip_runtime.h>
 #if defined(__HIP_DEVICE_COMPILE__)
 #include <deep_gemm/impls/cdna4/selected_q_up_core.cuh>
 #endif
@@ -19,8 +20,11 @@ __global__ __launch_bounds__(256) void q_up(SelectedQUpArgs p) {
 
 extern "C" int qu_launch(int mode, const void *a, const void *b, const int *sa, const int *sb, void *d, int m, int n,
                          int k, int sap, int sbp, int ldd, void *stream) {
-    if (mode != 61 || !a || !b || !sa || !sb || !d || m < 1 || m > 1536 || m % 256 || (n != 32768 && n != 36864) ||
-        k != 1280 || ldd != n || sap < m || sbp < n || reinterpret_cast<uintptr_t>(d) % 16)
+    if (mode != 61 || !a || !b || !sa || !sb || !d || m < 1 || m > 1536 || (n != 32768 && n != 36864) || k != 1280 ||
+        ldd != n || sap < m || sbp < n || (uint64_t(9) * sap + m) * 4 >= (uint64_t(1) << 32) ||
+        (uint64_t(9) * sbp + n) * 4 >= (uint64_t(1) << 32) || reinterpret_cast<uintptr_t>(a) % 16 ||
+        reinterpret_cast<uintptr_t>(b) % 16 || reinterpret_cast<uintptr_t>(sa) % 4 ||
+        reinterpret_cast<uintptr_t>(sb) % 4 || reinterpret_cast<uintptr_t>(d) % 16)
         return hipErrorInvalidValue;
     int device = 0;
     auto status = hipGetDevice(&device);
@@ -48,3 +52,5 @@ extern "C" int qu_launch(int mode, const void *a, const void *b, const int *sa, 
                        args);
     return hipGetLastError();
 }
+
+extern "C" int qu_row_tails_supported() { return 1; }

@@ -76,8 +76,10 @@ __device__ __forceinline__ void best_two(const float (&v)[EV], uint32_t consumed
 }
 
 // EV experts per lane (64 EV >= routed experts); BIASED: ranking by score + bias, else by logit
-template <int EV, bool BIASED> __device__ __forceinline__ void mega_gate_impl(const MegaGateArgs &p) {
-    const int lane = threadIdx.x % 64, waves = blockDim.x / 64;
+template <int EV, bool BIASED>
+__device__ __forceinline__ void mega_gate_impl(const MegaGateArgs &p, const float *staged_logits = nullptr,
+                                               int active_threads = 0) {
+    const int lane = threadIdx.x % 64, waves = (active_threads ? active_threads : int(blockDim.x)) / 64;
     const int k = p.num_topk, slots = p.num_topk + p.num_shared_experts, num_experts = p.num_routed_experts;
     constexpr uint32_t kInvalid = 0xffffffffu;
     constexpr int VEC = EV % 4 == 0 ? 4 : EV % 2 == 0 ? 2 : 1;
@@ -91,8 +93,9 @@ template <int EV, bool BIASED> __device__ __forceinline__ void mega_gate_impl(co
     }
 
     for (int token = blockIdx.x * waves + threadIdx.x / 64; token < p.num_tokens; token += gridDim.x * waves) {
-        const float *row = p.logits + (int64_t)token * p.ld_logits;
-        float value[EV];
+        const float *row =
+            staged_logits ? staged_logits + (threadIdx.x / 64) * num_experts : p.logits + (int64_t)token * p.ld_logits;
+        float value[EV] = {};
         if (lane_valid) {
 #pragma unroll
             for (int v = 0; v < EV; v += VEC) {
@@ -195,4 +198,33 @@ template <int EV, bool BIASED> __device__ __forceinline__ void mega_gate_impl(co
         const float sum = wave_reduce<false>(score) + 1e-20f;
         store(physical, lane < k ? score / sum * p.routed_scaling_factor : 1.f, selected);
     }
+}
+
+// Two waves reduce each token's experts, preserving the original vector-add
+// order. The first two waves then select the two tokens from disjoint LDS rows.
+// This keeps the reduction parallelism instead of serializing eight logits in
+// each selection lane, and removes the global logits write/read boundary.
+template <int EV, bool BIASED, int SPLITS> __device__ __forceinline__ void mega_gate_split_impl(const MegaGateArgs &p) {
+    static_assert(SPLITS > 1);
+    __shared__ float reduced[2 * 512];
+    const int local_row = threadIdx.x / 128;
+    const int token = blockIdx.x * 2 + local_row;
+    const int expert = (threadIdx.x % 128) * 4;
+    if (token < p.num_tokens && expert < p.num_routed_experts) {
+        const int64_t stride = int64_t(p.num_tokens) * p.ld_logits;
+        const float *input = p.logits + int64_t(token) * p.ld_logits + expert;
+        float4 value = *reinterpret_cast<const float4 *>(input);
+#pragma unroll 1
+        for (int split = 1; split < SPLITS; ++split) {
+            const float4 next = *reinterpret_cast<const float4 *>(input + split * stride);
+            value.x += next.x;
+            value.y += next.y;
+            value.z += next.z;
+            value.w += next.w;
+        }
+        *reinterpret_cast<float4 *>(reduced + local_row * p.num_routed_experts + expert) = value;
+    }
+    __syncthreads();
+    if (threadIdx.x < 128)
+        mega_gate_impl<EV, BIASED>(p, reduced, 128);
 }

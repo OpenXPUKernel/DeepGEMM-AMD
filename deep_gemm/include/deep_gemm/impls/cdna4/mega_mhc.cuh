@@ -223,9 +223,12 @@ __device__ __forceinline__ int64_t shared_sf_row(int token, int block_m) {
 // order and the quad adds its lanes in a fixed butterfly (an order set by the split count alone),
 // then the RMS scaling of new_residual, the sigmoids (lane k: previous and post mix k) and the
 // Sinkhorn normalization of the 4 x 4 combination (lane k: row k, columns over the quad)
-__device__ __forceinline__ void mega_mhc_mix_impl(const MegaMhcArgs &p) {
+__device__ __forceinline__ void mega_mhc_mix_impl(const MegaMhcArgs &p, int logical_block = -1,
+                                                  int logical_threads = -1) {
     using namespace mega_mhc;
-    const int thread = blockIdx.x * blockDim.x + threadIdx.x, k = thread % ROUTES;
+    const int block = logical_block < 0 ? int(blockIdx.x) : logical_block;
+    const int threads = logical_threads < 0 ? int(blockDim.x) : logical_threads;
+    const int thread = block * threads + threadIdx.x, k = thread % ROUTES;
     const int token = min(thread / ROUTES, p.num_tokens - 1);
     const size_t task0 = (size_t)(token / BM) * p.splits;
     const int r = token % BM;
@@ -314,7 +317,9 @@ __device__ __forceinline__ void mega_mhc_mix_impl(const MegaMhcArgs &p) {
 }
 
 // CHUNKS = hidden / 1024: thread t owns hidden 4 (t + 256 c) .. + 3 of chunk c
-template <bool SHIFTED, int CHUNKS> __device__ __forceinline__ void mega_mhc_norm_impl(const MegaMhcArgs &p) {
+template <bool SHIFTED, int CHUNKS>
+__device__ __forceinline__ void mega_mhc_norm_impl(const MegaMhcArgs &p, int logical_block = -1,
+                                                   int logical_grid = -1) {
     using namespace mega_mhc;
     __shared__ float wave_sums[2][4];
     const int tid = threadIdx.x, lane = tid % 64, wave = tid / 64, H = p.hidden;
@@ -342,11 +347,13 @@ template <bool SHIFTED, int CHUNKS> __device__ __forceinline__ void mega_mhc_nor
                               : *(const v2u *)(p.new_residual + ((size_t)token * ROUTES + j) * H + 4 * (tid + 256 * c));
     };
     v2u in[INPUTS][CHUNKS];
-    load_input(blockIdx.x, in);
+    const int block = logical_block < 0 ? int(blockIdx.x) : logical_block;
+    const int grid = logical_grid < 0 ? int(gridDim.x) : logical_grid;
+    load_input(block, in);
     int parity = 0;
-    for (int token = blockIdx.x; token < p.num_tokens; token += gridDim.x, parity ^= 1) {
+    for (int token = block; token < p.num_tokens; token += grid, parity ^= 1) {
         v2u in_next[INPUTS][CHUNKS];
-        load_input(token + gridDim.x, in_next);
+        load_input(token + grid, in_next);
         // normal mHC: the new previous mix of the mix kernel weights the routes
         v4f prev = SHIFTED ? v4f{} : *(const v4f *)(p.prev_mix + token * ROUTES);
 

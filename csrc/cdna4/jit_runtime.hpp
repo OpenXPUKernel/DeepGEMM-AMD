@@ -59,8 +59,40 @@ class JitRuntime {
     // tiles: output tiles of the launch (normal GEMMs: 0, derived from the shape). Persistent
     // kernels take at most one workgroup per compute unit.
     int launch(GemmArgs &args, const KernelConfig &config, const int out_dtype, hipStream_t stream, const int num_cus,
-               int tiles = 0) {
-        const auto jit = get_gemm_module(config, out_dtype);
+               int tiles = 0, bool reduce_splits = true) {
+        std::string specialization;
+        const char *requested = std::getenv("DG_CDNA4_SPECIALIZE_GEMM");
+        if (requested && std::string(requested) == "1" && args.M > 0 && args.M <= 512 &&
+            (config.type == GemmType::Normal || config.type == GemmType::MGroupedMasked)) {
+            std::ostringstream constants;
+#define DG_SPECIALIZE_INTEGER(name) constants << "p." #name "=" << args.name << "LL;"
+            DG_SPECIALIZE_INTEGER(M);
+            DG_SPECIALIZE_INTEGER(N);
+            DG_SPECIALIZE_INTEGER(K);
+            DG_SPECIALIZE_INTEGER(lda);
+            DG_SPECIALIZE_INTEGER(ldb);
+            DG_SPECIALIZE_INTEGER(lda_sf);
+            DG_SPECIALIZE_INTEGER(ldb_sf);
+            DG_SPECIALIZE_INTEGER(ldd);
+            DG_SPECIALIZE_INTEGER(splits);
+            DG_SPECIALIZE_INTEGER(ldw);
+            DG_SPECIALIZE_INTEGER(num_groups);
+            DG_SPECIALIZE_INTEGER(group_m_slots);
+            DG_SPECIALIZE_INTEGER(a_group_stride);
+            DG_SPECIALIZE_INTEGER(b_group_stride);
+            DG_SPECIALIZE_INTEGER(sfa_group_stride);
+            DG_SPECIALIZE_INTEGER(sfb_group_stride);
+            DG_SPECIALIZE_INTEGER(d_group_stride);
+#undef DG_SPECIALIZE_INTEGER
+            if (!args.C)
+                constants << "p.C=nullptr;";
+            if (!args.moe_acts)
+                constants << "p.moe_acts=nullptr;";
+            if (!args.moe_output_rows)
+                constants << "p.moe_output_rows=nullptr;";
+            specialization = constants.str();
+        }
+        const auto jit = get_gemm_module(config, out_dtype, specialization);
         if (tiles == 0)
             tiles = ceil_div(args.M, config.block_m) * ceil_div(args.N, config.block_n);
         if (tiles == 0)
@@ -81,7 +113,7 @@ class JitRuntime {
         error = JitModule::launch_function(jit->kernels[0], dim3(grid), dim3(block), shared, stream, false, args);
         if (error != hipSuccess)
             return static_cast<int>(error);
-        if (config.variant == KernelVariant::mfma_16x16x128_split_k) {
+        if (reduce_splits && config.variant == KernelVariant::mfma_16x16x128_split_k) {
             const unsigned int bx = (args.N + 1023) / 1024;
             const unsigned int by = std::min(args.M, std::max(1, 4096 / static_cast<int>(std::max(bx, 1u))));
             error = JitModule::launch_function(jit->kernels[1], dim3(bx, by), dim3(256), 0, stream, false, args);
@@ -238,18 +270,32 @@ class JitRuntime {
         return source.str();
     }
 
-    std::shared_ptr<JitModule> get_gemm_module(const KernelConfig &config, const int out_dtype) {
+    std::shared_ptr<JitModule> get_gemm_module(const KernelConfig &config, const int out_dtype,
+                                               const std::string &specialization = "") {
         const std::string key = std::string("gemm:") + variant_name(config.variant) + ":" + std::to_string(out_dtype) +
                                 ":" + std::to_string(config.mn_major) + ":" + std::to_string(config.scale_gran_128) +
                                 ":" + type_name(config.type) + ":" + std::to_string(config.block_m) + "x" +
                                 std::to_string(config.block_n) + ":" + std::to_string(config.depth) + ":" +
                                 std::to_string(config.waves) + (config.k_tail ? ":tail" : "") + ":" +
                                 operand_name(config.a_type) + "x" + operand_name(config.b_type) + ":gm" +
-                                std::to_string(config.tile_group_m);
+                                std::to_string(config.tile_group_m) + ":specialization:" + specialization;
         std::vector<std::string> names = {"dg_cdna4_gemm"};
         if (config.variant == KernelVariant::mfma_16x16x128_split_k)
             names.push_back("dg_cdna4_reduce");
-        return get_module(key, [&] { return source_for(config, out_dtype); }, names);
+        return get_module(
+            key,
+            [&] {
+                std::string source = source_for(config, out_dtype);
+                if (!specialization.empty()) {
+                    const std::string marker = "void dg_cdna4_gemm(GemmArgs p) { ";
+                    const auto start = source.find(marker);
+                    if (start == std::string::npos)
+                        throw std::runtime_error("missing GEMM entrypoint for specialization");
+                    source.insert(start + marker.size(), specialization);
+                }
+                return source;
+            },
+            names);
     }
 
     std::shared_ptr<HipJit> runtime_for_device(int device) {

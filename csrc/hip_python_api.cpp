@@ -1,10 +1,10 @@
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include <c10/hip/HIPGuard.h>
+#include <c10/hip/HIPStream.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
-#include <c10/hip/HIPGuard.h>
-#include <c10/hip/HIPStream.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 
 #include <uni_symm/backend/hip/backend.hpp>
 #include <uni_symm/python_api.hpp>
@@ -15,9 +15,9 @@
 #include "deep_gemm/impls/cdna4/mega_gate_args.h"
 #include "deep_gemm/layout/cdna4_mega_moe.cuh"
 
+#include <array>
 #include <limits>
 #include <map>
-#include <array>
 #include <optional>
 #include <tuple>
 
@@ -520,6 +520,66 @@ void cdna4_k_grouped_fp8_gemm(const torch::Tensor &a, const OptTensor &sfa, cons
     launch_or_throw(args, config, out_dtype, d, groups * ceil_div(m, kBlockMN) * ceil_div(n, kBlockMN));
 }
 
+// Return the unchanged split-K partials so the routing kernel can perform
+// their original ordered reduction without materializing another logits tensor.
+OptTensor cdna4_bf16_gate_partials(const torch::Tensor &x, const torch::Tensor &weight) {
+    TORCH_CHECK(x.is_cuda() && weight.is_cuda() && x.dim() == 2 && weight.dim() == 2 && x.is_contiguous() &&
+                    weight.is_contiguous() && x.scalar_type() == torch::kBFloat16 &&
+                    weight.scalar_type() == torch::kBFloat16 && x.device() == weight.device() &&
+                    x.size(1) == weight.size(1),
+                "invalid BF16 gate matrices");
+    const c10::hip::HIPGuardMasqueradingAsCUDA guard(x.get_device());
+    const int m = x.size(0), n = weight.size(0), k = x.size(1);
+    if (!((m == 500 && n == 384) || (m == 400 && n == 128)) || k != 5120)
+        return std::nullopt;
+    const int cus = deep_gemm::cdna4::num_compute_units();
+    const auto config = get_best_config(m, n, deep_gemm::cdna4::planner_k(k, OperandType::Bf16), MXFP8_OUT_FP32, false,
+                                        n, true, 0, 0, OperandType::Bf16, OperandType::Bf16);
+    if (config.variant != deep_gemm::cdna4::KernelVariant::mfma_16x16x128_split_k || config.split_k <= 1)
+        return std::nullopt;
+    auto workspace = torch::empty({config.split_k, m, n}, x.options().dtype(torch::kFloat));
+    const auto lhs = operand_layout(x, "gate input", OperandType::Bf16);
+    const auto rhs = operand_layout(weight, "gate weight", OperandType::Bf16);
+    auto args = make_args(x, std::nullopt, weight, std::nullopt, workspace, nullptr, m, n, k, lhs.ld, rhs.ld, 0, 0, n);
+    args.splits = config.split_k;
+    args.ws = workspace.data_ptr<float>();
+    args.ldw = n;
+    const auto stream = c10::hip::getCurrentHIPStream(x.get_device()).stream();
+    if (const char *selected = std::getenv("DG_GATE_PARTIAL_TILE"); selected && std::string(selected) != "off") {
+        int fm = 0, nf = 0, depth = 0;
+        char tail = 0;
+        TORCH_CHECK(std::sscanf(selected, "%d,%d,%d%c", &fm, &nf, &depth, &tail) == 3 &&
+                        (fm == 1 || fm == 2 || fm == 4 || fm == 8) && (nf == 1 || nf == 2 || nf == 4) &&
+                        (depth == 1 || depth == 2),
+                    "DG_GATE_PARTIAL_TILE must be FM,NF,DEPTH");
+        const int span = ceil_div(ceil_div(k, 64), config.split_k) * 64;
+        const int last = k - (config.split_k - 1) * span;
+        TORCH_CHECK(last > 0 && last % 64 == 0, "gate partial K range must contain full BF16 steps");
+        std::ostringstream source;
+        source << "#include <deep_gemm/impls/cdna4/fp8_gemm_mfma_16x16x128_small_m.cuh>\n"
+                  "extern \"C\" __global__ __launch_bounds__(64) void gate_partials(GemmArgs p) {"
+               << "p.A += uint64_t(blockIdx.y)*" << span * 2 << ";"
+               << "p.B += uint64_t(blockIdx.y)*" << span * 2 << ";"
+               << "p.D = reinterpret_cast<float*>(p.D)+uint64_t(blockIdx.y)*" << int64_t(m) * n << ";"
+               << "p.M=" << m << ";p.N=" << n << ";p.K=(blockIdx.y==" << config.split_k - 1 << "?" << last << ":"
+               << span << ");"
+               << "p.lda=" << lhs.ld << ";p.ldb=" << rhs.ld << ";p.ldd=" << n << ";p.C=nullptr;p.alpha=1.f;"
+               << "fp8_gemm_mfma_16x16x128_small_m_impl<Mfma16x16x128SmallMConfig<" << fm << "," << nf << "," << depth
+               << ",1,0,GemmType::Normal,false,OperandType::Bf16,OperandType::Bf16>,float>(p);}";
+        const auto text = source.str();
+        const auto module = jit_runtime.get_module("gate_partials:" + text, [&] { return text; }, {"gate_partials"});
+        const int tiles = ceil_div(m, 16 * fm) * ceil_div(n, 16 * nf);
+        const unsigned lds = 16 * fm * (16 * nf + 4) * sizeof(float);
+        const int error = deep_gemm::cdna4::JitRuntime::launch_kernel(
+            module->kernels[0], args, dim3(tiles, config.split_k, 1), dim3(64, 1, 1), lds, stream);
+        TORCH_CHECK(error == 0, "tiled BF16 gate partial launch failed: ", error);
+    } else {
+        const int error = jit_runtime.launch(args, config, MXFP8_OUT_FP32, stream, cus, 0, false);
+        TORCH_CHECK(error == 0, "BF16 gate partial launch failed: ", error);
+    }
+    return workspace;
+}
+
 // MoE gate routing (mega_gate.cuh) from FP32 logits [tokens, routed experts]; the Python wrapper
 // validates the tensors and computes the logits with the BF16 GEMM
 void cdna4_mega_gate_routing(const torch::Tensor &logits, const OptTensor &bias, const OptTensor &image_bias,
@@ -529,9 +589,15 @@ void cdna4_mega_gate_routing(const torch::Tensor &logits, const OptTensor &bias,
                              const torch::Tensor &topk_idx, const torch::Tensor &topk_weights,
                              const OptTensor &unmapped_topk_idx, int num_topk, int num_shared_experts, int rank_idx,
                              double routed_scaling_factor) {
-    TORCH_CHECK(logits.dim() == 2 && logits.scalar_type() == torch::kFloat && logits.stride(1) == 1,
-                "logits must be [tokens, experts] FP32 with contiguous rows");
-    const int num_tokens = logits.size(0), num_experts = logits.size(1);
+    TORCH_CHECK((logits.dim() == 2 || logits.dim() == 3) && logits.scalar_type() == torch::kFloat &&
+                    logits.stride(-1) == 1,
+                "logits must be [tokens, experts] or [splits, tokens, experts] FP32");
+    const int num_tokens = logits.size(-2), num_experts = logits.size(-1);
+    const int splits = logits.dim() == 3 ? logits.size(0) : 1;
+    TORCH_CHECK(splits == 1 || (num_tokens <= 512 && num_experts % 4 == 0),
+                "fused gate reduction requires at most 512 tokens and complete four-expert vectors");
+    TORCH_CHECK(splits >= 1 && splits <= 80 && (logits.dim() == 2 || logits.stride(0) == num_tokens * logits.stride(1)),
+                "gate split workspace must contain consecutive row matrices");
     TORCH_CHECK(num_experts > 0 && num_experts <= 512 && num_topk > 0 && num_topk + num_shared_experts <= 32,
                 "up to 512 routed experts and 32 slots");
     const c10::hip::HIPGuardMasqueradingAsCUDA device_guard(logits.get_device());
@@ -540,7 +606,7 @@ void cdna4_mega_gate_routing(const torch::Tensor &logits, const OptTensor &bias,
     const auto ptr = [](const OptTensor &t) { return t.has_value() ? t->data_ptr() : nullptr; };
     deep_gemm::cdna4::MegaGateArgs args{};
     args.logits = logits.data_ptr<float>();
-    args.ld_logits = stride_as_int(logits, 0, "logits");
+    args.ld_logits = stride_as_int(logits, logits.dim() - 2, "logits");
     args.bias = static_cast<const float *>(ptr(bias));
     args.image_bias = static_cast<const float *>(ptr(image_bias));
     args.image_token_mask = static_cast<const std::uint8_t *>(ptr(image_token_mask));
@@ -563,18 +629,19 @@ void cdna4_mega_gate_routing(const torch::Tensor &logits, const OptTensor &bias,
                 "logits rows must be 16-byte aligned with a pitch of the experts rounded up to 4");
     const int experts_per_lane = ceil_div(num_experts, 64);
     const bool biased = bias.has_value() || image_bias.has_value();
-    const auto instance = std::to_string(experts_per_lane) + (biased ? ", true" : ", false");
+    const auto instance = std::to_string(experts_per_lane) + (biased ? ", true" : ", false") +
+                          (splits > 1 ? "," + std::to_string(splits) : "");
     const auto module = jit_runtime.get_module(
         "mega_gate:" + instance,
         [&] {
             return "#include <deep_gemm/impls/cdna4/mega_gate.cuh>\n"
                    "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_mega_gate(MegaGateArgs p) "
-                   "{ mega_gate_impl<" +
-                   instance + ">(p); }\n";
+                   "{ " +
+                   std::string(splits > 1 ? "mega_gate_split_impl<" : "mega_gate_impl<") + instance + ">(p); }\n";
         },
         {"dg_cdna4_mega_gate"}, {"-fno-honor-nans"});
-    const unsigned blocks =
-        static_cast<unsigned>(std::min(ceil_div(num_tokens, 4), 16 * deep_gemm::cdna4::num_compute_units()));
+    const unsigned blocks = static_cast<unsigned>(
+        std::min(ceil_div(num_tokens, splits > 1 ? 2 : 4), 16 * deep_gemm::cdna4::num_compute_units()));
     const auto stream = c10::hip::getCurrentHIPStream(logits.get_device()).stream();
     const int error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[0], args, dim3(blocks, 1, 1),
                                                                   dim3(256, 1, 1), 0, stream);
@@ -638,7 +705,7 @@ void cdna4_mega_mhc(const torch::Tensor &x, const torch::Tensor &residual, const
 
     const std::string mode = shifted ? "true" : "false", chunks = std::to_string(hidden / 1024);
     const auto module = jit_runtime.get_module(
-        "mega_mhc:" + mode + ":" + chunks,
+        "mega_mhc:fused_finish_v1:" + mode + ":" + chunks,
         [&] {
             return "#include <deep_gemm/impls/cdna4/mega_mhc.cuh>\n"
                    "extern \"C\" __global__ __launch_bounds__(256) void "
@@ -651,15 +718,47 @@ void cdna4_mega_mhc(const torch::Tensor &x, const torch::Tensor &residual, const
                    "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_mega_mhc_norm(MegaMhcArgs "
                    "p) "
                    "{ mega_mhc_norm_impl<" +
-                   mode + ", " + chunks + ">(p); }\n";
+                   mode + ", " + chunks +
+                   ">(p); }\n"
+                   "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_mega_mhc_finish(MegaMhcArgs p) { "
+                   "const int mix_blocks=(p.num_tokens+31)/32; "
+                   "if(int(blockIdx.x)<mix_blocks) { if(threadIdx.x<128) mega_mhc_mix_impl(p,blockIdx.x,128); } "
+                   "else mega_mhc_norm_impl<true," +
+                   chunks + ">(p,int(blockIdx.x)-mix_blocks,int(gridDim.x)-mix_blocks); }\n";
         },
-        {"dg_cdna4_mega_mhc_residual", "dg_cdna4_mega_mhc_mix", "dg_cdna4_mega_mhc_norm"});
+        {"dg_cdna4_mega_mhc_residual", "dg_cdna4_mega_mhc_mix", "dg_cdna4_mega_mhc_norm", "dg_cdna4_mega_mhc_finish"});
     const auto stream = c10::hip::getCurrentHIPStream(x.get_device()).stream();
     int error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[0], args, dim3(m_blocks, splits, 1),
                                                             dim3(256, 1, 1), 64 * 1024, stream);
     TORCH_CHECK(error == 0, "CDNA4 mega mHC residual launch failed with code ", error);
-    error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[1], args, dim3(ceil_div(num_tokens, 64), 1, 1),
-                                                        dim3(256, 1, 1), 0, stream);
+    int mix_threads = 256;
+    if (const char *requested = std::getenv("DG_MHC_MIX_THREADS")) {
+        char *end = nullptr;
+        const long parsed = std::strtol(requested, &end, 10);
+        TORCH_CHECK(end != requested && *end == '\0' && (parsed == 64 || parsed == 128 || parsed == 256),
+                    "invalid DG_MHC_MIX_THREADS");
+        mix_threads = int(parsed);
+    }
+    const char *finish_option = std::getenv("DG_MHC_FUSED_FINISH");
+    if (shifted && mix_threads == 128 && finish_option && std::string(finish_option) == "1") {
+        // Shifted normalization consumes the previous layer's mix, so it is
+        // independent of the new mix. A single grid owns disjoint token ranges
+        // for both branches and joins them before the next model operation.
+        int resident = 0;
+        TORCH_CHECK(hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&resident, module->kernels[3], 256, 0) ==
+                            hipSuccess &&
+                        resident > 0,
+                    "fused mHC finish occupancy query failed");
+        const int norm_blocks = std::min(num_tokens, resident * deep_gemm::cdna4::num_compute_units());
+        const int mix_blocks = ceil_div(num_tokens, 32);
+        error = deep_gemm::cdna4::JitRuntime::launch_kernel(
+            module->kernels[3], args, dim3(mix_blocks + norm_blocks, 1, 1), dim3(256, 1, 1), 0, stream);
+        TORCH_CHECK(error == 0, "fused mHC finish launch failed with code ", error);
+        return;
+    }
+    error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[1], args,
+                                                        dim3(ceil_div(num_tokens, mix_threads / 4), 1, 1),
+                                                        dim3(mix_threads, 1, 1), 0, stream);
     TORCH_CHECK(error == 0, "CDNA4 mega mHC mix launch failed with code ", error);
     // a token per resident workgroup at a time (each loads the next token ahead)
     int resident = 0;
@@ -955,6 +1054,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("new_residual"), py::arg("new_prev_mix"), py::arg("new_post_mix"), py::arg("new_comb_res_mix"),
           py::arg("norm_bf16"), py::arg("write_y_bf16"), py::arg("y_fp8"), py::arg("y_sf"), py::arg("y_shared_sf"),
           py::arg("shared_sf_block_m"), py::arg("workspace"), py::arg("splits"));
+    m.def("cdna4_bf16_gate_partials", &cdna4_bf16_gate_partials, py::arg("x"), py::arg("weight"));
     m.def("cdna4_mega_gate_routing", &cdna4_mega_gate_routing, py::arg("logits"), py::arg("bias"),
           py::arg("image_bias"), py::arg("image_token_mask"), py::arg("mask"), py::arg("fix_routing_mask"),
           py::arg("force_random"), py::arg("to_physical_map"), py::arg("logical_count"), py::arg("topk_idx"),

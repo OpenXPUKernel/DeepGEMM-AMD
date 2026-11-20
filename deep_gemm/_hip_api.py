@@ -1365,10 +1365,18 @@ def bf16_mega_gate(
             )
     if num_tokens == 0:
         return topk_idx, topk_weights
-    logits = torch.empty(
-        (num_tokens, align(num_experts, 4)), dtype=torch.float32, device=x.device
-    )[:, :num_experts]
-    bf16_gemm_nt(x, weight, logits)
+    logits = None
+    if (
+        os.environ.get("DG_GATE_FUSED_REDUCTION", "0") == "1"
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        logits = _backend().cdna4_bf16_gate_partials(x, weight)
+    if logits is None:
+        logits = torch.empty(
+            (num_tokens, align(num_experts, 4)), dtype=torch.float32, device=x.device
+        )[:, :num_experts]
+        bf16_gemm_nt(x, weight, logits)
     contiguous = lambda t: None if t is None else t.contiguous()
     _backend().cdna4_mega_gate_routing(
         logits,
