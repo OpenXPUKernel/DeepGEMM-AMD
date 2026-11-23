@@ -24,6 +24,7 @@ py::dict cdna4_mega_moe_layout(int num_ranks, int num_experts, int num_max_token
     d["x"] = l.x, d["x_sf"] = l.x_sf, d["topk_idx"] = l.topk_idx, d["topk_weights"] = l.topk_weights;
     d["shared_l1_sf"] = l.shared_l1_sf, d["shared_l2_acts"] = l.shared_l2_acts, d["shared_l2_sf"] = l.shared_l2_sf;
     d["l1_acts"] = l.l1_acts, d["l1_sf"] = l.l1_sf, d["l2_acts"] = l.l2_acts, d["l2_sf"] = l.l2_sf;
+    d["resident_control"] = l.barrier + deep_gemm::cdna4::kFabricBarrierBytes;
     d["positions"] = l.positions, d["send_counts"] = l.send_counts, d["psum_ends"] = l.psum_ends;
     d["l1_records"] = l.l1_records, d["record_ints"] = l.record_ints;
     d["output_rows"] = l.output_rows, d["combine"] = l.combine;

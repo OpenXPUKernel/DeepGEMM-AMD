@@ -6,6 +6,11 @@
 
 namespace deep_gemm::cdna4 {
 
+// Fixed offsets are shared by all views of one symmetric allocation. Grid
+// epochs must never overlap routed inputs, including fully aligned row counts.
+constexpr int64_t kFabricBarrierBytes = 256;
+constexpr int64_t kResidentControlBytes = 64 * 1024;
+
 // The regions of a Mega MoE symmetric buffer (byte offsets; every rank's buffer has this layout).
 // Peers write the receive counts and lists (dispatch) and the combine slots; they read the inputs.
 struct MegaMoeLayout {
@@ -63,7 +68,7 @@ inline MegaMoeLayout make_mega_moe_layout(const int num_ranks, const int num_exp
     const int64_t er = l.num_experts_per_rank, t = num_max_tokens, rows = l.max_rows;
     const int sf = with_sf ? 1 : 0, shared = shared_intermediate > 0 ? 1 : 0;
     l.record_ints = ((with_sf ? hidden / 128 : 0) + 2 + 3) / 4 * 4;
-    l.barrier = take(256);
+    l.barrier = take(kFabricBarrierBytes + kResidentControlBytes);
     l.send_counts = take(int64_t(num_experts) * 4);
     l.positions = take(t * num_topk * 4);
     l.send_lists = take(int64_t(num_experts) * t * num_topk * 4);

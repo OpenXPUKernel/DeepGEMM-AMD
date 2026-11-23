@@ -126,13 +126,7 @@ inline void launch(MegaMoeArgs p, const torch::Tensor &buffer, const torch::Tens
     q.job_ready = q.jobs + q.max_blocks * (join ? 2 : q.n2);
     auto *base = static_cast<uint8_t *>(buffer.data_ptr());
     auto ptr = [&](int64_t offset) { return base + offset; };
-    const int64_t routed = int64_t(l.num_max_tokens) * l.num_ranks * std::min(l.num_topk, l.num_experts_per_rank);
-    const int64_t last_input_row =
-        (routed + int64_t(l.num_experts_per_rank) * (l.alignment - 1)) / l.alignment * l.alignment;
-    constexpr int64_t control_bytes = 64 * 1024;
-    TORCH_CHECK(last_input_row < l.max_rows && control_bytes <= (l.max_rows - last_input_row) * l.hidden,
-                "grid epochs require a provably unused, initially-zero input tail");
-    q.k_ready = reinterpret_cast<uint64_t *>(ptr(l.l1_acts + last_input_row * l.hidden));
+    q.k_ready = reinterpret_cast<uint64_t *>(ptr(l.barrier + deep_gemm::cdna4::kFabricBarrierBytes));
     q.l1 = matrix(ptr(l.l1_acts), reinterpret_cast<int32_t *>(ptr(l.l1_sf)), w1, sf1, l1_out.data_ptr(), l.max_rows,
                   2 * l.intermediate, l.hidden, l.sf_pitch, true);
     q.l2 = matrix(ptr(l.l2_acts), reinterpret_cast<int32_t *>(ptr(l.l2_sf)), w2, sf2, l2_out.data_ptr(), l.max_rows,
