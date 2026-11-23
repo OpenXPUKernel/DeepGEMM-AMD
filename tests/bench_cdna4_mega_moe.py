@@ -12,6 +12,21 @@ import torch.multiprocessing as mp
 from test_cdna4_mega_moe import quantize_rows
 
 
+def balanced_routes(tokens, experts, topk, rank, world, phase):
+    """Stripe the global slot sequence across owners, rotating the remainder by phase."""
+    local = experts // world
+    gen = torch.Generator().manual_seed(17)
+    order = torch.stack(
+        [owner * local + torch.randperm(local, generator=gen) for owner in range(world)], dim=1
+    ).flatten()
+    slots = tokens * topk
+    offset = (phase * world + rank) * slots % experts
+    ids = order[(torch.arange(slots) + offset) % experts].view(tokens, topk)
+    # Shuffle token rows without changing any expert or destination totals.
+    gen.manual_seed(29 + rank)
+    return ids[torch.randperm(tokens, generator=gen)]
+
+
 def worker(rank, world, store, args):
     import deep_gemm
     from deep_gemm.testing.moe import reference_mega_moe
@@ -54,6 +69,14 @@ def worker(rank, world, store, args):
     scores, ids = torch.randn((args.tokens, args.experts), device="cuda").topk(
         args.topk, dim=-1
     )
+    if args.routing == "balanced":
+        ids = balanced_routes(args.tokens, args.experts, args.topk, rank, world, args.route_phase).to(ids.device)
+    counts = ids.flatten().bincount(minlength=args.experts).cpu()
+    dist.all_reduce(counts)
+    owner_counts = counts.view(world, local).sum(dim=1)
+    if args.routing == "balanced":
+        assert counts.max() - counts.min() <= 1
+        assert (owner_counts == args.tokens * args.topk).all()
     buffer.topk_idx[: args.tokens].copy_(ids)
     buffer.topk_weights[: args.tokens].copy_(scores.softmax(-1))
     y = torch.empty_like(x, dtype=torch.bfloat16)
@@ -64,8 +87,10 @@ def worker(rank, world, store, args):
     def run():
         deep_gemm.fp8_fp4_mega_moe(y, l1, l2, buffer, **kwargs)
 
-    run()
+    received = torch.zeros(local, dtype=torch.int32, device=x.device)
+    deep_gemm.fp8_fp4_mega_moe(y, l1, l2, buffer, cumulative_local_expert_recv_stats=received, **kwargs)
     torch.cuda.synchronize()
+    assert torch.equal(received.cpu().long(), counts.narrow(0, rank * local, local))
     assert torch.equal(y, expected)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -102,6 +127,11 @@ def worker(rank, world, store, args):
                     experts=args.experts,
                     topk=args.topk,
                     shared_experts=1,
+                    routing=args.routing,
+                    route_phase=args.route_phase,
+                    min_rows_per_expert=int(counts.min()),
+                    max_rows_per_expert=int(counts.max()),
+                    rows_per_rank=owner_counts.tolist(),
                 )
             )
         )
@@ -112,6 +142,8 @@ def worker(rank, world, store, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ranks", type=int, default=torch.cuda.device_count())
+    parser.add_argument("--routing", choices=("random", "balanced"), default="random")
+    parser.add_argument("--route-phase", type=int, default=0, help="Rotate the balanced remainder between benchmark invocations.")
     for name, default in (
         ("tokens", 512),
         ("hidden", 1024),
@@ -126,6 +158,10 @@ def main():
     args = parser.parse_args()
     if args.ranks < 1 or args.experts % args.ranks:
         parser.error("experts must divide evenly across a positive number of ranks")
+    if args.tokens < 1 or not 1 <= args.topk <= args.experts:
+        parser.error("tokens must be positive and topk must be between one and the number of experts")
+    if args.route_phase < 0 or (args.route_phase and args.routing != "balanced"):
+        parser.error("a nonzero route phase requires balanced routing and a positive phase")
     with tempfile.TemporaryDirectory() as folder:
         mp.spawn(
             worker,
