@@ -159,3 +159,16 @@ def test_configured_decode_batch_preserves_gate_routes(batch, positions, experts
     monkeypatch.setenv("DG_GATE_FUSED_REDUCTION", "1")
     actual = deep_gemm.bf16_mega_gate(x, weight, **args)
     assert all(_equal(a, b) for a, b in zip(actual, reference))
+
+def test_resident_epoch_storage_is_disjoint_for_aliasing_shapes():
+    from deep_gemm import _C
+
+    offsets = set()
+    for capacity in (500, 520, 620, 652, 750, 864):
+        for experts, topk in ((512, 6), (256, 3)):
+            layout = _C.cdna4_mega_moe_layout(8, experts, capacity, topk, 5120, 2304, 2304, True)
+            control = layout["resident_control"]
+            offsets.add(control)
+            assert control >= 256 and control % 256 == 0
+            assert control + 65536 <= min(layout["send_counts"], layout["x"], layout["l1_acts"])
+    assert len(offsets) == 1
