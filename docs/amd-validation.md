@@ -58,3 +58,7 @@ and writable cache with `tests/test_cdna4_jit.py`.
 ### Ordered expert returns
 
 The native reducer and the independent serial oracle can produce different BF16 words in the optional shared-expert stress case with hidden size 5120 and intermediate size 2304. Comparing the original resident reduction and the wave-slot reduction on identical inputs produced bitwise identical native outputs. The routed return words, routed activations and scales, and the shared intermediate activations and scales matched the independent reference. Zeroing the shared down-projection weights removed the final discrepancy. The test retains its strict bitwise assertion for this case.
+
+### Balanced synthetic routes
+
+Run `python tests/bench_cdna4_mega_moe.py --ranks 8 --routing balanced` to distribute the same number of routed rows to every rank. Experts receive equal counts when the total number of slots is divisible by the expert count. Otherwise the counts differ by one. Each token still selects distinct experts. Successive values of `--route-phase` rotate which experts receive the extra rows. The benchmark reports the observed per-expert range and per-rank totals and checks the complete output against the reference before and after timing.
