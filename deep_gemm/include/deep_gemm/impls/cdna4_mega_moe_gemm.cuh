@@ -34,7 +34,20 @@ __device__ __forceinline__ void pipeline_native_tile(deep_gemm::cdna4::GemmArgs 
     constexpr int WM_ROWS = MappedRows / (TileColumns == 512 ? 1 : 2), MF = WM_ROWS / 32;
     static_assert(MF > 0, "every native matrix wave requires a complete row fragment");
 
-    constexpr int NF = 4;
+    // On short single panels, each wave computes the same 64 rows and
+    // distinct 64-column strips. Keep the 128-row external buffer layout.
+#ifdef CDNA4_SHORT_COLUMN_WAVES
+#ifdef CDNA4_MOE_PACKED_EPILOGUE
+    constexpr bool packed_output = First && (CDNA4_MOE_PACKED_EPILOGUE & 1);
+#else
+    constexpr bool packed_output = false;
+#endif
+    constexpr bool short_columns = RowCap == 64 && TileColumns == 256 && PackedB && WeightPanels && !packed_output &&
+                                   (CDNA4_SHORT_COLUMN_WAVES & (First ? 1 : 2));
+#else
+    constexpr bool short_columns = false;
+#endif
+    constexpr int NF = short_columns ? 2 : 4;
     constexpr int AL = BM / (32), BL = (BN / (PackedB ? 64 : 32));
     constexpr int BROW = PackedB ? 64 : 128, BSTRIDE = PackedB ? K / 2 : K;
     // Each wave owns its scale DMA destinations, including unused dummy rows.
@@ -49,8 +62,8 @@ __device__ __forceinline__ void pipeline_native_tile(deep_gemm::cdna4::GemmArgs 
     static_assert((EPI > BM * PITCH ? EPI : BM * PITCH) <= 163840);
     extern __shared__ __attribute__((aligned(1024))) uint8_t sm[];
     const int tid = threadIdx.x, lane = tid % 64, wave = __builtin_amdgcn_readfirstlane(tid / 64);
-    const int wm = ((TileColumns == 512) ? wave / 4 : wave / 2);
-    const int wn = ((TileColumns == 512) ? wave % 4 : wave % 2), r = lane % 32, g = lane / 32;
+    const int wm = short_columns ? 0 : ((TileColumns == 512) ? wave / 4 : wave / 2);
+    const int wn = short_columns ? wave : ((TileColumns == 512) ? wave % 4 : wave % 2), r = lane % 32, g = lane / 32;
     const int ar = 8 * wave + lane / 8, br = PackedB ? 16 * wave + lane / 4 : 8 * wave + lane / 8;
     const int bkey_dma = PackedB ? ((br >> 2) & 3) : ((br >> 1) & 7);
     const int brow = (r);
@@ -62,7 +75,7 @@ __device__ __forceinline__ void pipeline_native_tile(deep_gemm::cdna4::GemmArgs 
 #endif
     const int bv = br * (WeightPanels || dense_panel ? BROW : BSTRIDE) + ((lane % (PackedB ? 4 : 8)) ^ bkey_dma) * 16;
     const int sv = (wave * 64 + lane) * 4, sa_v = sv;
-    constexpr int NPerWave = ((TileColumns == 512) ? 128 : (BN / 2)), PanelStep = PairStride ? PairStride : 1;
+    constexpr int NPerWave = short_columns ? 64 : ((TileColumns == 512) ? 128 : (BN / 2)), PanelStep = PairStride ? PairStride : 1;
     constexpr int SpanN = PairStride ? (PairStride + 1) * 256 : BN;
     const int aoff = AO + (wm * WM_ROWS + r) * 128, boff = BO + (wn * NPerWave + brow) * BROW;
     const int akey = (r >> 1) & 7, bkey = PackedB ? ((r >> 2) & 3) : ((r >> 1) & 7);
