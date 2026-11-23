@@ -9,6 +9,7 @@
 #include <uni_symm/backend/hip/backend.hpp>
 #include <uni_symm/python_api.hpp>
 
+#include "cdna4/decode_batch.hpp"
 #include "cdna4/jit_runtime.hpp"
 #include "cdna4/mqa_logits.hpp"
 #include "deep_gemm/impls/cdna4/gemm_args.h"
@@ -278,11 +279,11 @@ void cdna4_fp8_gemm_nt(const torch::Tensor &a, const std::optional<torch::Tensor
 
     const bool decode_out = n == 5120 && k == 8192;
     const bool decode_qswa = n == 1792 && k == 5120;
-    if (!reference_plan && (decode_out || decode_qswa) && (m == 400 || m == 500) && a_type == OperandType::Fp8 &&
+    if (!reference_plan && (decode_out || decode_qswa) && (deep_gemm::cdna4::decode_batch_rows(m, 4) || deep_gemm::cdna4::decode_batch_rows(m, 5)) && a_type == OperandType::Fp8 &&
         b_type == OperandType::Fp8 && !lhs.mn_major && !rhs.mn_major && !c && alpha == 1.0 && gran_k_a == 32 && gran_k_b == 32 &&
         out_dtype == MXFP8_OUT_BF16) {
         const char *tile = std::getenv(decode_out ? "DG_CDNA4_LOCAL_OUT_TILE" : "DG_CDNA4_LOCAL_QSWA_TILE");
-        if (decode_out && m == 400) {
+        if (decode_out && deep_gemm::cdna4::decode_batch_rows(m, 4)) {
             if (const char *draft_tile = std::getenv("DG_CDNA4_DRAFT_OUT_TILE"))
                 tile = draft_tile;
         }
@@ -503,7 +504,7 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor &a, const OptTensor &sf
                 "masked GEMM shape mismatch");
     if (output_sf) {
         TORCH_CHECK(d.scalar_type() == at::kFloat8_e4m3fn && !c && alpha == 1.0 && !bf16 && groups == 8 && n == 1024 && k == 4096 &&
-                        expected_m == max_m && (max_m == 400 || max_m == 500) && d.stride(0) == n && d.stride(1) == groups * n &&
+                        expected_m == max_m && (deep_gemm::cdna4::decode_batch_rows(max_m, 4) || deep_gemm::cdna4::decode_batch_rows(max_m, 5)) && d.stride(0) == n && d.stride(1) == groups * n &&
                         output_sf->device() == device && output_sf->scalar_type() == torch::kInt32 && output_sf->dim() == 2 &&
                         output_sf->size(0) == max_m && output_sf->size(1) == groups * n / 128 && output_sf->stride(0) == 1 &&
                         output_sf->stride(1) >= max_m && output_sf->stride(1) <= INT32_MAX,

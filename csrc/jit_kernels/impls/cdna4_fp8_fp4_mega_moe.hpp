@@ -1,4 +1,6 @@
 #pragma once
+
+#include "cdna4/decode_batch.hpp"
 #include <torch/extension.h>
 #include <c10/hip/HIPStream.h>
 #include <sstream>
@@ -200,7 +202,7 @@ inline void launch(MegaMoeArgs p, const torch::Tensor &buffer, const torch::Tens
             code << "#define CDNA4_TRACE_MIN_POSITION " << lo << "\n#define CDNA4_TRACE_MAX_POSITION " << hi << "\n";
         }
     }
-    if (const char *plan = std::getenv("DG_MEGA_MOE_TAIL_GROUPS"); p.num_tokens == 500 && plan && std::string(plan) != "0") {
+    if (const char *plan = std::getenv("DG_MEGA_MOE_TAIL_GROUPS"); deep_gemm::cdna4::decode_batch_rows(p.num_tokens, 5) && plan && std::string(plan) != "0") {
         int maximum = 0, adaptive = 0;
         char extra = 0;
         TORCH_CHECK(std::sscanf(plan, "%d,%d%c", &maximum, &adaptive, &extra) == 2 && (maximum == 16 || maximum == 18 || maximum == 20) &&
@@ -267,7 +269,7 @@ inline void launch(MegaMoeArgs p, const torch::Tensor &buffer, const torch::Tens
     if (const char *flag = std::getenv("DG_MEGA_MOE_EARLY_K"); flag && (std::string(flag) == "1" || std::string(flag) == "2"))
         code << "#define CDNA4_MOE_EARLY_K " << flag << "\n";
     if (const char *flag = std::getenv("DG_MEGA_MOE_LOCAL_INPUT");
-        flag && (std::string(flag) == "1" || (std::string(flag) == "target500" && p.num_tokens == 500)) &&
+        flag && (std::string(flag) == "1" || (std::string(flag) == "target500" && deep_gemm::cdna4::decode_batch_rows(p.num_tokens, 5))) &&
         (int64_t(l.num_max_tokens) + 1) * l.hidden <= UINT32_MAX) {
         code << "#define CDNA4_MOE_LOCAL_INPUT 1\n";
         if (const char *eager = std::getenv("DG_MEGA_MOE_EAGER_LOCAL");
