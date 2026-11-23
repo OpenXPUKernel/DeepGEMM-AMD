@@ -59,3 +59,5 @@ DG_CDNA4_GEMM_TUNE_MAP selects exact contracts: m,n,planner_k,a_type,b_type,out_
 Set plans before graph capture. They change scheduling and may change reduction order, so compare numerical outputs and measure the complete workload on matched random and real inputs before deployment. No new plan is enabled by default, and no performance guarantee or cross-backend hardware qualification is implied.
 
 For speculative decode, `DG_CDNA4_DECODE_BATCH` opts the compact projection and resident routing schedules into the exact target and draft row counts of that per-rank batch. Its default specialized batch is 100. The normal planner handles other row counts. The route bitmap is checked against the available shared memory and the fused gate must cover every pair of rows in its launch grid.
+
+The resident grid's epoch and diagnostic state occupy a dedicated region of the symmetric buffer. All configurations sharing a base allocation use the same offset, available as `layout["resident_control"]`. Rebuild the host extension with the matching device headers when changing revisions so both use the same layout.
