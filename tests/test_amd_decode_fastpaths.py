@@ -141,3 +141,21 @@ def test_shape_specialization_preserves_accumulation_and_strides(
     monkeypatch.setenv("DG_CDNA4_SPECIALIZE_GEMM", "1")
     deep_gemm.bf16_gemm_nt(x, weight, actual)
     assert _equal(expected, actual)
+
+@pytest.mark.parametrize("batch,positions,experts,topk", [(128, 5, 384, 6), (150, 4, 128, 3), (150, 5, 384, 6)])
+def test_configured_decode_batch_preserves_gate_routes(batch, positions, experts, topk, monkeypatch):
+    import torch
+    if not torch.version.hip or not torch.cuda.is_available():
+        pytest.skip("requires an AMD GPU")
+    import deep_gemm
+
+    monkeypatch.setenv("DG_CDNA4_DECODE_BATCH", str(batch))
+    torch.manual_seed(401)
+    x = torch.randn(batch * positions, 5120, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(experts, 5120, device="cuda", dtype=torch.bfloat16) * 0.01
+    args = dict(num_topk=topk, num_shared_experts=0, use_shared_as_routed=False, routed_scaling_factor=1.5, ep_rank=0)
+    monkeypatch.setenv("DG_GATE_FUSED_REDUCTION", "0")
+    reference = deep_gemm.bf16_mega_gate(x, weight, **args)
+    monkeypatch.setenv("DG_GATE_FUSED_REDUCTION", "1")
+    actual = deep_gemm.bf16_mega_gate(x, weight, **args)
+    assert all(_equal(a, b) for a, b in zip(actual, reference))
