@@ -108,7 +108,8 @@ inline void launch(MegaMoeArgs p, const torch::Tensor &buffer, const torch::Tens
     // The route bitmap uses Group * ceil(entries / 32) uint32 words before
     // the shared allocation is reused for the gather table and matrix stages.
     const int64_t entries = int64_t(p.num_tokens) * l.num_topk;
-    const bool configured_decode = deep_gemm::cdna4::decode_batch_rows(p.num_tokens, 5) || deep_gemm::cdna4::decode_batch_rows(p.num_tokens, 4);
+    const bool configured_decode = std::getenv("DG_CDNA4_DECODE_BATCH") &&
+                                  (deep_gemm::cdna4::decode_batch_rows(p.num_tokens, 5) || deep_gemm::cdna4::decode_batch_rows(p.num_tokens, 4));
     const bool bitmap_fits = entries <= 4096 || (configured_decode && 8 * ((entries + 31) / 32) * sizeof(unsigned) <= Config::shared_memory_bytes);
     const char *early_shared = std::getenv("DG_MEGA_MOE_EARLY_SHARED_L1");
     if (!bitmap ||

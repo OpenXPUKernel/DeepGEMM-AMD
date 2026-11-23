@@ -10,9 +10,13 @@ inline bool decode_batch_rows(int rows, int positions) {
     const char* value = std::getenv("DG_CDNA4_DECODE_BATCH");
     if (!value || !*value)
         return rows == 100 * positions;
-    char* end = nullptr;
-    const long batch = std::strtol(value, &end, 10);
-    return *end == '\0' && batch > 0 && batch <= 256 && rows == batch * positions;
+    int batch = 0;
+    for (int i = 0; value[i]; ++i) {
+        if (i >= 3 || value[i] < '0' || value[i] > '9')
+            return false;
+        batch = batch * 10 + value[i] - '0';
+    }
+    return batch >= 1 && batch <= 256 && rows == batch * positions;
 }
 
 } // namespace deep_gemm::cdna4
