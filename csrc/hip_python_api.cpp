@@ -654,7 +654,8 @@ OptTensor cdna4_bf16_gate_partials(const torch::Tensor &x, const torch::Tensor &
                 "invalid BF16 gate matrices");
     const c10::hip::HIPGuardMasqueradingAsCUDA guard(x.get_device());
     const int m = x.size(0), n = weight.size(0), k = x.size(1);
-    if (!((m == 500 && n == 384) || (m == 400 && n == 128)) || k != 5120)
+    if (!((deep_gemm::cdna4::decode_batch_rows(m, 5) && n == 384) || (deep_gemm::cdna4::decode_batch_rows(m, 4) && n == 128)) ||
+        k != 5120 || ceil_div(m, 2) > 16 * deep_gemm::cdna4::num_compute_units())
         return std::nullopt;
     TORCH_CHECK((packed_layout == 0) == !packed.has_value() && packed_layout >= 0 && packed_layout <= 2, "invalid prepared gate layout");
     if (packed) {
@@ -670,7 +671,7 @@ OptTensor cdna4_bf16_gate_partials(const torch::Tensor &x, const torch::Tensor &
                                         n, true, 0, 0, OperandType::Bf16, OperandType::Bf16);
     if (config.variant != deep_gemm::cdna4::KernelVariant::mfma_16x16x128_split_k || config.split_k <= 1)
         return std::nullopt;
-    const char *tile = m == 400 ? std::getenv("DG_GATE_DRAFT_ORDERED_TILE") : nullptr;
+    const char *tile = n == 128 ? std::getenv("DG_GATE_DRAFT_ORDERED_TILE") : nullptr;
     if (!tile)
         tile = std::getenv("DG_GATE_ORDERED_TILE");
     if (tile && std::string(tile) != "off") {
@@ -786,8 +787,8 @@ void cdna4_mega_gate_routing(const torch::Tensor &logits, const OptTensor &bias,
                 "logits must be [tokens, experts] or [splits, tokens, experts] FP32");
     const int num_tokens = logits.size(-2), num_experts = logits.size(-1);
     const int splits = logits.dim() == 3 ? logits.size(0) : 1;
-    TORCH_CHECK(splits == 1 || (num_tokens <= 512 && num_experts % 4 == 0),
-                "fused gate reduction requires at most 512 tokens and complete four-expert vectors");
+    TORCH_CHECK(splits == 1 || (num_experts % 4 == 0 && ceil_div(num_tokens, 2) <= 16 * deep_gemm::cdna4::num_compute_units()),
+                "each pair of token rows needs a reduction block and complete four-expert vectors");
     const bool token_major = splits > 1 && logits.stride(0) == num_experts && logits.stride(1) == int64_t(splits) * num_experts;
     TORCH_CHECK(splits >= 1 && splits <= 80 && (logits.dim() == 2 || token_major || logits.stride(0) == num_tokens * logits.stride(1)),
         "gate split workspace must contain consecutive split matrices or per-token split rows");

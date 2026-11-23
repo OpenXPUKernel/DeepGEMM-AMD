@@ -105,10 +105,15 @@ inline void launch(MegaMoeArgs p, const torch::Tensor &buffer, const torch::Tens
             join = mode[0] - '0';
     }
     const char *bitmap = std::getenv("DG_MEGA_MOE_ROUTE_BITMAP_GROUP");
+    // The route bitmap uses Group * ceil(entries / 32) uint32 words before
+    // the shared allocation is reused for the gather table and matrix stages.
+    const int64_t entries = int64_t(p.num_tokens) * l.num_topk;
+    const bool configured_decode = deep_gemm::cdna4::decode_batch_rows(p.num_tokens, 5) || deep_gemm::cdna4::decode_batch_rows(p.num_tokens, 4);
+    const bool bitmap_fits = entries <= 4096 || (configured_decode && 8 * ((entries + 31) / 32) * sizeof(unsigned) <= Config::shared_memory_bytes);
     const char *early_shared = std::getenv("DG_MEGA_MOE_EARLY_SHARED_L1");
     if (!bitmap ||
         !(std::string(bitmap) == "1" || std::string(bitmap) == "2" || std::string(bitmap) == "4" || std::string(bitmap) == "8") ||
-        int64_t(p.num_tokens) * l.num_topk > 4096 || (early_shared && std::string(early_shared) == "1"))
+        !bitmap_fits || (early_shared && std::string(early_shared) == "1"))
         join = 0;
     const int state_words = join ? 192 + 5 * q.max_blocks + (join == 3 ? blocks : 0) : 192 + 2 * q.max_blocks + 2 * q.max_blocks * q.n2;
     auto state = torch::empty({state_words}, y.options().dtype(torch::kInt32));
@@ -256,7 +261,7 @@ inline void launch(MegaMoeArgs p, const torch::Tensor &buffer, const torch::Tens
     if (const char *policy = std::getenv("DG_MEGA_MOE_STAGE_RETURN"); policy && (std::string(policy) == "1" || std::string(policy) == "2"))
         code << "#define CDNA4_MOE_STAGE_RETURN " << policy << "\n";
     if (const char *group = std::getenv("DG_MEGA_MOE_ROUTE_BITMAP_GROUP");
-        group && int64_t(p.num_tokens) * l.num_topk <= 4096 &&
+        group && bitmap_fits &&
         (std::string(group) == "1" || std::string(group) == "2" || std::string(group) == "4" || std::string(group) == "8"))
         code << "#define CDNA4_MOE_ROUTE_BITMAP_GROUP " << group << "\n";
     if (const char *v = std::getenv("DG_MEGA_MOE_ROUTE_PLANES"); v) {
