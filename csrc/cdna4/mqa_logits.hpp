@@ -88,10 +88,36 @@ inline const char *mqa_source_name(MqaLogitsSource source) {
 // grid: (waves, chunk rounds); a wave takes chunks y, y + rounds, ... of its tokens' columns.
 // Chunks of 2048 columns, or shorter ones (more work items) while that leaves a compute unit's
 // SIMDs without work.
-inline int launch_mqa_logits(MqaLogitsArgs &args, MqaLogitsPlan plan, int waves, int max_columns, hipStream_t stream,
-                             int column_rounds = 0) {
+inline int launch_mqa_logits(
+    MqaLogitsArgs &args, MqaLogitsPlan plan, int waves, int max_columns, hipStream_t stream, int column_rounds = 0, int sparse_mode = 0) {
     if (waves <= 0 || max_columns <= 0)
         return 0;
+    int policy = 0;
+    if (const char *mode = std::getenv("DG_MQA_FIVE_POSITION");
+        mode && column_rounds > 0 && args.run_starts && plan.source == MqaLogitsSource::Paged && plan.format == MqaLogitsFormat::MxFp4 &&
+        plan.num_heads == 32 && plan.head_dim == 128 && (args.page_kv == 64 || args.page_kv == 128)) {
+        if (std::string(mode) == "page")
+            policy = 1;
+        if (std::string(mode) == "split" && plan.token_groups == 3)
+            policy = 2;
+        if (std::string(mode) == "five" && plan.token_groups == 5)
+            policy = 3;
+    }
+    int registers = 0, vector_output = 0;
+    if (const char *io = std::getenv("DG_MQA_PAGED_IO"); io && std::string(io) != "0" && args.run_starts && column_rounds > 0 &&
+                                                         plan.source == MqaLogitsSource::Paged && plan.format == MqaLogitsFormat::MxFp4 &&
+                                                         plan.num_heads == 32 && plan.head_dim == 128) {
+        char rest = 0;
+        TORCH_CHECK(std::sscanf(io, "%d,%d%c", &registers, &vector_output, &rest) == 2 && registers >= 0 && registers <= 2 &&
+                        vector_output >= 0 && vector_output <= 1,
+            "invalid paged MQA query storage and write plan");
+    }
+    if (sparse_mode == 3) {
+        registers = 1;
+        vector_output = 1;
+    }
+    if (policy >= 2)
+        waves = ((args.num_q + 4) / 5) * (policy == 2 ? 2 : 1);
     // workgroups of four waves, a quarter of a chunk each: two waves per SIMD at least
     const int slots = 2 * num_compute_units();
     plan.chunk = 2048;
@@ -100,6 +126,14 @@ inline int launch_mqa_logits(MqaLogitsArgs &args, MqaLogitsPlan plan, int waves,
     std::ostringstream name;
     name << "mqa_logits:" << mqa_format_name(plan.format) << ":" << mqa_source_name(plan.source) << ":" << plan.head_dim
          << ":" << plan.num_heads << ":" << plan.lanes_per_token << ":" << plan.token_groups << ":" << plan.chunk;
+    if (args.block_scores)
+        name << ":blockmax8";
+    if (sparse_mode)
+        name << ":sparse_mode=" << sparse_mode << ":page=" << args.page_kv << ":stride=" << args.page_stride;
+    if (registers || vector_output)
+        name << ":regs=" << registers << ":store=" << vector_output;
+    if (policy)
+        name << ":page=" << args.page_kv << ":stride=" << args.page_stride << ":five=" << policy;
     // two waves per SIMD (256 VGPRs each), unless the LDS of a workgroup allows only one (a
     // higher bound would make the compiler spill)
     const int waves_per_simd = std::clamp(163840 / std::max(plan.lds_bytes(), 1), 1, 2);
@@ -107,16 +141,37 @@ inline int launch_mqa_logits(MqaLogitsArgs &args, MqaLogitsPlan plan, int waves,
         name.str(),
         [&] {
             std::ostringstream source;
-            source
-                << "#include <deep_gemm/impls/cdna4/mqa_logits.cuh>\n"
-                << "extern \"C\" __global__ __attribute__((amdgpu_flat_work_group_size(256, 256), amdgpu_waves_per_eu("
-                << waves_per_simd << "))) "
-                << "void " << mqa_kernel_name(plan.source)
-                << "(MqaLogitsArgs p) { mqa_logits_impl<MqaLogitsConfig<MqaLogitsFormat::"
-                << mqa_format_name(plan.format) << ",MqaLogitsSource::" << mqa_source_name(plan.source) << ","
-                << plan.head_dim << "," << plan.num_heads << "," << plan.lanes_per_token << "," << plan.token_groups
-                << "," << plan.chunk << ">," << (plan.format == MqaLogitsFormat::Fp8 ? "float" : "std::uint16_t")
-                << ">(p); }\n";
+            if (registers)
+                source << "#define CDNA4_MQA_REGISTER_Q " << registers << "\n";
+            if (vector_output)
+                source << "#define CDNA4_MQA_VECTOR_OUTPUT 1\n";
+            if (args.block_scores)
+                source << "#define CDNA4_MQA_BLOCK_MAX 1\n";
+            if (sparse_mode >= 2)
+                source << "#define CDNA4_MQA_SPARSE_STARTS 1\n";
+            if (policy)
+                source << "#define CDNA4_MQA_PAGE_FAST 1\n";
+            if (policy >= 2)
+                source << "#define CDNA4_MQA_FIVE_GROUP 1\n";
+            source << "#include <deep_gemm/impls/cdna4/mqa_logits.cuh>\n"
+                      "extern \"C\" __global__ __attribute__((amdgpu_flat_work_group_size(256,256),amdgpu_waves_per_eu("
+                   << waves_per_simd << "))) void " << mqa_kernel_name(plan.source) << "(MqaLogitsArgs p){";
+            auto cfg = [&](int groups) {
+                std::ostringstream t;
+                t << "MqaLogitsConfig<MqaLogitsFormat::" << mqa_format_name(plan.format)
+                  << ",MqaLogitsSource::" << mqa_source_name(plan.source) << "," << plan.head_dim << "," << plan.num_heads << ","
+                  << plan.lanes_per_token << "," << groups << "," << plan.chunk << ">";
+                return t.str();
+            };
+            if (sparse_mode)
+                source << "p.sparse_block_kv=8;";
+            if (policy || sparse_mode)
+                source << "p.page_kv=" << args.page_kv << ";p.page_stride=" << args.page_stride << "LL;";
+            const char *out = plan.format == MqaLogitsFormat::Fp8 ? "float" : "std::uint16_t";
+            if (policy >= 2)
+                source << "mqa_five_positions<" << cfg(plan.token_groups) << "," << cfg(2) << "," << out << ">(p);}";
+            else
+                source << "mqa_logits_impl<" << cfg(plan.token_groups) << "," << out << ">(p);}";
             return source.str();
         },
         {mqa_kernel_name(plan.source)},
@@ -126,7 +181,7 @@ inline int launch_mqa_logits(MqaLogitsArgs &args, MqaLogitsPlan plan, int waves,
     const int chunks = (max_columns + plan.chunk - 1) / plan.chunk;
     const int rounds = std::clamp(column_rounds > 0 ? column_rounds : 16 * num_compute_units() / waves, 1, chunks);
     return JitRuntime::launch_kernel(module->kernels[0], args, dim3(waves, rounds, 1), dim3(256, 1, 1),
-                                     plan.lds_bytes(), stream);
+        plan.lds_bytes() - (registers == 1 ? plan.tiles() * 1280 : 0), stream);
 }
 
 } // namespace deep_gemm::cdna4

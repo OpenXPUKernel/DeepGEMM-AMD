@@ -1,5 +1,6 @@
 #pragma once
 #include "../jit_kernels/impls/cdna4_fp8_fp4_mega_moe.hpp"
+#include <ATen/ops/_assert_async.h>
 namespace {
 // Mega MoE (mega_moe.cuh): the regions of the symmetric buffer, for the Python views
 constexpr int kMegaMoeAlignment = 256;
@@ -67,13 +68,73 @@ torch::Tensor cdna4_prepare_moe_weight_panels(const torch::Tensor &weight) {
     return output;
 }
 
+// The shared expert uses the same rounded activation, clamp, native matrix
+// tile, and BF16 output as its resident workgroups. Its caller owns the stream.
+void cdna4_shared_stages(const torch::Tensor &x, const torch::Tensor &sf, const torch::Tensor &w1, const torch::Tensor &s1,
+    const torch::Tensor &w2, const torch::Tensor &s2, const torch::Tensor &mid, const torch::Tensor &mid_sf, const torch::Tensor &out,
+    double clamp, bool fast_math) {
+    using namespace deep_gemm::cdna4;
+    using namespace deep_gemm::cdna4::mega_moe_host;
+    TORCH_CHECK(
+        x.dim() == 2 && w1.dim() == 2 && w2.dim() == 2 && x.is_cuda() && x.scalar_type() == torch::kFloat8_e4m3fn && x.is_contiguous());
+    const int m = x.size(0), h = x.size(1), i = w2.size(1);
+    TORCH_CHECK(m > 0 && m <= 1536 && h == 5120 && i == 2304 && w1.size(0) == 2 * i && w1.size(1) == h && w2.size(0) == h &&
+                w1.scalar_type() == x.scalar_type() && w2.scalar_type() == x.scalar_type() && w1.is_contiguous() && w2.is_contiguous());
+    TORCH_CHECK(out.sizes() == x.sizes() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && mid.dim() == 2 &&
+                mid.size(0) == m && mid.size(1) == i && mid.scalar_type() == x.scalar_type() && mid.is_contiguous() && clamp >= 0);
+    for (const auto *t : {&sf, &w1, &s1, &w2, &s2, &mid, &mid_sf, &out})
+        TORCH_CHECK(t->device() == x.device());
+    auto scale = [](const torch::Tensor &v, int rows, int k) {
+        TORCH_CHECK(v.dim() == 2 && v.size(0) == rows && v.size(1) == k / 128 && v.scalar_type() == torch::kInt32 && v.stride(0) == 1 &&
+                    v.stride(1) >= rows && v.stride(1) <= INT32_MAX);
+    };
+    scale(sf, m, h);
+    scale(s1, 2 * i, h);
+    scale(s2, h, i);
+    scale(mid_sf, m, i);
+    const c10::hip::HIPGuardMasqueradingAsCUDA guard(x.get_device());
+    MegaMoeKernelArgs q{};
+    q.shared_tokens = m;
+    q.shared_l1 =
+        matrix(reinterpret_cast<const uint8_t *>(x.data_ptr()), sf.data_ptr<int32_t>(), w1, s1, nullptr, m, 2 * i, h, sf.stride(1), false);
+    q.shared_l1.moe_acts = reinterpret_cast<uint8_t *>(mid.data_ptr());
+    q.shared_l1.moe_sf = mid_sf.data_ptr<int32_t>();
+    q.shared_l1.moe_sf_pitch = mid_sf.stride(1);
+    q.shared_l1.moe_clamp = float(clamp);
+    q.shared_l1.moe_fast_math = fast_math;
+    q.shared_l2 = matrix(reinterpret_cast<const uint8_t *>(mid.data_ptr()), mid_sf.data_ptr<int32_t>(), w2, s2, out.data_ptr(), m, h, i,
+        mid_sf.stride(1), false);
+    std::ostringstream code;
+    constants(code, "RESIDENT_L1", q.l1);
+    constants(code, "RESIDENT_L2", q.l2);
+    constants(code, "RESIDENT_S1", q.shared_l1);
+    constants(code, "RESIDENT_S2", q.shared_l2);
+    code << "#define CDNA4_MOE_WEIGHT_PANELS 1\n#define CDNA4_MOE_DRAIN_TAIL 1\n"
+            "#include <deep_gemm/impls/cdna4_fp8_fp4_mega_moe.cuh>\n";
+    for (int n = 0; n < 2; ++n)
+        code << "extern \"C\" __global__ __launch_bounds__(256) void shared_stage" << n
+             << "(deep_gemm::cdna4::MegaMoeKernelArgs q){"
+                "const int start=blockIdx.y*128;deep_gemm::cdna4::MegaMoeRowBlock b{0,start,min(start+128,q.shared_tokens),1};"
+                "resident_moe::tile<"
+             << (n ? i : h) << "," << (n ? h : 2 * i) << "," << (n ? "false" : "true") << ",true>(q,b,blockIdx.x*256);}";
+    const auto source = code.str();
+    const auto module = jit_runtime.get_module("standalone_shared:" + std::to_string(std::hash<std::string>{}(source)),
+        [&] { return source; }, {"shared_stage0", "shared_stage1"}, {"-O2"});
+    const auto stream = c10::hip::getCurrentHIPStream(x.get_device()).stream();
+    constexpr unsigned lds = 2 * (128 * 128 + 256 * 128 + 2 * 256 * 4);
+    for (int n = 0; n < 2; ++n)
+        TORCH_CHECK(JitModule::launch_function(
+                        module->kernels[n], dim3((n ? h : 2 * i) / 256, (m + 127) / 128), dim3(256), lds, stream, false, q) == hipSuccess,
+            "standalone shared matrix stage failed");
+}
+
 void cdna4_mega_moe(const torch::Tensor &y, const torch::Tensor &l1_weights, const OptTensor &l1_weights_sf,
-                    const torch::Tensor &l2_weights, const OptTensor &l2_weights_sf, const OptTensor &shared_l1_weights,
-                    const OptTensor &shared_l1_weights_sf, const OptTensor &shared_l2_weights,
-                    const OptTensor &shared_l2_weights_sf, const OptTensor &stats, const torch::Tensor &buffer,
-                    const std::vector<int64_t> &buffer_ptrs, int rank, int num_max_tokens, int num_experts,
-                    int num_topk, double activation_clamp, bool fast_math, bool resident_weight_panels = false,
-                    bool reference = false) {
+    const torch::Tensor &l2_weights, const OptTensor &l2_weights_sf, const OptTensor &shared_l1_weights,
+    const OptTensor &shared_l1_weights_sf, const OptTensor &shared_l2_weights, const OptTensor &shared_l2_weights_sf,
+    const OptTensor &stats, const torch::Tensor &buffer, const std::vector<int64_t> &buffer_ptrs, int rank, int num_max_tokens,
+    int num_experts, int num_topk, double activation_clamp, bool fast_math, bool resident_weight_panels = false, bool reference = false,
+    const OptTensor &shared_result = std::nullopt, int shared_panel_mask = 0, const OptTensor &trace = std::nullopt,
+    const OptTensor &position = std::nullopt) {
     const bool with_sf = l1_weights_sf.has_value(), shared = shared_l1_weights.has_value();
     const int tokens = y.size(0), hidden = y.size(1), ranks = static_cast<int>(buffer_ptrs.size());
     const int intermediate = l1_weights.size(1) / 2;
@@ -102,7 +163,15 @@ void cdna4_mega_moe(const torch::Tensor &y, const torch::Tensor &l1_weights, con
     const auto l2_out = torch::empty({l.max_rows, hidden}, bf16);
     const bool shared_tokens = shared && tokens > 0;
     const auto shared_l1_out = shared_tokens ? torch::empty({tokens, 2 * shared_intermediate}, bf16) : torch::Tensor();
-    const auto shared_out = shared_tokens ? torch::empty({tokens, hidden}, bf16) : torch::Tensor();
+    TORCH_CHECK(!shared_result.has_value() || (!reference && resident_weight_panels && shared_tokens &&
+                                                  shared_result->device() == y.device() && shared_result->sizes() == y.sizes() &&
+                                                  shared_result->scalar_type() == torch::kBFloat16 && shared_result->is_contiguous()),
+        "a prepared shared output requires the same device, shape, BF16 type and native routed path");
+    const char *requested_shadow = std::getenv("DG_SHARED_EXPERT_SHADOW");
+    const bool check_shared = shared_result.has_value() && requested_shadow && std::string(requested_shadow) == "1";
+    const auto shared_out = shared_result.has_value() && !check_shared
+                                ? *shared_result
+                                : (shared_tokens ? torch::empty({tokens, hidden}, bf16) : torch::Tensor());
     const auto u16 = [](const torch::Tensor &t) { return reinterpret_cast<const std::uint16_t *>(t.data_ptr()); };
     args.l1_out = u16(l1_out), args.l2_out = u16(l2_out);
     args.shared_l1_out = shared_tokens ? u16(shared_l1_out) : nullptr;
@@ -111,12 +180,22 @@ void cdna4_mega_moe(const torch::Tensor &y, const torch::Tensor &l1_weights, con
     const bool native = !reference && with_sf && is_packed_fp4(l1_weights) && is_packed_fp4(l2_weights) &&
                         hidden >= 512 && intermediate >= 512 && hidden % 256 == 0 && intermediate % 256 == 0 &&
                         (!shared || shared_intermediate == intermediate);
+    TORCH_CHECK(shared_panel_mask == 0 || (native && resident_weight_panels && shared && shared_panel_mask > 0 && shared_panel_mask <= 3),
+        "shared panels require the native packed-weight path");
     TORCH_CHECK(native || !resident_weight_panels, "prepared panels require aligned FP8 x FP4 MoE");
+    TORCH_CHECK(trace.has_value() == position.has_value(), "provide both timing storage and positions");
+    if (trace)
+        TORCH_CHECK(native && trace->device() == y.device() && trace->scalar_type() == torch::kInt64 && trace->is_contiguous() &&
+                        trace->numel() == 1 + 256 * 9 && position->device() == y.device() && position->numel() > 0 &&
+                        (position->scalar_type() == torch::kInt32 || position->scalar_type() == torch::kInt64),
+            "invalid resident timing inputs");
     if (native) {
-        deep_gemm::cdna4::mega_moe_host::launch(args, buffer, y, l1_weights, *l1_weights_sf, l2_weights, *l2_weights_sf,
-                                                shared_l1_weights, shared_l1_weights_sf, shared_l2_weights,
-                                                shared_l2_weights_sf, l1_out, l2_out, shared_l1_out, shared_out,
-                                                resident_weight_panels);
+        deep_gemm::cdna4::mega_moe_host::launch(args, buffer, y, l1_weights, *l1_weights_sf, l2_weights, *l2_weights_sf, shared_l1_weights,
+            shared_l1_weights_sf, shared_l2_weights, shared_l2_weights_sf, l1_out, l2_out, shared_l1_out, shared_out,
+            resident_weight_panels, shared_result.has_value() && !check_shared, shared_panel_mask, trace, position);
+        if (check_shared)
+            at::_assert_async((shared_result->view(torch::kInt16) == shared_out.view(torch::kInt16)).all(),
+                "separately computed shared expert differs from the resident output");
         return;
     }
     const int finish_lds = l.num_experts_per_rank * 4;

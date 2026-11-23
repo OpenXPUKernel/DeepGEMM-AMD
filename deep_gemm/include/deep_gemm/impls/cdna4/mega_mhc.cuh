@@ -23,7 +23,11 @@ using deep_gemm::cdna4::MegaMhcArgs;
 namespace mega_mhc {
 constexpr int ROUTES = 4, OUTPUTS = 24, BM = 64, STEP = 64;
 // a step's fn as MFMA operands: [route][MFMA u][fragment][hi, lo][lane] x 16 bytes
+#if DG_MHC_RESIDUAL_SCHEDULE >= 2
+constexpr int STAGE_BYTES = ROUTES * 2 * 3 * 2 * 32 * 16;
+#else
 constexpr int STAGE_BYTES = ROUTES * 2 * 2 * 2 * 64 * 16;
+#endif
 constexpr int LDS_BYTES = 2 * STAGE_BYTES;
 } // namespace mega_mhc
 
@@ -75,8 +79,14 @@ template <bool SHIFTED> __device__ __forceinline__ void mega_mhc_residual_impl(c
         for (int rd = 0; rd < FN_ROUNDS; ++rd) {
             const int idx = rd * 16 + tid / 16, o = idx / ROUTES, j = idx % ROUTES, hh = 4 * (tid % 16);
             const int u = hh / 8 % 2, slot_lane = 16 * (hh / 16) + o % 16;
+#if DG_MHC_RESIDUAL_SCHEDULE >= 2
+            uint8_t *slot = smem + stage * STAGE_BYTES + (((j * 2 + u) * 3 + o / 8) * 64 + (hh / 16) * 8 + o % 8) * 16 + (hh % 8) * 2;
+            constexpr int part_bytes = 32 * 16;
+#else
             uint8_t *slot =
                 smem + stage * STAGE_BYTES + (((j * 2 + u) * 2 + o / 16) * 2 * 64 + slot_lane) * 16 + (hh % 8) * 2;
+            constexpr int part_bytes = 64 * 16;
+#endif
             v2u hi, lo;
 #pragma unroll
             for (int e = 0; e < 2; ++e) {
@@ -86,7 +96,7 @@ template <bool SHIFTED> __device__ __forceinline__ void mega_mhc_residual_impl(c
                 hi[e] = h, lo[e] = pack_bf16x2(f[rd][2 * e] - h0, f[rd][2 * e + 1] - h1);
             }
             *(v2u *)slot = hi;
-            *(v2u *)(slot + 64 * 16) = lo;
+            *(v2u *)(slot + part_bytes) = lo;
         }
     };
     struct Step {
@@ -121,18 +131,83 @@ template <bool SHIFTED> __device__ __forceinline__ void mega_mhc_residual_impl(c
                 for (int i = 0; i < ROUTES; ++i)
                     unpack_bf16x2((uint32_t)cur.res[i][u][q], rv[i][2 * q], rv[i][2 * q + 1]);
             }
+            struct FnPair {
+                v4i hi[2], lo[2];
+            };
+#ifdef DG_MHC_COMPACT_FN
+            auto panel_operands = [&](int j) {
+                FnPair v;
+#if DG_MHC_COMPACT_FN == 1
+                const uint8_t *base = operands;
+#else
+                const uint8_t *base = reinterpret_cast<const uint8_t *>(p.fn) + size_t(s) * STAGE_BYTES;
+#endif
+#pragma unroll
+                for (int f = 0; f < 2; ++f) {
+                    const int o = f ? 16 + (r16 & 7) : r16;
+                    const auto *slot = base + (((j * 2 + u) * 2) * 96 + g * 24 + o) * 16;
+                    v.hi[f] = *reinterpret_cast<const v4i *>(slot);
+                    v.lo[f] = *reinterpret_cast<const v4i *>(slot + 96 * 16);
+                }
+                return v;
+            };
+#endif
+            auto accumulate_route = [&](int j, const v4i &bits, const FnPair *early = nullptr) {
+#ifdef DG_MHC_COMPACT_FN
+                const FnPair data = early ? *early : panel_operands(j);
+#pragma unroll
+                for (int f = 0; f < 2; ++f) {
+                    acc[f] = mfma_bf16_16x16x32(data.hi[f], bits, acc[f]);
+                    acc[f] = mfma_bf16_16x16x32(data.lo[f], bits, acc[f]);
+                }
+#else
+#pragma unroll
+                for (int f = 0; f < 2; ++f) {
+#if DG_MHC_RESIDUAL_SCHEDULE >= 2
+                    // Rows 24..31 of FN have no output. Supply copies of the
+                    // live rows 16..23 for those discarded accumulator columns.
+                    const int og = f == 0 ? r16 / 8 : 2;
+                    const uint8_t *slot = operands + (((j * 2 + u) * 3 + og) * 64 + g * 8 + r16 % 8) * 16;
+                    constexpr int part_bytes = 32 * 16;
+#else
+                    const uint8_t *slot = operands + (((j * 2 + u) * 2 + f) * 2 * 64 + lane) * 16;
+                    constexpr int part_bytes = 64 * 16;
+#endif
+                    acc[f] = mfma_bf16_16x16x32(*(const v4i *)slot, bits, acc[f]);
+                    acc[f] = mfma_bf16_16x16x32(*(const v4i *)(slot + part_bytes), bits, acc[f]);
+                }
+#endif
+            };
             v4i nr[ROUTES];
             float rounded[ROUTES][8];
+#if DG_MHC_RESIDUAL_SCHEDULE >= 3
+            float shifted_values[8];
+#endif
 #pragma unroll
             for (int j = 0; j < ROUTES; ++j) {
+#if DG_MHC_COMPACT_FN == 3
+                const FnPair early = panel_operands(j);
+                __builtin_amdgcn_sched_barrier(0);
+#endif
                 float v[8];
 #pragma unroll
+#if DG_MHC_RESIDUAL_SCHEDULE == 4
+                for (int q = 0; q < 4; ++q) {
+                    v2f z = v2f{xv[2 * q], xv[2 * q + 1]} * v2f{post[j], post[j]};
+#pragma unroll
+                    for (int i = 0; i < ROUTES; ++i)
+                        z = __builtin_elementwise_fma(v2f{comb[i][j], comb[i][j]}, v2f{rv[i][2 * q], rv[i][2 * q + 1]}, z);
+                    v[2 * q] = z[0];
+                    v[2 * q + 1] = z[1];
+                }
+#else
                 for (int e = 0; e < 8; ++e) {
                     v[e] = xv[e] * post[j];
 #pragma unroll
                     for (int i = 0; i < ROUTES; ++i)
                         v[e] = __builtin_fmaf(comb[i][j], rv[i][e], v[e]);
                 }
+#endif
 #pragma unroll
                 for (int q = 0; q < 4; ++q) {
                     nr[j][q] = (int)pack_bf16x2(v[2 * q], v[2 * q + 1]);
@@ -142,11 +217,26 @@ template <bool SHIFTED> __device__ __forceinline__ void mega_mhc_residual_impl(c
 #pragma unroll
                 for (int e = 0; e < 8; ++e)
                     sq = __builtin_fmaf(rounded[j][e], rounded[j][e], sq);
+#if DG_MHC_RESIDUAL_SCHEDULE >= 3
+                if constexpr (SHIFTED) {
+#pragma unroll
+                    for (int e = 0; e < 8; ++e)
+                        shifted_values[e] = j == 0 ? rounded[j][e] * prev[0] : __builtin_fmaf(rounded[j][e], prev[j], shifted_values[e]);
+                }
+#if DG_MHC_COMPACT_FN == 3
+                accumulate_route(j, nr[j], &early);
+#else
+                accumulate_route(j, nr[j]);
+#endif
+#endif
             }
             if constexpr (SHIFTED) {
                 v4i n;
 #pragma unroll
                 for (int q = 0; q < 4; ++q) {
+#if DG_MHC_RESIDUAL_SCHEDULE >= 3
+                    n[q] = (int)pack_bf16x2(shifted_values[2 * q], shifted_values[2 * q + 1]);
+#else
                     float a[2];
 #pragma unroll
                     for (int e = 0; e < 2; ++e) {
@@ -156,24 +246,73 @@ template <bool SHIFTED> __device__ __forceinline__ void mega_mhc_residual_impl(c
                             a[e] = __builtin_fmaf(rounded[j][2 * q + e], prev[j], a[e]);
                     }
                     n[q] = (int)pack_bf16x2(a[0], a[1]);
+#endif
                 }
                 __builtin_amdgcn_raw_buffer_store_b128((v4u)n, norm_rsrc, (row * H + h) * 2, 0, 0);
             }
+#if DG_MHC_RESIDUAL_SCHEDULE < 3
 #pragma unroll
             for (int j = 0; j < ROUTES; ++j)
-#pragma unroll
-                for (int f = 0; f < 2; ++f) {
-                    const uint8_t *slot = operands + (((j * 2 + u) * 2 + f) * 2 * 64 + lane) * 16;
-                    acc[f] = mfma_bf16_16x16x32(*(const v4i *)slot, nr[j], acc[f]);
-                    acc[f] = mfma_bf16_16x16x32(*(const v4i *)(slot + 64 * 16), nr[j], acc[f]);
-                }
+                accumulate_route(j, nr[j]);
+#endif
         }
     };
 
+#ifdef DG_MHC_COMPACT_FN
+    // Each step carries exactly 24 output rows of high/low BF16 operands.
+    // The register path needs no workgroup rendezvous: all inputs are immutable.
+    const auto resource = make_rsrc(p.fn, steps * STAGE_BYTES);
+    auto prefetch = [&](int slot, int step) {
+#if DG_MHC_COMPACT_FN == 1
+#pragma unroll
+        for (int rd = 0; rd < STAGE_BYTES / (256 * 16); ++rd)
+            __builtin_amdgcn_raw_ptr_buffer_load_lds(resource, (lds_ptr_t)(smem + slot * STAGE_BYTES + rd * 4096 + wave * 1024), 16,
+                tid * 16, step * STAGE_BYTES + rd * 4096, 0, 0);
+#endif
+    };
+    auto wait_panel = []() {
+#if DG_MHC_COMPACT_FN == 1
+        asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#endif
+    };
+    Step even, odd;
+    if (s_begin < s_end) {
+        prefetch(0, s_begin);
+        load_step(s_begin, even);
+        wait_panel();
+        for (int s = s_begin; s < s_end; s += 2) {
+            if (s + 1 < s_end) {
+                prefetch(1, s + 1);
+                load_step(s + 1, odd);
+            }
+            compute(s, even, 0);
+            if (s + 1 >= s_end)
+                break;
+            wait_panel();
+            if (s + 2 < s_end) {
+                prefetch(0, s + 2);
+                load_step(s + 2, even);
+            }
+            compute(s + 1, odd, 1);
+            if (s + 2 >= s_end)
+                break;
+            wait_panel();
+        }
+    }
+#else
     // output rows 24 .. 31 (fragment 1) stay zero
+#if DG_MHC_RESIDUAL_SCHEDULE == 1
+    // Only these eight columns of fragment one are not populated by store_fn.
+    for (int i = tid; i < LDS_BYTES / (4 * 16); i += 256) {
+        const int slice = i / 32, within = i % 32, lane_idx = (within / 8) * 16 + 8 + within % 8;
+        const int slot = (((slice / 2) * 2 + 1) * 2 + slice % 2) * 64 + lane_idx;
+        ((v4i *)smem)[slot] = v4i{};
+    }
+#elif !DG_MHC_RESIDUAL_SCHEDULE
     for (int i = tid; i < LDS_BYTES / 16; i += 256)
         ((v4i *)smem)[i] = v4i{};
     __syncthreads();
+#endif
     Step even, odd;
     v4f fn_even[FN_ROUNDS], fn_odd[FN_ROUNDS];
     load_fn(s_begin, fn_even);
@@ -183,22 +322,43 @@ template <bool SHIFTED> __device__ __forceinline__ void mega_mhc_residual_impl(c
     // two steps per iteration on alternating registers (no copies between the prefetch and its use);
     // the barriers order LDS only, so the prefetches and stores stay in flight
     for (int s = s_begin; s < s_end; s += 2) {
+#if DG_MHC_RESIDUAL_SCHEDULE
+        if (s + 1 < s_end) {
+            load_fn(s + 1, fn_odd);
+            load_step(s + 1, odd);
+        }
+        compute(s, even, 0);
+        if (s + 1 >= s_end)
+            break;
+#else
         load_fn(s + 1, fn_odd);
         load_step(s + 1, odd);
         compute(s, even, 0);
+#endif
         if (s + 1 < s_end)
             store_fn(1, fn_odd);
         asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
         if (s + 1 >= s_end)
             break;
+#if DG_MHC_RESIDUAL_SCHEDULE
+        if (s + 2 < s_end) {
+            load_fn(s + 2, fn_even);
+            load_step(s + 2, even);
+        }
+        compute(s + 1, odd, 1);
+        if (s + 2 >= s_end)
+            break;
+#else
         load_fn(s + 2, fn_even);
         load_step(s + 2, even);
         compute(s + 1, odd, 1);
+#endif
         if (s + 2 < s_end)
             store_fn(0, fn_even);
         asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
     }
 
+#endif
     // acc[f][e] of lane (g, r16) is the mix 16 f + 4 g + e of the wave's token r16
     const size_t task = (size_t)m_block * p.splits + split;
     float *mixes = p.mix_partials + (task * BM + row) * OUTPUTS;
@@ -219,6 +379,81 @@ __device__ __forceinline__ int64_t shared_sf_row(int token, int block_m) {
     return token;
 }
 
+#if defined(DG_MHC_MATRIX_MIX) && DG_MHC_MATRIX_MIX
+template <int Lane> __device__ __forceinline__ float mhc_quad_value(float x) {
+#if DG_MHC_MATRIX_MIX == 2
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), Lane * 0x55, 0xf, 0xf, false));
+#else
+    return __shfl(x, Lane, 4);
+#endif
+}
+template <int Delta> __device__ __forceinline__ float mhc_column_peer(float x) {
+#if DG_MHC_MATRIX_MIX == 2
+    auto perm = [](auto control, float v) {
+        return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), decltype(control)::value, 0xf, 0xf, false));
+    };
+    if constexpr (Delta == 4)
+        return perm(std::integral_constant<int, 0x1b>{}, perm(std::integral_constant<int, 0x141>{}, x));
+    return perm(std::integral_constant<int, 0x141>{}, perm(std::integral_constant<int, 0x140>{}, x));
+#else
+    return __shfl_xor(x, Delta, 64);
+#endif
+}
+// Sixteen lanes own one 4x4 matrix. Each four-lane row first reduces the
+// same split subsequences as the original kernel. During Sinkhorn, column
+// exchanges cross the row quads and every lane carries one matrix entry.
+__device__ __forceinline__ void mega_mhc_matrix_mix(const MegaMhcArgs &p, int block, int threads) {
+    using namespace mega_mhc;
+    const int t = block * threads + threadIdx.x, token = t / 16, row = (t / 4) % 4, col = t % 4;
+    if (token >= p.num_tokens)
+        return;
+    const size_t task0 = size_t(token / BM) * p.splits;
+    const int inner = token % BM;
+    float pre = 0, post = 0, sqr = 0;
+    v4f comb{};
+    for (int split = col; split < p.splits; split += 4) {
+        const auto *partial = p.mix_partials + ((task0 + split) * BM + inner) * OUTPUTS;
+        pre += partial[row];
+        post += partial[4 + row];
+        comb += *reinterpret_cast<const v4f *>(partial + 8 + 4 * row);
+        sqr += p.sqr_partials[(task0 + split) * BM + inner];
+    }
+    auto sum_quad = [&](float v) {
+        v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0xb1, 0xf, 0xf, false));
+        v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x4e, 0xf, 0xf, false));
+        return __shfl(v, row, 4);
+    };
+    const float rms = rsqrtf(sum_quad(sqr) / (ROUTES * p.hidden) + p.hc_norm_eps);
+    pre = sum_quad(pre) * rms * p.mix_scales[0] + p.mix_bases[row];
+    post = sum_quad(post) * rms * p.mix_scales[1] + p.mix_bases[4 + row];
+    float v = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float x = sum_quad(comb[j]) * rms * p.mix_scales[2] + p.mix_bases[8 + 4 * row + j];
+        if (col == j)
+            v = x;
+    }
+    if (col == 0) {
+        p.prev_mix[token * 4 + row] = 1.f / (1.f + __expf(-pre)) + p.hc_pre_eps;
+        p.new_post_mix[token * 4 + row] = 1.f / (1.f + __expf(-post)) * p.hc_post_scale;
+    }
+    auto row_sum = [](float x) { return ((mhc_quad_value<0>(x) + mhc_quad_value<1>(x)) + mhc_quad_value<2>(x)) + mhc_quad_value<3>(x); };
+    auto column_sum = [](float x) {
+        x += mhc_column_peer<4>(x);
+        return x + mhc_column_peer<8>(x);
+    };
+    const float maximum = fmaxf(fmaxf(mhc_quad_value<0>(v), mhc_quad_value<1>(v)), fmaxf(mhc_quad_value<2>(v), mhc_quad_value<3>(v)));
+    v = __expf(v - maximum);
+    v = v * (1.f / row_sum(v)) + p.sinkhorn_eps;
+    v *= 1.f / (column_sum(v) + p.sinkhorn_eps);
+    for (int it = 1; it < p.num_sinkhorn_iters; ++it) {
+        v *= 1.f / (row_sum(v) + p.sinkhorn_eps);
+        v *= 1.f / (column_sum(v) + p.sinkhorn_eps);
+    }
+    p.new_comb_res_mix[(token * 4 + row) * 4 + col] = v;
+}
+#endif
+
 // The mixes of a token per quad of lanes: lane k adds the split partials k, k + 4, ... in split
 // order and the quad adds its lanes in a fixed butterfly (an order set by the split count alone),
 // then the RMS scaling of new_residual, the sigmoids (lane k: previous and post mix k) and the
@@ -228,6 +463,10 @@ __device__ __forceinline__ void mega_mhc_mix_impl(const MegaMhcArgs &p, int logi
     using namespace mega_mhc;
     const int block = logical_block < 0 ? int(blockIdx.x) : logical_block;
     const int threads = logical_threads < 0 ? int(blockDim.x) : logical_threads;
+#if defined(DG_MHC_MATRIX_MIX) && DG_MHC_MATRIX_MIX
+    mega_mhc_matrix_mix(p, block, threads);
+    return;
+#endif
     const int thread = block * threads + threadIdx.x, k = thread % ROUTES;
     const int token = min(thread / ROUTES, p.num_tokens - 1);
     const size_t task0 = (size_t)(token / BM) * p.splits;
@@ -423,13 +662,33 @@ __device__ __forceinline__ void mega_mhc_norm_impl(const MegaMhcArgs &p, int log
                 dpp_max(std::integral_constant<int, 0xb1>{});  // quad_perm 1 0 3 2
                 dpp_max(std::integral_constant<int, 0x4e>{});  // quad_perm 2 3 0 1
                 dpp_max(std::integral_constant<int, 0x141>{}); // row_half_mirror
+#if (DG_MHC_SCALE_WORDS & 1)
+                // yv is already rounded to BF16. For finite values the E4M3
+                // maximum 448 is 1.75*2^8; an exact-power boundary occurs only
+                // at mantissa 0x600000. Preserve the original infinity clamp.
+                const uint32_t bits = __float_as_uint(fmaxf(amax, 1e-4f));
+                const int exponent = bits == 0x7f800000u ? 254 : int((bits + 0x1fffffu) >> 23) - 8;
+                const float inv = __uint_as_float(exponent == 254 ? 0x00400000u : uint32_t(254 - exponent) << 23);
+#else
                 const uint32_t bits = __float_as_uint(fmaxf(amax, 1e-4f) / 448.f);
                 const int exponent = min(max((int)(bits >> 23 & 0xff) + ((bits & 0x7fffff) != 0), 1), 254);
                 const float inv = 1.f / __uint_as_float((uint32_t)exponent << 23);
+#endif
                 const int lo = __builtin_amdgcn_cvt_pk_fp8_f32(yv[0] * inv, yv[1] * inv, 0, false);
                 const int packed = __builtin_amdgcn_cvt_pk_fp8_f32(yv[2] * inv, yv[3] * inv, lo, true);
                 *(int *)(p.y_fp8 + (size_t)token * H + h) = packed;
                 // the block's leader stores byte (t / 8) % 4 of the word of hidden 128 (t / 32 + 8 c) .. + 127
+#if (DG_MHC_SCALE_WORDS & 2)
+                const int first = lane & ~31;
+                const uint32_t word = uint32_t(exponent) | uint32_t(__shfl(exponent, first + 8)) << 8 |
+                                      uint32_t(__shfl(exponent, first + 16)) << 16 | uint32_t(__shfl(exponent, first + 24)) << 24;
+                if (lane % 32 == 0) {
+                    const int w = tid / 32 + 8 * c;
+                    p.y_sf[token * p.y_sf_stride_token + w * p.y_sf_stride_word] = word;
+                    if (p.y_shared_sf)
+                        p.y_shared_sf[shared_sf_row(token, p.shared_sf_block_m) + w * p.y_shared_sf_stride_word] = word;
+                }
+#else
                 if (lane % 8 == 0) {
                     const int w = tid / 32 + 8 * c, b = tid / 8 % 4;
                     ((uint8_t *)(p.y_sf + token * p.y_sf_stride_token + w * p.y_sf_stride_word))[b] = (uint8_t)exponent;
@@ -437,6 +696,7 @@ __device__ __forceinline__ void mega_mhc_norm_impl(const MegaMhcArgs &p, int log
                         ((uint8_t *)(p.y_shared_sf + shared_sf_row(token, p.shared_sf_block_m) +
                                      w * p.y_shared_sf_stride_word))[b] = (uint8_t)exponent;
                 }
+#endif
             }
         }
 #pragma unroll

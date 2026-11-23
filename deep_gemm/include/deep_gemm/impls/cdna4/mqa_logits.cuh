@@ -56,7 +56,8 @@ struct MqaLogitsConfig {
     }
 };
 
-template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl(const MqaLogitsArgs &p) {
+template <class Cfg, class OutT>
+__device__ __forceinline__ void mqa_logits_impl(const MqaLogitsArgs &p, int q_start = -1, int q_count = 0) {
 #if defined(__HIP_DEVICE_COMPILE__)
     constexpr int T = Cfg::T, TU = Cfg::TU, U = Cfg::U, L = Cfg::L, QW = Cfg::QW, J = Cfg::J, H = Cfg::H;
     constexpr int ROW_BYTES = Cfg::ROW_BYTES;
@@ -67,19 +68,24 @@ template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl
     // every QW-th token of a request)
     int q0, nq;
     if constexpr (Cfg::PAGED && !Cfg::SPARSE) {
-        const int x = blockIdx.x;
-        const int start = p.run_starts ? p.run_starts[x] : x / p.next_n * p.next_n;
-        if ((x - start) % QW != 0)
-            return;
-        q0 = x;
-        int n = 1;
-        if (p.run_starts) {
-            while (n < QW && x + n < p.num_q && p.run_starts[x + n] == start)
-                ++n;
+        if (q_start >= 0) {
+            q0 = q_start;
+            nq = q_count;
         } else {
-            n = min(QW, start + p.next_n - x);
+            const int x = blockIdx.x;
+            const int start = p.run_starts ? p.run_starts[x] : x / p.next_n * p.next_n;
+            if ((x - start) % QW != 0)
+                return;
+            q0 = x;
+            int n = 1;
+            if (p.run_starts) {
+                while (n < QW && x + n < p.num_q && p.run_starts[x + n] == start)
+                    ++n;
+            } else {
+                n = min(QW, start + p.next_n - x);
+            }
+            nq = n;
         }
-        nq = n;
     } else {
         q0 = blockIdx.x * QW;
         nq = min(QW, p.num_q - q0);
@@ -107,6 +113,13 @@ template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl
             hi = max(hi, p.ke[q0 + i]);
         }
     }
+#ifdef CDNA4_MQA_BLOCK_MAX
+    static_assert(Cfg::PAGED && !Cfg::SPARSE && Cfg::FP4 && Cfg::J == 4);
+    if (blockIdx.y == 0 && threadIdx.x < nq) {
+        const int tok = q0 + threadIdx.x;
+        p.block_counts[tok] = (min(max(p.context_lens[tok], 0), p.score_width) + 7) / 8;
+    }
+#endif
     const int chunks = hi > lo ? (hi - lo + Cfg::CHUNK - 1) / Cfg::CHUNK : 0;
     if ((int)blockIdx.y >= chunks)
         return;
@@ -117,6 +130,22 @@ template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl
     // is a 1 KB array at (HALVES t + h) KB, 16 bytes per lane; codes follow, 4 bytes per lane and
     // tile. Wave w stages the tiles t % WAVES == w.
     extern __shared__ __attribute__((aligned(16))) uint8_t smem[];
+    struct QTile {
+        v4i halves[2];
+        uint32_t code;
+    };
+    auto staged_query = [&](int t) {
+        QTile q;
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf)
+            q.halves[hf] = hf < Cfg::HALVES ? *reinterpret_cast<const v4i *>(smem + (Cfg::HALVES * t + hf) * 1024 + 16 * lane) : v4i{};
+        q.code = Cfg::MX ? *reinterpret_cast<const uint32_t *>(smem + Cfg::CODES_OFF + t * 256 + 4 * lane) : 127u;
+        return q;
+    };
+#ifdef CDNA4_MQA_REGISTER_Q
+    QTile resident[T];
+#endif
+#if !defined(CDNA4_MQA_REGISTER_Q) || CDNA4_MQA_REGISTER_Q == 2
     static_for<0, T>([&](auto I) {
         constexpr int t = decltype(I)::value, u = t / TU, tt = t % TU;
         if (t % Cfg::WAVES != wave)
@@ -133,6 +162,24 @@ template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl
                 valid && g < Cfg::SCALE_BLOCKS ? (uint32_t)p.q_sf[(size_t)(q0 + q) * H + h] >> (8 * g) : 127u;
     });
     __syncthreads();
+#endif
+#ifdef CDNA4_MQA_REGISTER_Q
+    static_for<0, T>([&](auto I) {
+        constexpr int t = decltype(I)::value;
+#if CDNA4_MQA_REGISTER_Q == 1
+        const int q = Cfg::token_of(t / TU, r16 / 4), h = Cfg::head_of(t % TU, r16 / 4, r16 % 4);
+        const bool valid = q < nq && h < H;
+        const uint64_t idx = uint64_t(q0 + min(q, nq - 1)) * H + min(h, H - 1);
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf)
+            resident[t].halves[hf] =
+                valid && Cfg::half_exists(g, hf) ? *reinterpret_cast<const v4i *>(p.q + idx * ROW_BYTES + 16 * g + 64 * hf) : v4i{};
+        resident[t].code = valid && g < Cfg::SCALE_BLOCKS ? uint32_t(p.q_sf[idx]) >> (8 * g) : 127u;
+#else
+        resident[t] = staged_query(t);
+#endif
+    });
+#endif
     // weights of the rows of lane group g: w[t][e] for token token_of(u, g), head head_of(tt, g, e)
     float w[T][4];
     static_for<0, T>([&](auto I) {
@@ -176,7 +223,11 @@ template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl
     // The wave's row table of its part of the current chunk, in LDS: entry i is that of page /
     // sparse block t0 + i. The next chunk's entries load into registers during this chunk
     // (TableLoad), and go to LDS when it starts.
+#if defined(CDNA4_MQA_REGISTER_Q) && CDNA4_MQA_REGISTER_Q == 1
+    int *const table = reinterpret_cast<int *>(smem) + wave * Cfg::TABLE_ENTRIES;
+#else
     int *const table = (int *)(smem + Cfg::TABLE_OFF) + wave * Cfg::TABLE_ENTRIES;
+#endif
     const int granule = Cfg::SPARSE ? p.sparse_block_kv : p.page_kv;
     int t0 = 0, c_end = 0;
     struct TableLoad {
@@ -200,13 +251,23 @@ template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl
         }
         return t;
     };
+#ifdef CDNA4_MQA_SPARSE_STARTS
+    static_assert(Cfg::PAGED && Cfg::SPARSE && Cfg::WAVE_CHUNK <= 8 * 64);
+    int lane_start = 0;
+#endif
     auto store_table = [&](const TableLoad &t, int c_lo, int c_hi) {
         t0 = c_lo / granule;
         c_end = c_hi;
+#ifdef CDNA4_MQA_SPARSE_STARTS
+        // Wave chunks begin on eight-column boundaries. At most 64 block
+        // starts are live, so the lane's first prefetched entry suffices.
+        lane_start = t.entries[0];
+#else
 #pragma unroll
         for (int k = 0; k < Cfg::TABLE_PER_LANE; ++k)
             if (lane + 64 * k < Cfg::TABLE_ENTRIES)
                 table[lane + 64 * k] = t.entries[k];
+#endif
     };
     struct KvRow {
         const uint8_t *data;
@@ -237,9 +298,41 @@ template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl
     };
     auto load_step = [&](int n0) {
         KvStep s;
+#ifdef CDNA4_MQA_SPARSE_STARTS
+        // The four neighbouring columns of each lane belong to one sparse
+        // block. Clamp each physical position separately, also for a block
+        // spanning two physical pages or containing a negative start.
+        const int col = min(n0 + 4 * r16, c_end - 1);
+        const int start = __shfl(lane_start, col / 8 - t0, 64);
+#endif
+#ifdef CDNA4_MQA_PAGE_FAST
+        const uint8_t *same_page = nullptr;
+        if constexpr (Cfg::PAGED && !Cfg::SPARSE) {
+            if (n0 + Cfg::STEP <= c_end && n0 % p.page_kv <= p.page_kv - Cfg::STEP) {
+                const int id = __builtin_amdgcn_readfirstlane(table[n0 / p.page_kv - t0]);
+                same_page = p.kv + int64_t(id) * p.page_stride;
+            }
+        }
+#endif
         static_for<0, J>([&](auto JJ) {
             constexpr int j = decltype(JJ)::value;
-            const KvRow row = kv_row(n0 + 4 * r16 + j);
+            KvRow row;
+#ifdef CDNA4_MQA_PAGE_FAST
+            if (same_page) {
+                const int r = n0 % p.page_kv + 4 * r16 + j;
+                row = {same_page + r * ROW_BYTES, same_page + p.page_kv * ROW_BYTES + 4 * r};
+            } else
+#endif
+#ifdef CDNA4_MQA_SPARSE_STARTS
+            {
+                const int pos = max(0, start + min(n0 + 4 * r16 + j, c_end - 1) % 8);
+                const uint8_t *page = p.kv + int64_t(pos / p.page_kv) * p.page_stride;
+                const int k = pos % p.page_kv;
+                row = {page + k * ROW_BYTES, page + p.page_kv * ROW_BYTES + 4 * k};
+            }
+#else
+            row = kv_row(n0 + 4 * r16 + j);
+#endif
 #pragma unroll
             for (int hf = 0; hf < 2; ++hf)
                 s.kf[j][hf] = Cfg::half_exists(g, hf) ? *(const v4i *)(row.data + 16 * g + 64 * hf) : v4i{};
@@ -270,7 +363,11 @@ template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl
         KvStep kv_cur = load_step(c_lo);
         for (int n0 = c_lo; n0 < c_hi; n0 += Cfg::STEP) {
             // the next step's KV rows load during this step's MFMAs
+#if defined(CDNA4_MQA_PAGE_FAST) || defined(CDNA4_MQA_SPARSE_STARTS)
+            const KvStep kv_next = n0 + Cfg::STEP < c_hi ? load_step(n0 + Cfg::STEP) : KvStep{};
+#else
             const KvStep kv_next = load_step(n0 + Cfg::STEP);
+#endif
             __builtin_amdgcn_sched_barrier(0);
             const auto &kf = kv_cur.kf;
             const auto &ks = kv_cur.ks;
@@ -290,18 +387,12 @@ template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl
                         part[u][j][c] = v2f{};
             // (the next tile's operand is read during this one's; the scheduler may not hoist further,
             // or the accumulators of all tiles become live at once)
-            struct QTile {
-                v4i halves[2];
-                uint32_t code;
-            };
             auto read_tile = [&](int t) {
-                QTile q;
-#pragma unroll
-                for (int hf = 0; hf < 2; ++hf)
-                    q.halves[hf] =
-                        hf < Cfg::HALVES ? *(const v4i *)(smem + (Cfg::HALVES * t + hf) * 1024 + 16 * lane) : v4i{};
-                q.code = Cfg::MX ? *(const uint32_t *)(smem + Cfg::CODES_OFF + t * 256 + 4 * lane) : 127u;
-                return q;
+#ifdef CDNA4_MQA_REGISTER_Q
+                return resident[t];
+#else
+                return staged_query(t);
+#endif
             };
             // Software pipeline: iteration t issues the MFMAs of tile t and the weighted ReLUs of tile
             // t - 1, interleaved (one MFMA per 8 VALU instructions: a ReLU and an FMA per result).
@@ -369,7 +460,39 @@ template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl
             for (int u = 0; u < U; ++u) {
                 if (!stores[u])
                     continue;
+#ifdef CDNA4_MQA_BLOCK_MAX
+                // Two neighbouring lanes own the eight logits for a candidate.
+                // Use the BF16 score bits, then implement maxnum and cap at the
+                // greatest finite value. Integer keys keep signed zero ordered.
+                unsigned largest = 0;
+#pragma unroll
+                for (int j = 0; j < J; ++j) {
+                    const int n = n0 + 4 * r16 + j;
+                    const uint16_t b = n < col_hi[u] ? f32_to_bf16(out[u][j]) : uint16_t(0xff80);
+                    const unsigned key = (b & 0x7fffu) > 0x7f80u ? 0u : ((b & 0x8000u) ? (0xffffu ^ b) : (0x8000u ^ b));
+                    largest = max(largest, key);
+                }
+                largest = max(largest, __shfl_xor(largest, 1, 64));
+                const int base = n0 + 4 * r16;
+                if (!(r16 & 1) && base < col_hi[u]) {
+                    uint16_t value = largest ? (largest & 0x8000u ? largest ^ 0x8000u : largest ^ 0xffffu) : 0x7f7fu;
+                    if (value == 0x7f80u)
+                        value = 0x7f7fu;
+                    if (base + 8 >= col_hi[u])
+                        value = 0x7f80u;
+                    p.block_scores[int64_t(tok_of_u[u]) * p.ld_block_scores + base / 8] = value;
+                }
+#endif
                 OutT *const row = logits + (int64_t)tok_of_u[u] * p.ld_logits - col_shift[u];
+#ifdef CDNA4_MQA_VECTOR_OUTPUT
+                const int first = n0 + 4 * r16;
+                if (first >= col_lo[u] && first + 4 <= col_hi[u] && !(reinterpret_cast<uintptr_t>(row + first) & 7u)) {
+                    using Codes = uint16_t __attribute__((ext_vector_type(4)));
+                    const Codes packed = {f32_to_bf16(out[u][0]), f32_to_bf16(out[u][1]), f32_to_bf16(out[u][2]), f32_to_bf16(out[u][3])};
+                    *reinterpret_cast<Codes *>(row + first) = packed;
+                    continue;
+                }
+#endif
 #pragma unroll
                 for (int j = 0; j < J; ++j) {
                     const int n = n0 + 4 * r16 + j;
@@ -386,3 +509,43 @@ template <class Cfg, class OutT> __device__ __forceinline__ void mqa_logits_impl
     }
 #endif
 }
+
+#ifdef CDNA4_MQA_FIVE_GROUP
+template <class Cfg, class Short, class Out> __device__ __forceinline__ void mqa_five_positions(const MqaLogitsArgs &p) {
+    constexpr bool split = Cfg::QW == 3;
+    static_assert(Cfg::QW == 3 || Cfg::QW == 5);
+    const int start = (int(blockIdx.x) / (split ? 2 : 1)) * 5;
+    const bool second = split && (blockIdx.x & 1);
+    const int first = start + (second ? 3 : 0), end = min(p.num_q, start + (split && !second ? 3 : 5));
+    if (first >= end)
+        return;
+    bool regular = start + 5 <= p.num_q && p.run_starts[start] == start;
+#pragma unroll
+    for (int i = 1; i < 5; ++i)
+        regular = regular && p.run_starts[start + i] == start;
+    regular = regular && (start + 5 == p.num_q || p.run_starts[start + 5] != start);
+    if (regular) {
+        if constexpr (split) {
+            if (second) {
+                mqa_logits_impl<Short, Out>(p, first, 2);
+                return;
+            }
+        }
+        mqa_logits_impl<Cfg, Out>(p, first, Cfg::QW);
+        return;
+    }
+    // A chunk may cut through any sequence or padding run. Execute exactly
+    // those original subgroup starts that belong to this chunk, using the
+    // original block-table row and bounded subgroup size for each one.
+    for (int x = first; x < end; ++x) {
+        const int base = p.run_starts[x];
+        if ((x - base) % Cfg::QW)
+            continue;
+        int n = 1;
+        while (n < Cfg::QW && x + n < p.num_q && p.run_starts[x + n] == base)
+            ++n;
+        mqa_logits_impl<Cfg, Out>(p, x, n);
+        __syncthreads();
+    }
+}
+#endif

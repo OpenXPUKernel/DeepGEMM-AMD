@@ -23,6 +23,8 @@ __all__ = [
     "fp8_fp4_mega_moe",
     "bf16_mega_moe",
     "ResidentMoEPanelWeights",
+    "SharedExpertPanels",
+    "prepare_shared_expert_panels",
     "prepare_weights_for_resident_mega_moe",
 ]
 
@@ -40,6 +42,39 @@ class ResidentMoEPanelWeights(NamedTuple):
 
     weight: torch.Tensor
     scales: torch.Tensor
+
+
+class SharedExpertPanels(NamedTuple):
+    """Native shared FP8 [N/32,K/128,32,128] storage; public scales remain unmodified."""
+
+    weight: torch.Tensor
+    scales: torch.Tensor
+
+
+def prepare_shared_expert_panels(pair):
+    w, sf = pair
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("prepare immutable shared weights before capture")
+    if (
+        w.ndim != 2
+        or not w.is_cuda
+        or w.dtype != torch.float8_e4m3fn
+        or not w.is_contiguous()
+    ):
+        raise ValueError("expected contiguous FP8 shared weights")
+    n, k = w.shape
+    if (
+        n % 32
+        or k % 128
+        or sf.device != w.device
+        or sf.dtype != torch.int32
+        or sf.shape != (n, k // 128)
+    ):
+        raise ValueError("invalid shared weight panel or scale geometry")
+    packed = (
+        w.view(n // 32, 32, k // 128, 128).permute(0, 2, 1, 3).contiguous().view(n, k)
+    )
+    return SharedExpertPanels(packed, sf)
 
 
 def prepare_weights_for_resident_mega_moe(l1_weights, l2_weights):
@@ -294,6 +329,8 @@ def _mega_moe(
     activation_clamp,
     fast_math,
     with_sf,
+    shared_result=None,
+    timing=None,
 ):
     if activation != "swiglu":
         raise ValueError(f"only the swiglu activation is supported, got {activation}")
@@ -314,6 +351,17 @@ def _mega_moe(
         shared_l2_weights, ResidentMoEPanelWeights
     ):
         raise ValueError("shared experts do not use routed packed-FP4 panel storage")
+    shared_format = int(isinstance(shared_l1_weights, SharedExpertPanels)) | (
+        2 * int(isinstance(shared_l2_weights, SharedExpertPanels))
+    )
+    if shared_format and not panels:
+        raise ValueError(
+            "tagged shared panels require resident routed matrix execution"
+        )
+    if isinstance(l1_weights, SharedExpertPanels) or isinstance(
+        l2_weights, SharedExpertPanels
+    ):
+        raise ValueError("the shared FP8 panel layout is only valid for shared weights")
     (l1, l1_sf), (l2, l2_sf) = _split(l1_weights), _split(l2_weights)
     (s1, s1_sf), (s2, s2_sf) = (
         (_split(shared_l1_weights), _split(shared_l2_weights))
@@ -380,8 +428,25 @@ def _mega_moe(
         clamp,
         bool(fast_math),
     )
-    if panels:
-        _C.cdna4_mega_moe(*arguments, resident_weight_panels=True)
+    extra = {}
+    if timing is not None:
+        if not panels or not isinstance(timing, tuple) or len(timing) != 2:
+            raise ValueError(
+                "timing requires native panels and a (ring,positions) pair"
+            )
+        extra = dict(trace=timing[0], position=timing[1])
+    if shared_result is not None:
+        if not panels:
+            raise ValueError("prepared shared output requires resident routed panels")
+        _C.cdna4_mega_moe(
+            *arguments,
+            resident_weight_panels=True,
+            shared_result=shared_result,
+            shared_panel_mask=shared_format,
+            **extra,
+        )
+    elif panels:
+        _C.cdna4_mega_moe(*arguments, resident_weight_panels=True,shared_panel_mask=shared_format,**extra)
     else:
         _C.cdna4_mega_moe(*arguments)
 
@@ -398,6 +463,8 @@ def fp8_fp4_mega_moe(
     activation: str = "swiglu",
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
+    shared_result: Optional[torch.Tensor] = None,
+    timing=None,
 ) -> None:
     """y = the MoE of the tokens in sym_buffer (x, x_sf, topk_idx, topk_weights): FP8 activations and
     FP8 or packed FP4 expert weights with UE8M0 scales per 32 values, SwiGLU with the top-k weight
@@ -416,6 +483,8 @@ def fp8_fp4_mega_moe(
         activation_clamp,
         fast_math,
         True,
+        shared_result,
+        timing,
     )
 
 

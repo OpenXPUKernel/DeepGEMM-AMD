@@ -123,5 +123,8 @@ struct MegaMoeKernelArgs {
     int *state, *l1_done, *sf_ready, *jobs, *job_ready;
     uint64_t *k_ready;
     int max_blocks, shared_tokens, dispatch_blocks, n1, n2;
+    uint64_t *trace;
+    const void *first_position;
+    int position64;
 };
 } // namespace deep_gemm::cdna4

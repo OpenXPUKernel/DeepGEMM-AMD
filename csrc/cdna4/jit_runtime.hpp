@@ -254,6 +254,8 @@ class JitRuntime {
                            : config.variant == KernelVariant::mfma_16x16x128_split_k  ? "SplitK"
                                                                                       : "DataParallel";
         std::ostringstream source;
+        if (out_dtype == MXFP8_OUT_PACKED_WV)
+            source << "#define DG_PACKED_WV_OUTPUT 1\n";
         source << "#include <deep_gemm/impls/cdna4/fp8_gemm_mfma_16x16x128.cuh>\n";
         if (config.variant == KernelVariant::mfma_16x16x128_split_k)
             source << "#include <deep_gemm/impls/cdna4/split_k_reduce.cuh>\n";

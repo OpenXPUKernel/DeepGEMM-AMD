@@ -151,17 +151,40 @@ template <int H, int TopK> __device__ __forceinline__ void reduce(const MegaMoeA
             for (uint32_t linear = blockIdx.x * blockDim.x + threadIdx.x; linear < uint32_t(p.num_tokens) * (H / 8);
                  linear += gridDim.x * blockDim.x) {
                 const int token = __builtin_amdgcn_readfirstlane(linear / (H / 8));
+#ifdef CDNA4_WAVE_SLOT_REDUCE
+                // Each wave covers 512 channels of one token. The first
+                // TopK lanes collect its signed physical IDs in one load.
+                const int lane = threadIdx.x % 64;
+                const unsigned mask = unsigned(__ballot(lane < TopK && ids[int64_t(token) * TopK + lane] >= 0));
+#else
                 unsigned mask = 0;
 #pragma unroll
                 for (int slot = 0; slot < TopK; ++slot)
                     mask |= unsigned(ids[int64_t(token) * TopK + slot] >= 0) << slot;
+#endif
                 v4i values[TopK];
+#if defined(CDNA4_WAVE_SLOT_REDUCE) && CDNA4_WAVE_SLOT_REDUCE == 2
+                if (mask == (0xffffffffu >> (32 - TopK))) {
 #pragma unroll
-                for (int slot = 0; slot < TopK; ++slot)
-                    values[slot] =
-                        (mask & (1u << slot))
-                            ? __builtin_amdgcn_raw_buffer_load_b128(input, linear * 16, uint32_t(slot * plane), 16)
-                            : v4i{};
+                    for (int slot = 0; slot < TopK; ++slot)
+                        values[slot] = __builtin_amdgcn_raw_buffer_load_b128(input, linear * 16, uint32_t(slot * plane), 16);
+                } else
+#endif
+                {
+#pragma unroll
+                    for (int slot = 0; slot < TopK; ++slot) {
+#if defined(CDNA4_WAVE_SLOT_REDUCE) && CDNA4_WAVE_SLOT_REDUCE == 3
+                        // A disabled slot lies outside the bounded descriptor,
+                        // so the hardware supplies the same zero operand.
+                        const uint32_t offset = (mask & (1u << slot)) ? linear * 16 + uint32_t(slot * plane) : 0xffffffffu;
+                        values[slot] = __builtin_amdgcn_raw_buffer_load_b128(input, offset, 0, 16);
+#else
+                        values[slot] = (mask & (1u << slot))
+                                           ? __builtin_amdgcn_raw_buffer_load_b128(input, linear * 16, uint32_t(slot * plane), 16)
+                                           : v4i{};
+#endif
+                    }
+                }
                 float sum[8] = {};
 #pragma unroll
                 for (int slot = 0; slot < TopK; ++slot) {

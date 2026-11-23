@@ -53,6 +53,10 @@ struct MqaLogitsArgs {
     // context_lens (PagedSparse) give the tokens' KV lengths.
     const std::int32_t *sparse_starts;
     int num_max_sparse_blocks, sparse_block_kv;
+    std::uint16_t *block_scores;
+    std::int32_t *block_counts;
+    std::int64_t ld_block_scores;
+    std::int32_t score_width;
 };
 
 } // namespace deep_gemm::cdna4

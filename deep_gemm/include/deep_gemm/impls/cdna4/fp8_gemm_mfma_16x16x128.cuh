@@ -680,14 +680,98 @@ __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_impl(GemmArgs p, GroupTi
                 static_for<0, 4>([&](auto S) {
                     constexpr int ss = decltype(S)::value;
                     const v4u v = *(const v4u *)(resident_mfma16_lds + epi_rd + 2 * ss * Cfg::EPI_PITCH);
+#ifdef DG_PACKED_WV_OUTPUT
+                    float values[8];
+                    float peak = 1e-4f;
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        unpack_bf16x2(v[k], values[2 * k], values[2 * k + 1]);
+                        peak = fmaxf(peak, fmaxf(fabsf(values[2 * k]), fabsf(values[2 * k + 1])));
+                    }
+                    peak = fmaxf(peak, __shfl_xor(peak, 1));
+                    peak = fmaxf(peak, __shfl_xor(peak, 2));
+                    const uint32_t exp = ((__float_as_uint(peak * (1.f / 448.f)) - 1) >> 23) + 1;
+                    const float inv = __uint_as_float((254u - exp) << 23);
+                    v2u packed;
+#pragma unroll
+                    for (int k = 0; k < 2; ++k) {
+                        float q[4];
+#pragma unroll
+                        for (int a = 0; a < 4; ++a)
+                            q[a] = fminf(fmaxf(values[4 * k + a] * inv, -448.f), 448.f);
+                        const int lo = __builtin_amdgcn_cvt_pk_fp8_f32(q[0], q[1], 0, false);
+                        packed[k] = __builtin_amdgcn_cvt_pk_fp8_f32(q[2], q[3], lo, true);
+                    }
+                    const int row = s.m0 + wm * 128 + (wave % 2) * 8 + lane / 32 + 16 * i + 2 * ss;
+                    const int col = s.n0 + (lane % 32) * 8;
+                    const int leader = lane & ~15;
+                    const uint32_t scales = exp | (uint32_t(__shfl(exp, leader + 4)) << 8) | (uint32_t(__shfl(exp, leader + 8)) << 16) |
+                                            (uint32_t(__shfl(exp, leader + 12)) << 24);
+                    if (row < s.m_end) {
+                        auto *dst = static_cast<uint8_t *>(p.D) + s.group * p.d_group_stride + int64_t(row) * p.ldd + col;
+                        *reinterpret_cast<v2u *>(dst) = packed;
+                        if (lane % 16 == 0)
+                            p.moe_sf[int64_t((s.group * p.N + col) / 128) * p.moe_sf_pitch + row] = scales;
+                    }
+#else
                     const int soff = (int)(((uint32_t)(16 * i + 2 * ss) * p.ldd + s.n0) * 2);
                     buffer_store16<(0)>(v, rout, epi_out, soff);
+#endif
                 });
             }
             asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
         });
     };
     auto store_persistent_tile = [&](const Src &s) {
+#ifdef DG_PACKED_WV_OUTPUT
+        if constexpr (Cfg::PAIRED_B_FRAGMENTS) {
+            // Four lane groups own exactly one group of 32 output channels.
+            // Preserve the BF16 materialization before both amax and conversion.
+            static_for<0, 8>([&](auto I) {
+                constexpr int i = decltype(I)::value;
+                const int row = s.m0 + wm * 128 + 16 * i + r16;
+                uint32_t scales = 0;
+                static_for<0, 4>([&](auto P) {
+                    constexpr int pp = decltype(P)::value;
+                    const v4f lo = acc[i][2 * pp], hi = acc[i][2 * pp + 1];
+                    const v4u bf{
+                        pack_bf16x2(lo[0], lo[1]), pack_bf16x2(lo[2], lo[3]), pack_bf16x2(hi[0], hi[1]), pack_bf16x2(hi[2], hi[3])};
+                    float v[8], peak = 1.e-4f;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        unpack_bf16x2(bf[j], v[2 * j], v[2 * j + 1]);
+                        peak = fmaxf(peak, fmaxf(fabsf(v[2 * j]), fabsf(v[2 * j + 1])));
+                    }
+                    peak = fmaxf(peak, __shfl_xor(peak, 16));
+                    peak = fmaxf(peak, __shfl_xor(peak, 32));
+                    const uint32_t exponent = ((__float_as_uint(peak * (1.f / 448.f)) - 1) >> 23) + 1;
+                    const float inverse = __uint_as_float((254u - exponent) << 23);
+                    scales |= exponent << (pp * 8);
+                    v2u packed;
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) {
+                        float q[4];
+#pragma unroll
+                        for (int k = 0; k < 4; ++k)
+                            q[k] = fminf(fmaxf(v[4 * j + k] * inverse, -448.f), 448.f);
+                        const int a = __builtin_amdgcn_cvt_pk_fp8_f32(q[0], q[1], 0, false);
+                        packed[j] = __builtin_amdgcn_cvt_pk_fp8_f32(q[2], q[3], a, true);
+                    }
+                    if (row < s.m_end) {
+                        const int col = s.n0 + wn * 128 + pp * 32 + 8 * g;
+                        auto *dst = static_cast<uint8_t *>(p.D) + s.group * p.d_group_stride + int64_t(row) * p.ldd + col;
+                        *reinterpret_cast<v2u *>(dst) = packed;
+                    }
+                    __builtin_amdgcn_sched_barrier(0);
+                });
+                if (g == 0 && row < s.m_end)
+                    p.moe_sf[int64_t((s.group * p.N + s.n0) / 128 + wn) * p.moe_sf_pitch + row] = scales;
+            });
+        } else {
+            store_tile_lds(s, std::true_type{});
+        }
+        return;
+#endif
         if (fast_ok && ((s.m0 + BM <= s.m_end)) && s.n0 + BN <= p.N) {
             if constexpr (Cfg::PERSISTENT && std::is_same<OutT, uint16_t>::value) {
                 if (p.alpha == 1.f)

@@ -143,9 +143,91 @@ std::pair<int64_t, int64_t> logical_mn_k(const torch::Tensor &t, OperandType typ
 }
 
 // FP8 / packed FP4 operands with packed scales, or (no scales) BF16 operands
+void launch_compact_wv(GemmArgs &args, const char *shape, int groups, int output_splits, hipStream_t stream, const torch::Tensor &original,
+    const OptTensor &panels, const OptTensor &panel_sf) {
+    const std::string tile(shape);
+    TORCH_CHECK(tile == "64x128" || tile == "128x128" || tile == "128x256" || tile == "32x128" || tile == "64x64" || tile == "64x256",
+        "unsupported packed WV tile");
+    const int bm = std::stoi(tile.substr(0, tile.find('x')));
+    const int bn = std::stoi(tile.substr(tile.find('x') + 1));
+    const char *value = output_splits && args.K == 5120 ? std::getenv("DG_CDNA4_QSWA_STAGES") : nullptr;
+    if (!value && !output_splits)
+        value = std::getenv("DG_CDNA4_WV_PANEL_STAGES");
+    if (!value && output_splits && args.K == 8192)
+        value = std::getenv("DG_CDNA4_OUT_PANEL_STAGES");
+    if (!value)
+        value = std::getenv("DG_CDNA4_COMPACT_STAGES");
+    TORCH_CHECK(!value || std::string(value) == "2" || std::string(value) == "3", "compact stages must be 2 or 3");
+    const int stages = value && std::string(value) == "3" ? 3 : 2;
+    std::ostringstream source;
+    const char *flow = std::getenv(!output_splits   ? "DG_CDNA4_WV_FRAGMENT_PIPE"
+                                   : args.K == 5120 ? "DG_CDNA4_QSWA_FRAGMENT_PIPE"
+                                                    : "DG_CDNA4_OUT_FRAGMENT_PIPE");
+    if (flow && (std::string(flow) == "1" || std::string(flow) == "2"))
+        source << "#define CDNA4_DENSE_FRAGMENT_PIPE " << flow << "\n";
+    TORCH_CHECK(!panel_sf || panels, "compact scales require an explicitly packed weight");
+    if (panels) {
+        TORCH_CHECK(panels->device() == original.device() && panels->scalar_type() == torch::kFloat8_e4m3fn && panels->is_contiguous() &&
+                        panels->dim() == 5 && panels->size(0) == groups && panels->size(1) == args.N / 32 &&
+                        panels->size(2) == args.K / 128 && panels->size(3) == 32 && panels->size(4) == 128,
+            "dense panels must be contiguous FP8 [groups,N/32,K/128,32,128]");
+        args.B = reinterpret_cast<const uint8_t *>(panels->data_ptr());
+        args.b_group_stride = int64_t(args.N) * args.K;
+        args.ldb = args.K;
+        source << "#define CDNA4_DENSE_PANELS 1\n";
+        if (panel_sf) {
+            TORCH_CHECK(panel_sf->device() == original.device() && panel_sf->scalar_type() == torch::kInt32 && panel_sf->is_contiguous() &&
+                            panel_sf->dim() == 3 && panel_sf->size(0) == groups && panel_sf->size(1) == args.N / 32 &&
+                            panel_sf->size(2) == args.K / 128,
+                "invalid compact panel scales");
+            args.sfb = panel_sf->data_ptr<int32_t>();
+            args.sfb_group_stride = int64_t(args.N / 32) * (args.K / 128);
+            args.ldb_sf = args.K / 128;
+            source << "#define CDNA4_DENSE_GROUP_SCALE 1\n";
+        }
+    }
+    int coop = 0, coop_stages = 0;
+    unsigned lds = stages * ((bm + bn) * 128 + (panel_sf ? 1024 : 2048));
+    if (const char *requested = std::getenv(args.K == 5120 ? "DG_CDNA4_QSWA_SPLIT_WAVES" : "DG_CDNA4_OUT_SPLIT_WAVES");
+        output_splits > 1 && groups == 1 && requested && std::string(requested) != "0") {
+        char tail = 0;
+        TORCH_CHECK(std::sscanf(requested, "%d,%d%c", &coop, &coop_stages, &tail) == 2 && coop >= 2 && coop <= 4 &&
+                        (coop_stages == 1 || coop_stages == 2),
+            "invalid cooperative split shape");
+        const int kt = args.K / 128, span = ceil_div(kt, output_splits);
+        coop = std::min(coop, ceil_div(kt, span));
+        int bytes = (bm + bn) * 128 + ceil_div(bm, 64) * 256 + (panel_sf ? 0 : ceil_div(bn, 64) * 256);
+        bytes = ceil_div(bytes, 1024) * 1024;
+        const int required = std::max(coop * coop_stages * bytes, (coop - 1) * bm * bn * 4);
+        if (coop >= 2 && required <= 163840)
+            lds = required;
+        else
+            coop = 0;
+    }
+    if (coop) {
+        source << "#include <deep_gemm/impls/cdna4/cooperative_dense_splits.cuh>\n"
+                  "extern \"C\" __global__ __launch_bounds__("
+               << coop * 256
+               << ") void dg_packed_wv(deep_gemm::cdna4::GemmArgs p){"
+                  "cooperative_dense_splits<"
+               << bm << "," << bn << "," << output_splits << "," << coop << "," << coop_stages << "," << args.K << "," << args.N
+               << ">(p);}";
+    } else
+        source << "#include <deep_gemm/impls/cdna4/packed_wv.cuh>\n"
+                  "extern \"C\" __global__ __launch_bounds__(256) void dg_packed_wv(deep_gemm::cdna4::GemmArgs p){"
+                  "packed_wv_tile<"
+               << bm << "," << bn << "," << output_splits << "," << stages << "," << args.K << "," << args.N << ">(p);}";
+    const auto text = source.str();
+    const auto module = jit_runtime.get_module("compact_wv:" + text, [&] { return text; }, {"dg_packed_wv"});
+
+    const int error = deep_gemm::cdna4::JitRuntime::launch_kernel(
+        module->kernels[0], args, dim3(args.N / bn, ceil_div(args.M, bm), groups), dim3(256 * std::max(1, coop)), lds, stream);
+    TORCH_CHECK(error == 0, "packed WV tile launch failed: ", error);
+}
+
 void cdna4_fp8_gemm_nt(const torch::Tensor &a, const std::optional<torch::Tensor> &sfa, const torch::Tensor &b,
-                       const std::optional<torch::Tensor> &sfb, const torch::Tensor &d,
-                       const std::optional<torch::Tensor> &c, double alpha, int gran_k_a, int gran_k_b) {
+    const std::optional<torch::Tensor> &sfb, const torch::Tensor &d, const std::optional<torch::Tensor> &c, double alpha, int gran_k_a,
+    int gran_k_b, bool reference_plan = false, const OptTensor &panels = std::nullopt, const OptTensor &panel_sf = std::nullopt) {
     const auto device = d.device();
     const bool bf16 = !sfa.has_value();
     TORCH_CHECK(sfa.has_value() == sfb.has_value(), "pass scales for both operands or for none");
@@ -194,6 +276,27 @@ void cdna4_fp8_gemm_nt(const torch::Tensor &a, const std::optional<torch::Tensor
                                         int(lhs.mn_major) | (int(rhs.mn_major) << 1),
                                         bf16 ? 0 : int(gran_k_a == 128) | (int(gran_k_b == 128) << 1), a_type, b_type);
 
+    const bool decode_out = n == 5120 && k == 8192;
+    const bool decode_qswa = n == 1792 && k == 5120;
+    if (!reference_plan && (decode_out || decode_qswa) && (m == 400 || m == 500) && a_type == OperandType::Fp8 &&
+        b_type == OperandType::Fp8 && !lhs.mn_major && !rhs.mn_major && !c && alpha == 1.0 && gran_k_a == 32 && gran_k_b == 32 &&
+        out_dtype == MXFP8_OUT_BF16) {
+        const char *tile = std::getenv(decode_out ? "DG_CDNA4_LOCAL_OUT_TILE" : "DG_CDNA4_LOCAL_QSWA_TILE");
+        if (decode_out && m == 400) {
+            if (const char *draft_tile = std::getenv("DG_CDNA4_DRAFT_OUT_TILE"))
+                tile = draft_tile;
+        }
+        if (tile && std::string(tile) != "off") {
+            int splits = 1;
+            if (config.variant == deep_gemm::cdna4::KernelVariant::mfma_16x16x128_split_k)
+                splits = config.split_k;
+            else if (config.variant == deep_gemm::cdna4::KernelVariant::mfma_16x16x128_small_m)
+                splits = config.waves;
+            GemmArgs args = make_args(a, sfa, b, sfb, d, nullptr, m, n, k, lhs.ld, rhs.ld, lda_sf, ldb_sf, ldd);
+            launch_compact_wv(args, tile, 1, splits, c10::hip::getCurrentHIPStream(d.get_device()).stream(), b, panels, panel_sf);
+            return;
+        }
+    }
     // Each split writes FP32 [M, align(N,4)]; workspace_size is measured in bytes.
     const auto workspace_size = jit_runtime.workspace_size(config, m, n);
     auto workspace = workspace_size == 0 ? torch::Tensor()
@@ -382,9 +485,9 @@ void cdna4_m_grouped_fp8_gemm_contiguous(const torch::Tensor &a, const OptTensor
 // D[g, :masked_m[g]] (+)= alpha A[g, :masked_m[g]] @ B[g]^T: the masked layout, and (masked_m all
 // full) batched GEMMs over strided views. A / B are K- or MN-major within each group (MN-major
 // operands run the 256x256 tiles); D is N-major, C (if any) has D's strides.
-void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor &a, const OptTensor &sfa, const torch::Tensor &b,
-                                     const OptTensor &sfb, const torch::Tensor &d, const torch::Tensor &masked_m,
-                                     int expected_m, int gran_k_a, int gran_k_b, const OptTensor &c, double alpha) {
+void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor &a, const OptTensor &sfa, const torch::Tensor &b, const OptTensor &sfb,
+    const torch::Tensor &d, const torch::Tensor &masked_m, int expected_m, int gran_k_a, int gran_k_b, const OptTensor &c, double alpha,
+    const OptTensor &output_sf, const OptTensor &panels = std::nullopt, const OptTensor &panel_sf = std::nullopt) {
     const auto device = d.device();
     const bool bf16 = !sfa.has_value();
     TORCH_CHECK(sfa.has_value() == sfb.has_value(), "pass scales for both operands or for none");
@@ -398,7 +501,16 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor &a, const OptTensor &sf
     TORCH_CHECK(b.size(0) == groups && logical_mn_k(b, b_type).second == k && d.size(0) == groups &&
                     d.size(1) == max_m && d.size(2) == n,
                 "masked GEMM shape mismatch");
-    TORCH_CHECK(d.scalar_type() == torch::kBFloat16 || d.scalar_type() == torch::kFloat, "d must be BF16 or FP32");
+    if (output_sf) {
+        TORCH_CHECK(d.scalar_type() == at::kFloat8_e4m3fn && !c && alpha == 1.0 && !bf16 && groups == 8 && n == 1024 && k == 4096 &&
+                        expected_m == max_m && (max_m == 400 || max_m == 500) && d.stride(0) == n && d.stride(1) == groups * n &&
+                        output_sf->device() == device && output_sf->scalar_type() == torch::kInt32 && output_sf->dim() == 2 &&
+                        output_sf->size(0) == max_m && output_sf->size(1) == groups * n / 128 && output_sf->stride(0) == 1 &&
+                        output_sf->stride(1) >= max_m && output_sf->stride(1) <= INT32_MAX,
+            "invalid packed WV output layout");
+    } else {
+        TORCH_CHECK(d.scalar_type() == torch::kBFloat16 || d.scalar_type() == torch::kFloat, "d must be BF16 or FP32");
+    }
     TORCH_CHECK(n <= 1 || d.stride(2) == 1, "d must be N-major");
     if (c.has_value())
         TORCH_CHECK(c->is_cuda() && c->device() == device && c->sizes() == d.sizes() && c->strides() == d.strides() &&
@@ -443,7 +555,18 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor &a, const OptTensor &sf
     const int tiles = config.variant == deep_gemm::cdna4::KernelVariant::mfma_16x16x128_small_m
                           ? set_group_m_slots(args, config, expected_m, max_m, groups, n)
                           : groups * ceil_div(max_m, config.block_m) * ceil_div(n, config.block_n);
-    launch_or_throw(args, config, out_dtype, d, tiles);
+    if (output_sf) {
+        TORCH_CHECK(config.variant == deep_gemm::cdna4::KernelVariant::mfma_16x16x128_persistent, "packed WV requires the persistent GEMM");
+        args.moe_sf = output_sf->data_ptr<int32_t>();
+        args.moe_sf_pitch = output_sf->stride(1);
+        if (const char *shape = std::getenv("DG_CDNA4_PACKED_WV_TILE"); shape && std::string(shape) != "off") {
+            TORCH_CHECK(mn_major == 0 && a_type == OperandType::Fp8 && b_type == OperandType::Fp8 && gran_k_a == 32 && gran_k_b == 32,
+                "packed WV tile requires row-wise FP8 inputs");
+            launch_compact_wv(args, shape, groups, 0, c10::hip::getCurrentHIPStream(d.get_device()).stream(), b, panels, panel_sf);
+            return;
+        }
+    }
+    launch_or_throw(args, config, output_sf ? MXFP8_OUT_PACKED_WV : out_dtype, d, tiles);
 }
 
 // D[g] (+)= A_g^T B_g over the K range of group g. MN-major (TN): A [sum_k, M], B [sum_k, N].
@@ -522,7 +645,7 @@ void cdna4_k_grouped_fp8_gemm(const torch::Tensor &a, const OptTensor &sfa, cons
 
 // Return the unchanged split-K partials so the routing kernel can perform
 // their original ordered reduction without materializing another logits tensor.
-OptTensor cdna4_bf16_gate_partials(const torch::Tensor &x, const torch::Tensor &weight) {
+OptTensor cdna4_bf16_gate_partials(const torch::Tensor &x, const torch::Tensor &weight, const OptTensor &packed, int packed_layout) {
     TORCH_CHECK(x.is_cuda() && weight.is_cuda() && x.dim() == 2 && weight.dim() == 2 && x.is_contiguous() &&
                     weight.is_contiguous() && x.scalar_type() == torch::kBFloat16 &&
                     weight.scalar_type() == torch::kBFloat16 && x.device() == weight.device() &&
@@ -532,12 +655,54 @@ OptTensor cdna4_bf16_gate_partials(const torch::Tensor &x, const torch::Tensor &
     const int m = x.size(0), n = weight.size(0), k = x.size(1);
     if (!((m == 500 && n == 384) || (m == 400 && n == 128)) || k != 5120)
         return std::nullopt;
+    TORCH_CHECK((packed_layout == 0) == !packed.has_value() && packed_layout >= 0 && packed_layout <= 2, "invalid prepared gate layout");
+    if (packed) {
+        const bool n_first = packed_layout == 1;
+        TORCH_CHECK(packed->device() == weight.device() && packed->scalar_type() == torch::kBFloat16 && packed->is_contiguous() &&
+                        packed->dim() == 5 && packed->size(0) == (n_first ? n / 16 : k / 32) &&
+                        packed->size(1) == (n_first ? k / 32 : n / 16) && packed->size(2) == 4 && packed->size(3) == 16 &&
+                        packed->size(4) == 8,
+            "prepared gate operand must match the declared fragment layout");
+    }
     const int cus = deep_gemm::cdna4::num_compute_units();
     const auto config = get_best_config(m, n, deep_gemm::cdna4::planner_k(k, OperandType::Bf16), MXFP8_OUT_FP32, false,
                                         n, true, 0, 0, OperandType::Bf16, OperandType::Bf16);
     if (config.variant != deep_gemm::cdna4::KernelVariant::mfma_16x16x128_split_k || config.split_k <= 1)
         return std::nullopt;
-    auto workspace = torch::empty({config.split_k, m, n}, x.options().dtype(torch::kFloat));
+    const char *tile = m == 400 ? std::getenv("DG_GATE_DRAFT_ORDERED_TILE") : nullptr;
+    if (!tile)
+        tile = std::getenv("DG_GATE_ORDERED_TILE");
+    if (tile && std::string(tile) != "off") {
+        int fm = 0, nf = 0, batch = 0;
+        char rest = 0;
+        TORCH_CHECK(std::sscanf(tile, "%d,%d,%d%c", &fm, &nf, &batch, &rest) == 3 && (fm == 1 || fm == 2) &&
+                        (nf == 1 || nf == 2 || nf == 4) && (batch == 4 || batch == 8 || batch == 16 || batch == 40) &&
+                        int64_t(fm) * nf * 256 * batch * 4 <= 131072,
+            "unsupported ordered gate tile");
+        const int span = ceil_div(ceil_div(k, 64), config.split_k) * 64;
+        auto logits = torch::empty({m, n}, x.options().dtype(torch::kFloat));
+        auto args = make_args(x, std::nullopt, weight, std::nullopt, logits, nullptr, m, n, k, k, k, 0, 0, n);
+        std::ostringstream code;
+        if (packed) {
+            args.B = static_cast<const uint8_t *>(packed->data_ptr());
+            code << "#define CDNA4_GATE_PACKED_B " << packed_layout << "\n";
+        }
+        code << "#include <deep_gemm/impls/cdna4/ordered_gate.cuh>\n"
+                "extern \"C\" __global__ __launch_bounds__(256) void ordered_gate(deep_gemm::cdna4::GemmArgs p){"
+                "ordered_gate_tile<"
+             << fm << "," << nf << "," << batch << "," << config.split_k << "," << span << ">(p);}";
+        const auto text = code.str();
+        const auto module = jit_runtime.get_module("ordered_gate:" + text, [&] { return text; }, {"ordered_gate"});
+        const auto stream = c10::hip::getCurrentHIPStream(x.get_device()).stream();
+        const int error = deep_gemm::cdna4::JitRuntime::launch_kernel(
+            module->kernels[0], args, dim3(n / (16 * nf), ceil_div(m, 16 * fm)), dim3(256), fm * nf * 256 * batch * 4, stream);
+        TORCH_CHECK(error == 0, "ordered gate projection launch failed: ", error);
+        return logits;
+    }
+    const char *major = std::getenv("DG_GATE_TOKEN_MAJOR"), *small_tile = std::getenv("DG_GATE_PARTIAL_TILE");
+    const bool token_major = major && std::string(major) == "1" && small_tile && std::string(small_tile) != "off";
+    auto workspace = token_major ? torch::empty({m, config.split_k, n}, x.options().dtype(torch::kFloat)).transpose(0, 1)
+                                 : torch::empty({config.split_k, m, n}, x.options().dtype(torch::kFloat));
     const auto lhs = operand_layout(x, "gate input", OperandType::Bf16);
     const auto rhs = operand_layout(weight, "gate weight", OperandType::Bf16);
     auto args = make_args(x, std::nullopt, weight, std::nullopt, workspace, nullptr, m, n, k, lhs.ld, rhs.ld, 0, 0, n);
@@ -555,23 +720,49 @@ OptTensor cdna4_bf16_gate_partials(const torch::Tensor &x, const torch::Tensor &
         const int span = ceil_div(ceil_div(k, 64), config.split_k) * 64;
         const int last = k - (config.split_k - 1) * span;
         TORCH_CHECK(last > 0 && last % 64 == 0, "gate partial K range must contain full BF16 steps");
+        const int tiles = ceil_div(m, 16 * fm) * ceil_div(n, 16 * nf);
+        const char *direct_flag = std::getenv("DG_GATE_PARTIAL_DIRECT");
+        const bool direct = direct_flag && std::string(direct_flag) == "1";
+        int group = 0;
+        if (const char *order = std::getenv("DG_GATE_PARTIAL_ORDER"); order && std::string(order) != "0") {
+            char *end = nullptr;
+            long parsed = std::strtol(order, &end, 10);
+            TORCH_CHECK(
+                end != order && !*end && (parsed == 2 || parsed == 4 || parsed == 8 || parsed == 40) && config.split_k % parsed == 0,
+                "invalid gate split launch group");
+            group = int(parsed);
+        }
         std::ostringstream source;
+        if (packed) {
+            args.B = static_cast<const uint8_t *>(packed->data_ptr());
+            source << "#define CDNA4_GATE_PACKED_B " << packed_layout << "\n";
+        }
+        if (direct)
+            source << "#define CDNA4_DIRECT_GATE_SPLITS 1\n";
         source << "#include <deep_gemm/impls/cdna4/fp8_gemm_mfma_16x16x128_small_m.cuh>\n"
-                  "extern \"C\" __global__ __launch_bounds__(64) void gate_partials(GemmArgs p) {"
-               << "p.A += uint64_t(blockIdx.y)*" << span * 2 << ";"
-               << "p.B += uint64_t(blockIdx.y)*" << span * 2 << ";"
-               << "p.D = reinterpret_cast<float*>(p.D)+uint64_t(blockIdx.y)*" << int64_t(m) * n << ";"
-               << "p.M=" << m << ";p.N=" << n << ";p.K=(blockIdx.y==" << config.split_k - 1 << "?" << last << ":"
-               << span << ");"
-               << "p.lda=" << lhs.ld << ";p.ldb=" << rhs.ld << ";p.ldd=" << n << ";p.C=nullptr;p.alpha=1.f;"
+                  "extern \"C\" __global__ __launch_bounds__(64) void gate_partials(GemmArgs p) {";
+        if (group)
+            source << "const int slice=blockIdx.x%" << group << "+blockIdx.x/" << (tiles * group) << "*" << group << ",tile=(blockIdx.x/"
+                   << group << ")%" << tiles << ";";
+        else
+            source << "const int slice=blockIdx.y,tile=blockIdx.x;";
+        source << "p.A += uint64_t(slice)*" << span * 2 << ";"
+               << "p.B += uint64_t(slice)*"
+               << span * 2 *
+                      (packed_layout == 1      ? 16
+                          : packed_layout == 2 ? n
+                                               : 1)
+               << ";"
+               << "p.D = reinterpret_cast<float*>(p.D)+uint64_t(slice)*" << workspace.stride(0) << ";"
+               << "p.M=" << m << ";p.N=" << n << ";p.K=(slice==" << config.split_k - 1 << "?" << last << ":" << span << ");"
+               << "p.lda=" << lhs.ld << ";p.ldb=" << rhs.ld << ";p.ldd=" << workspace.stride(1) << ";p.C=nullptr;p.alpha=1.f;"
                << "fp8_gemm_mfma_16x16x128_small_m_impl<Mfma16x16x128SmallMConfig<" << fm << "," << nf << "," << depth
-               << ",1,0,GemmType::Normal,false,OperandType::Bf16,OperandType::Bf16>,float>(p);}";
+               << ",1,0,GemmType::Normal,false,OperandType::Bf16,OperandType::Bf16>,float>(p,tile);}";
         const auto text = source.str();
         const auto module = jit_runtime.get_module("gate_partials:" + text, [&] { return text; }, {"gate_partials"});
-        const int tiles = ceil_div(m, 16 * fm) * ceil_div(n, 16 * nf);
-        const unsigned lds = 16 * fm * (16 * nf + 4) * sizeof(float);
-        const int error = deep_gemm::cdna4::JitRuntime::launch_kernel(
-            module->kernels[0], args, dim3(tiles, config.split_k, 1), dim3(64, 1, 1), lds, stream);
+        const unsigned lds = direct ? 0 : 16 * fm * (16 * nf + 4) * sizeof(float);
+        const dim3 grid = group ? dim3(tiles * config.split_k) : dim3(tiles, config.split_k);
+        const int error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[0], args, grid, dim3(64, 1, 1), lds, stream);
         TORCH_CHECK(error == 0, "tiled BF16 gate partial launch failed: ", error);
     } else {
         const int error = jit_runtime.launch(args, config, MXFP8_OUT_FP32, stream, cus, 0, false);
@@ -596,8 +787,9 @@ void cdna4_mega_gate_routing(const torch::Tensor &logits, const OptTensor &bias,
     const int splits = logits.dim() == 3 ? logits.size(0) : 1;
     TORCH_CHECK(splits == 1 || (num_tokens <= 512 && num_experts % 4 == 0),
                 "fused gate reduction requires at most 512 tokens and complete four-expert vectors");
-    TORCH_CHECK(splits >= 1 && splits <= 80 && (logits.dim() == 2 || logits.stride(0) == num_tokens * logits.stride(1)),
-                "gate split workspace must contain consecutive row matrices");
+    const bool token_major = splits > 1 && logits.stride(0) == num_experts && logits.stride(1) == int64_t(splits) * num_experts;
+    TORCH_CHECK(splits >= 1 && splits <= 80 && (logits.dim() == 2 || token_major || logits.stride(0) == num_tokens * logits.stride(1)),
+        "gate split workspace must contain consecutive split matrices or per-token split rows");
     TORCH_CHECK(num_experts > 0 && num_experts <= 512 && num_topk > 0 && num_topk + num_shared_experts <= 32,
                 "up to 512 routed experts and 32 slots");
     const c10::hip::HIPGuardMasqueradingAsCUDA device_guard(logits.get_device());
@@ -631,10 +823,23 @@ void cdna4_mega_gate_routing(const torch::Tensor &logits, const OptTensor &bias,
     const bool biased = bias.has_value() || image_bias.has_value();
     const auto instance = std::to_string(experts_per_lane) + (biased ? ", true" : ", false") +
                           (splits > 1 ? "," + std::to_string(splits) : "");
-    const auto module = jit_runtime.get_module(
-        "mega_gate:" + instance,
+    std::string replica_define;
+    if (const char *value = std::getenv("DG_GATE_REPLICA_BLOCK"); value && std::string(value) != "0" && to_physical_map) {
+        char *end = nullptr;
+        const long block = std::strtol(value, &end, 10);
+        TORCH_CHECK(end != value && !*end && block >= 1 && block <= 1024, "replica token block must be in [1,1024]");
+        replica_define = "#define DG_GATE_REPLICA_BLOCK " + std::to_string(block) + "\n";
+    }
+    if (token_major)
+        replica_define += "#define DG_GATE_TOKEN_MAJOR 1\n";
+    if (const char *group = std::getenv("DG_GATE_SPLIT_READS");
+        splits > 1 && group &&
+        (std::string(group) == "2" || std::string(group) == "4" || std::string(group) == "8" || std::string(group) == "16"))
+        replica_define += "#define DG_GATE_SPLIT_READS " + std::string(group) + "\n";
+    const auto module = jit_runtime.get_module("mega_gate:" + instance + replica_define,
         [&] {
-            return "#include <deep_gemm/impls/cdna4/mega_gate.cuh>\n"
+            return replica_define +
+                   "#include <deep_gemm/impls/cdna4/mega_gate.cuh>\n"
                    "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_mega_gate(MegaGateArgs p) "
                    "{ " +
                    std::string(splits > 1 ? "mega_gate_split_impl<" : "mega_gate_impl<") + instance + ">(p); }\n";
@@ -652,15 +857,13 @@ void cdna4_mega_gate_routing(const torch::Tensor &logits, const OptTensor &bias,
 // kernel (a token per thread), then the norm kernel over the tokens. The Python wrapper validates
 // the tensors and sizes the workspace: [token blocks, splits, 64, 25] floats of partials, then
 // [tokens, 4] previous mixes; norm_bf16 is y_bf16 or (shifted, FP8 only) a scratch.
-void cdna4_mega_mhc(const torch::Tensor &x, const torch::Tensor &residual, const OptTensor &shifted_prev_mix,
-                    const torch::Tensor &post_mix, const torch::Tensor &comb_res_mix, const torch::Tensor &fn,
-                    const torch::Tensor &mix_scales, const torch::Tensor &mix_bases, double hc_norm_eps,
-                    double hc_pre_eps, double hc_post_scale, double sinkhorn_eps, int num_sinkhorn_iters,
-                    const torch::Tensor &rmsnorm_weight, double rmsnorm_eps, double rmsnorm_scale,
-                    const torch::Tensor &new_residual, const OptTensor &new_prev_mix, const torch::Tensor &new_post_mix,
-                    const torch::Tensor &new_comb_res_mix, const OptTensor &norm_bf16, bool write_y_bf16,
-                    const OptTensor &y_fp8, const OptTensor &y_sf, const OptTensor &y_shared_sf, int shared_sf_block_m,
-                    const torch::Tensor &workspace, int splits) {
+void cdna4_mega_mhc(const torch::Tensor &x, const torch::Tensor &residual, const OptTensor &shifted_prev_mix, const torch::Tensor &post_mix,
+    const torch::Tensor &comb_res_mix, const torch::Tensor &fn, const torch::Tensor &mix_scales, const torch::Tensor &mix_bases,
+    double hc_norm_eps, double hc_pre_eps, double hc_post_scale, double sinkhorn_eps, int num_sinkhorn_iters,
+    const torch::Tensor &rmsnorm_weight, double rmsnorm_eps, double rmsnorm_scale, const torch::Tensor &new_residual,
+    const OptTensor &new_prev_mix, const torch::Tensor &new_post_mix, const torch::Tensor &new_comb_res_mix, const OptTensor &norm_bf16,
+    bool write_y_bf16, const OptTensor &y_fp8, const OptTensor &y_sf, const OptTensor &y_shared_sf, int shared_sf_block_m,
+    const torch::Tensor &workspace, int splits, const OptTensor &fn_panels = std::nullopt) {
     const int num_tokens = x.size(0), hidden = x.size(1);
     TORCH_CHECK(hidden % 1024 == 0 && hidden / 1024 <= 16, "hidden must be a multiple of 1024 up to 16384");
     const bool shifted = shifted_prev_mix.has_value();
@@ -704,10 +907,36 @@ void cdna4_mega_mhc(const torch::Tensor &x, const torch::Tensor &residual, const
     args.rmsnorm_eps = rmsnorm_eps, args.rmsnorm_scale = rmsnorm_scale;
 
     const std::string mode = shifted ? "true" : "false", chunks = std::to_string(hidden / 1024);
-    const auto module = jit_runtime.get_module(
-        "mega_mhc:fused_finish_v1:" + mode + ":" + chunks,
+    std::string mix_policy = "0";
+    if (const char *value = std::getenv("DG_MHC_MATRIX_MIX"); value && (std::string(value) == "1" || std::string(value) == "2"))
+        mix_policy = value;
+    const int mix_width = mix_policy == "0" ? 4 : 16;
+    std::string residual_policy = "0";
+    if (const char *v = std::getenv("DG_MHC_RESIDUAL_SCHEDULE"); v && std::string(v).size() == 1 && *v >= '1' && *v <= '4')
+        residual_policy = v;
+    std::string fn_mode = "0";
+    if (fn_panels) {
+        TORCH_CHECK(fn_panels->device() == x.device() && fn_panels->scalar_type() == torch::kBFloat16 && fn_panels->is_contiguous() &&
+                        fn_panels->sizes() == at::IntArrayRef({hidden / 64, 4, 2, 2, 4, 24, 8}),
+            "mHC FN panels must supply compact high/low BF16 operand rows");
+        const char *v = std::getenv("DG_MHC_FN_PANEL_PATH");
+        TORCH_CHECK(v && (std::string(v) == "1" || std::string(v) == "2" || std::string(v) == "3"), "invalid mHC panel read mode");
+        fn_mode = v;
+        if (residual_policy < "2")
+            residual_policy = "2";
+        if (fn_mode == "3" && residual_policy < "3")
+            residual_policy = "3";
+    }
+    std::string scale_policy = "0";
+    if (const char *value = std::getenv("DG_MHC_SCALE_WORDS");
+        value && (std::string(value) == "1" || std::string(value) == "2" || std::string(value) == "3"))
+        scale_policy = value;
+    const auto module = jit_runtime.get_module("mega_mhc:fused_finish_v1:" + mode + ":" + chunks + ":scales=" + scale_policy +
+                                                   ":mix=" + mix_policy + ":residual=" + residual_policy + ":fn=" + fn_mode,
         [&] {
-            return "#include <deep_gemm/impls/cdna4/mega_mhc.cuh>\n"
+            return (fn_panels ? ("#define DG_MHC_COMPACT_FN " + fn_mode + "\n") : std::string()) + "#define DG_MHC_RESIDUAL_SCHEDULE " +
+                   residual_policy + "\n#define DG_MHC_MATRIX_MIX " + mix_policy + "\n#define DG_MHC_SCALE_WORDS " + scale_policy +
+                   "\n#include <deep_gemm/impls/cdna4/mega_mhc.cuh>\n"
                    "extern \"C\" __global__ __launch_bounds__(256) void "
                    "dg_cdna4_mega_mhc_residual(MegaMhcArgs p) "
                    "{ mega_mhc_residual_impl<" +
@@ -721,16 +950,51 @@ void cdna4_mega_mhc(const torch::Tensor &x, const torch::Tensor &residual, const
                    mode + ", " + chunks +
                    ">(p); }\n"
                    "extern \"C\" __global__ __launch_bounds__(256) void dg_cdna4_mega_mhc_finish(MegaMhcArgs p) { "
-                   "const int mix_blocks=(p.num_tokens+31)/32; "
+                   "const int mix_blocks=(p.num_tokens+" +
+                   std::to_string(128 / mix_width - 1) + ")/" + std::to_string(128 / mix_width) +
+                   "; "
                    "if(int(blockIdx.x)<mix_blocks) { if(threadIdx.x<128) mega_mhc_mix_impl(p,blockIdx.x,128); } "
                    "else mega_mhc_norm_impl<true," +
                    chunks + ">(p,int(blockIdx.x)-mix_blocks,int(gridDim.x)-mix_blocks); }\n";
         },
         {"dg_cdna4_mega_mhc_residual", "dg_cdna4_mega_mhc_mix", "dg_cdna4_mega_mhc_norm", "dg_cdna4_mega_mhc_finish"});
     const auto stream = c10::hip::getCurrentHIPStream(x.get_device()).stream();
-    int error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[0], args, dim3(m_blocks, splits, 1),
-                                                            dim3(256, 1, 1), 64 * 1024, stream);
+    auto residual_args = args;
+    if (fn_panels)
+        residual_args.fn = reinterpret_cast<const float *>(fn_panels->data_ptr());
+    const unsigned residual_lds = fn_mode == "2" || fn_mode == "3" ? 0u : (residual_policy >= "2" ? 48u : 64u) * 1024;
+    int error = deep_gemm::cdna4::JitRuntime::launch_kernel(
+        module->kernels[0], residual_args, dim3(m_blocks, splits, 1), dim3(256), residual_lds, stream);
     TORCH_CHECK(error == 0, "CDNA4 mega mHC residual launch failed with code ", error);
+    const char *residual_check = std::getenv("DG_MHC_CHECK_RESIDUAL");
+    if (residual_policy != "0" && residual_check && std::string(residual_check) == "1") {
+        auto reference = jit_runtime.get_module("mhc-residual-original:" + mode,
+            [&] {
+                return std::string(
+                           "#include <deep_gemm/impls/cdna4/mega_mhc.cuh>\n"
+                           "extern \"C\" __global__ __launch_bounds__(256) void ref_residual(MegaMhcArgs p){mega_mhc_residual_impl<") +
+                       mode + ">(p);}";
+            },
+            {"ref_residual"});
+        auto nr = torch::empty_like(new_residual), ws = torch::empty_like(workspace);
+        auto norm = shifted ? torch::empty_like(*norm_bf16) : torch::Tensor();
+        auto ref = args;
+        ref.new_residual = u16(nr);
+        if (shifted)
+            ref.norm_bf16 = u16(norm);
+        ref.mix_partials = ws.data_ptr<float>();
+        ref.sqr_partials = ref.mix_partials + int64_t(m_blocks) * splits * 64 * 24;
+        const int status =
+            deep_gemm::cdna4::JitRuntime::launch_kernel(reference->kernels[0], ref, dim3(m_blocks, splits), dim3(256), 64 * 1024, stream);
+        TORCH_CHECK(status == 0, "original residual replay failed");
+        at::_assert_async((nr.view(torch::kInt16) == new_residual.view(torch::kInt16)).all(), "mHC residual differs");
+        at::_assert_async((ws.reshape({-1}).narrow(0, 0, partial_floats).view(torch::kInt32) ==
+                              workspace.reshape({-1}).narrow(0, 0, partial_floats).view(torch::kInt32))
+                              .all(),
+            "mHC ordered partials differ");
+        if (shifted)
+            at::_assert_async((norm.view(torch::kInt16) == norm_bf16->view(torch::kInt16)).all(), "mHC normalization input differs");
+    }
     int mix_threads = 256;
     if (const char *requested = std::getenv("DG_MHC_MIX_THREADS")) {
         char *end = nullptr;
@@ -739,6 +1003,32 @@ void cdna4_mega_mhc(const torch::Tensor &x, const torch::Tensor &residual, const
                     "invalid DG_MHC_MIX_THREADS");
         mix_threads = int(parsed);
     }
+    auto check_mix = [&]() {
+        const char *check = std::getenv("DG_MHC_CHECK_MATRIX_MIX");
+        if (mix_policy == "0" || !check || std::string(check) != "1")
+            return;
+        auto ref_prev = torch::empty({num_tokens * 4}, workspace.options());
+        auto ref_post = torch::empty_like(new_post_mix);
+        auto ref_comb = torch::empty_like(new_comb_res_mix);
+        auto ref = args;
+        ref.new_prev_mix = ref.prev_mix = ref_prev.data_ptr<float>();
+        ref.new_post_mix = ref_post.data_ptr<float>();
+        ref.new_comb_res_mix = ref_comb.data_ptr<float>();
+        auto oracle = jit_runtime.get_module("mhc-original-mix-replay",
+            [] {
+                return std::string(
+                    "#include <deep_gemm/impls/cdna4/mega_mhc.cuh>\n"
+                    "extern \"C\" __global__ __launch_bounds__(256) void original_mix(MegaMhcArgs p){mega_mhc_mix_impl(p);}");
+            },
+            {"original_mix"});
+        const int status = deep_gemm::cdna4::JitRuntime::launch_kernel(
+            oracle->kernels[0], ref, dim3(ceil_div(num_tokens, mix_threads / 4)), dim3(mix_threads), 0, stream);
+        TORCH_CHECK(status == 0, "original mHC mix replay failed");
+        auto actual_prev = shifted ? new_prev_mix->reshape({-1}) : workspace.reshape({-1}).narrow(0, partial_floats, num_tokens * 4);
+        at::_assert_async((ref_prev.view(torch::kInt32) == actual_prev.view(torch::kInt32)).all(), "mHC previous mix differs");
+        at::_assert_async((ref_post.view(torch::kInt32) == new_post_mix.view(torch::kInt32)).all(), "mHC post mix differs");
+        at::_assert_async((ref_comb.view(torch::kInt32) == new_comb_res_mix.view(torch::kInt32)).all(), "mHC combination mix differs");
+    };
     const char *finish_option = std::getenv("DG_MHC_FUSED_FINISH");
     if (shifted && mix_threads == 128 && finish_option && std::string(finish_option) == "1") {
         // Shifted normalization consumes the previous layer's mix, so it is
@@ -750,15 +1040,15 @@ void cdna4_mega_mhc(const torch::Tensor &x, const torch::Tensor &residual, const
                         resident > 0,
                     "fused mHC finish occupancy query failed");
         const int norm_blocks = std::min(num_tokens, resident * deep_gemm::cdna4::num_compute_units());
-        const int mix_blocks = ceil_div(num_tokens, 32);
+        const int mix_blocks = ceil_div(num_tokens, 128 / mix_width);
         error = deep_gemm::cdna4::JitRuntime::launch_kernel(
             module->kernels[3], args, dim3(mix_blocks + norm_blocks, 1, 1), dim3(256, 1, 1), 0, stream);
         TORCH_CHECK(error == 0, "fused mHC finish launch failed with code ", error);
+        check_mix();
         return;
     }
-    error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[1], args,
-                                                        dim3(ceil_div(num_tokens, mix_threads / 4), 1, 1),
-                                                        dim3(mix_threads, 1, 1), 0, stream);
+    error = deep_gemm::cdna4::JitRuntime::launch_kernel(
+        module->kernels[1], args, dim3(ceil_div(num_tokens, mix_threads / mix_width), 1, 1), dim3(mix_threads, 1, 1), 0, stream);
     TORCH_CHECK(error == 0, "CDNA4 mega mHC mix launch failed with code ", error);
     // a token per resident workgroup at a time (each loads the next token ahead)
     int resident = 0;
@@ -769,6 +1059,7 @@ void cdna4_mega_mhc(const torch::Tensor &x, const torch::Tensor &residual, const
     error = deep_gemm::cdna4::JitRuntime::launch_kernel(module->kernels[2], args, dim3(norm_blocks, 1, 1),
                                                         dim3(256, 1, 1), 0, stream);
     TORCH_CHECK(error == 0, "CDNA4 mega mHC norm launch failed with code ", error);
+    check_mix();
 }
 
 // D = A @ B^T and sqr_sum = sum_k A^2 for BF16 A [M, K], FP32 B [N, K] (hc_prenorm_gemm.cuh). With
@@ -911,11 +1202,10 @@ void cdna4_k_batched_gemm(const torch::Tensor &a, const torch::Tensor &b, const 
 // (MqaLogitsSource) into the preallocated logits. The Python wrappers validate shapes and build the
 // per-source tensors (metadata).
 void cdna4_mqa_logits(const torch::Tensor &q, const OptTensor &q_sf, const torch::Tensor &kv, const OptTensor &kv_sf,
-                      const torch::Tensor &weights, const torch::Tensor &logits, int source, const OptTensor &ks,
-                      const OptTensor &ke, const OptTensor &group_ranges, const OptTensor &context_lens,
-                      const OptTensor &block_table, const OptTensor &run_starts, int next_n, int page_kv,
-                      const OptTensor &sparse_starts, int num_max_sparse_blocks, int sparse_block_kv, int token_groups,
-                      int column_rounds) {
+    const torch::Tensor &weights, const torch::Tensor &logits, int source, const OptTensor &ks, const OptTensor &ke,
+    const OptTensor &group_ranges, const OptTensor &context_lens, const OptTensor &block_table, const OptTensor &run_starts, int next_n,
+    int page_kv, const OptTensor &sparse_starts, int num_max_sparse_blocks, int sparse_block_kv, int token_groups, int column_rounds,
+    int sparse_mode, const OptTensor &block_scores, const OptTensor &block_counts) {
     using deep_gemm::cdna4::MqaLogitsFormat;
     using deep_gemm::cdna4::MqaLogitsSource;
     const auto src = static_cast<MqaLogitsSource>(source);
@@ -954,6 +1244,20 @@ void cdna4_mqa_logits(const torch::Tensor &q, const OptTensor &q_sf, const torch
     args.ld_weights = stride_as_int(weights, 0, "weights");
     args.logits = logits.data_ptr();
     args.ld_logits = logits.stride(0);
+    TORCH_CHECK(block_scores.has_value() == block_counts.has_value(), "supply both block maximum outputs");
+    if (block_scores) {
+        TORCH_CHECK(src == MqaLogitsSource::Paged && format == MqaLogitsFormat::MxFp4 && block_scores->dim() == 2 &&
+                        block_scores->size(0) == num_q && block_scores->size(1) >= ceil_div(int(logits.size(1)), 8) &&
+                        block_scores->is_contiguous() && block_scores->scalar_type() == torch::kBFloat16 &&
+                        block_scores->device() == q.device() && block_counts->dim() == 1 && block_counts->numel() == num_q &&
+                        block_counts->is_contiguous() && block_counts->scalar_type() == torch::kInt32 &&
+                        block_counts->device() == q.device(),
+            "invalid paged MXFP4 block-max output tensors");
+        args.block_scores = reinterpret_cast<uint16_t *>(block_scores->data_ptr());
+        args.block_counts = block_counts->data_ptr<int32_t>();
+        args.ld_block_scores = block_scores->stride(0);
+        args.score_width = int(logits.size(1));
+    }
     args.num_q = num_q;
     const auto ptr = [](const OptTensor &t) { return t.has_value() ? t->data_ptr<std::int32_t>() : nullptr; };
     args.ks = ptr(ks), args.ke = ptr(ke), args.group_ranges = ptr(group_ranges);
@@ -970,8 +1274,13 @@ void cdna4_mqa_logits(const torch::Tensor &q, const OptTensor &q_sf, const torch
         TORCH_CHECK(args.num_kv > 0 && kv_sf.has_value(), "contiguous KV needs rows and scales");
     }
     TORCH_CHECK(token_groups >= 0 && token_groups <= 8 && column_rounds >= 0, "invalid paged MQA launch plan");
-    TORCH_CHECK((token_groups == 0 && column_rounds == 0) || (src == MqaLogitsSource::Paged && run_starts.has_value()),
-                "MQA launch overrides require paged varlen inputs");
+    TORCH_CHECK(sparse_mode >= 0 && sparse_mode <= 3, "invalid sparse MQA address plan");
+    TORCH_CHECK(!sparse_mode || (src == MqaLogitsSource::PagedSparse && format == MqaLogitsFormat::MxFp4 && sparse_block_kv == 8 &&
+                                    (page_kv == 64 || page_kv == 128) && head_dim == 128 && num_heads == 32),
+        "sparse block address specialization requires eight-row blocks of MXFP4 keys");
+    TORCH_CHECK((token_groups == 0 && column_rounds == 0) || (sparse_mode && token_groups == 0) ||
+                    (src == MqaLogitsSource::Paged && run_starts.has_value()),
+        "MQA launch overrides require paged varlen inputs");
     const int query_group = token_groups > 0 ? token_groups : run_starts.has_value() ? 4 : args.next_n;
     const auto plan = deep_gemm::cdna4::plan_mqa_logits(format, src, head_dim, num_heads, query_group);
     // Paged: a workgroup per token, the first of each group of a request's tokens works
@@ -979,7 +1288,7 @@ void cdna4_mqa_logits(const torch::Tensor &q, const OptTensor &q_sf, const torch
     TORCH_CHECK(!group_ranges.has_value() || group_ranges->numel() == 2 * int64_t(waves),
                 "the MQA logits metadata does not match the number of heads");
     const auto stream = c10::hip::getCurrentHIPStream(q.get_device()).stream();
-    const int error = deep_gemm::cdna4::launch_mqa_logits(args, plan, waves, logits.size(1), stream, column_rounds);
+    const int error = deep_gemm::cdna4::launch_mqa_logits(args, plan, waves, logits.size(1), stream, column_rounds, sparse_mode);
     TORCH_CHECK(error == 0, "CDNA4 MQA logits launch failed with code ", error);
 }
 
@@ -1012,26 +1321,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_jit", [] { return jit_runtime.get_runtime(); });
     uni_symm::register_python_api<uni_symm::HIP>(m);
     m.def("cdna4_init", &cdna4_init, py::arg("root"));
-    m.def("cdna4_fp8_gemm_nt", &cdna4_fp8_gemm_nt, py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"),
-          py::arg("d"), py::arg("c") = std::nullopt, py::arg("alpha") = 1.0, py::arg("gran_k_a") = 32,
-          py::arg("gran_k_b") = 32);
+    m.def("cdna4_fp8_gemm_nt", &cdna4_fp8_gemm_nt, py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("d"),
+        py::arg("c") = std::nullopt, py::arg("alpha") = 1.0, py::arg("gran_k_a") = 32, py::arg("gran_k_b") = 32,
+        py::arg("reference_plan") = false, py::arg("panels") = std::nullopt, py::arg("panel_sf") = std::nullopt);
     m.def("cdna4_fp8_gemm_plan", &cdna4_fp8_gemm_plan, py::arg("m"), py::arg("n"), py::arg("k"));
     m.def("cdna4_m_grouped_fp8_gemm_contiguous", &cdna4_m_grouped_fp8_gemm_contiguous, py::arg("a"), py::arg("sfa"),
           py::arg("b"), py::arg("sfb"), py::arg("d"), py::arg("grouped_layout"), py::arg("gran_k_a"),
           py::arg("gran_k_b"), py::arg("use_psum_layout"), py::arg("ensure_zero_padding"), py::arg("m_alignment"),
           py::arg("expected_m") = 0);
-    m.def("cdna4_m_grouped_fp8_gemm_masked", &cdna4_m_grouped_fp8_gemm_masked, py::arg("a"), py::arg("sfa"),
-          py::arg("b"), py::arg("sfb"), py::arg("d"), py::arg("masked_m"), py::arg("expected_m"), py::arg("gran_k_a"),
-          py::arg("gran_k_b"), py::arg("c") = std::nullopt, py::arg("alpha") = 1.0);
+    m.def("cdna4_m_grouped_fp8_gemm_masked", &cdna4_m_grouped_fp8_gemm_masked, py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"),
+        py::arg("d"), py::arg("masked_m"), py::arg("expected_m"), py::arg("gran_k_a"), py::arg("gran_k_b"), py::arg("c") = std::nullopt,
+        py::arg("alpha") = 1.0, py::arg("output_sf") = std::nullopt, py::arg("panels") = std::nullopt, py::arg("panel_sf") = std::nullopt);
     m.def("cdna4_k_grouped_fp8_gemm", &cdna4_k_grouped_fp8_gemm, py::arg("a"), py::arg("sfa"), py::arg("b"),
           py::arg("sfb"), py::arg("d"), py::arg("c"), py::arg("grouped_layout"), py::arg("use_psum_layout"),
           py::arg("k_alignment"), py::arg("gran_k"), py::arg("k_major"));
-    m.def("cdna4_mqa_logits", &cdna4_mqa_logits, py::arg("q"), py::arg("q_sf"), py::arg("kv"), py::arg("kv_sf"),
-          py::arg("weights"), py::arg("logits"), py::arg("source"), py::arg("ks") = std::nullopt,
-          py::arg("ke") = std::nullopt, py::arg("group_ranges") = std::nullopt, py::arg("context_lens") = std::nullopt,
-          py::arg("block_table") = std::nullopt, py::arg("run_starts") = std::nullopt, py::arg("next_n") = 1,
-          py::arg("page_kv") = 0, py::arg("sparse_starts") = std::nullopt, py::arg("num_max_sparse_blocks") = 0,
-          py::arg("sparse_block_kv") = 0, py::arg("token_groups") = 0, py::arg("column_rounds") = 0);
+    m.def("cdna4_mqa_logits", &cdna4_mqa_logits, py::arg("q"), py::arg("q_sf"), py::arg("kv"), py::arg("kv_sf"), py::arg("weights"),
+        py::arg("logits"), py::arg("source"), py::arg("ks") = std::nullopt, py::arg("ke") = std::nullopt,
+        py::arg("group_ranges") = std::nullopt, py::arg("context_lens") = std::nullopt, py::arg("block_table") = std::nullopt,
+        py::arg("run_starts") = std::nullopt, py::arg("next_n") = 1, py::arg("page_kv") = 0, py::arg("sparse_starts") = std::nullopt,
+        py::arg("num_max_sparse_blocks") = 0, py::arg("sparse_block_kv") = 0, py::arg("token_groups") = 0, py::arg("column_rounds") = 0,
+        py::arg("sparse_mode") = 0, py::arg("block_scores") = std::nullopt, py::arg("block_counts") = std::nullopt);
     m.def("cdna4_mqa_logits_tokens_per_wave", &cdna4_mqa_logits_tokens_per_wave, py::arg("num_heads"));
     m.def("cdna4_k_batched_gemm", &cdna4_k_batched_gemm, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt);
@@ -1040,21 +1349,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("cdna4_mega_moe_layout", &cdna4_mega_moe_layout, py::arg("num_ranks"), py::arg("num_experts"),
           py::arg("num_max_tokens"), py::arg("num_topk"), py::arg("hidden"), py::arg("intermediate"),
           py::arg("shared_intermediate"), py::arg("with_sf"));
-    m.def("cdna4_mega_moe", &cdna4_mega_moe, py::arg("y"), py::arg("l1_weights"), py::arg("l1_weights_sf"),
-          py::arg("l2_weights"), py::arg("l2_weights_sf"), py::arg("shared_l1_weights"),
-          py::arg("shared_l1_weights_sf"), py::arg("shared_l2_weights"), py::arg("shared_l2_weights_sf"),
-          py::arg("stats"), py::arg("buffer"), py::arg("buffer_ptrs"), py::arg("rank"), py::arg("num_max_tokens"),
-          py::arg("num_experts"), py::arg("num_topk"), py::arg("activation_clamp"), py::arg("fast_math"),
-          py::arg("resident_weight_panels") = false, py::arg("reference") = false);
+    m.def("cdna4_shared_stages", &cdna4_shared_stages);
+    m.def("cdna4_mega_moe", &cdna4_mega_moe, py::arg("y"), py::arg("l1_weights"), py::arg("l1_weights_sf"), py::arg("l2_weights"),
+        py::arg("l2_weights_sf"), py::arg("shared_l1_weights"), py::arg("shared_l1_weights_sf"), py::arg("shared_l2_weights"),
+        py::arg("shared_l2_weights_sf"), py::arg("stats"), py::arg("buffer"), py::arg("buffer_ptrs"), py::arg("rank"),
+        py::arg("num_max_tokens"), py::arg("num_experts"), py::arg("num_topk"), py::arg("activation_clamp"), py::arg("fast_math"),
+        py::arg("resident_weight_panels") = false, py::arg("reference") = false, py::arg("shared_result") = std::nullopt,
+        py::arg("shared_panel_mask") = 0, py::arg("trace") = std::nullopt, py::arg("position") = std::nullopt);
     m.def("cdna4_prepare_moe_weight_panels", &cdna4_prepare_moe_weight_panels, py::arg("weight"));
-    m.def("cdna4_mega_mhc", &cdna4_mega_mhc, py::arg("x"), py::arg("residual"), py::arg("shifted_prev_mix"),
-          py::arg("post_mix"), py::arg("comb_res_mix"), py::arg("fn"), py::arg("mix_scales"), py::arg("mix_bases"),
-          py::arg("hc_norm_eps"), py::arg("hc_pre_eps"), py::arg("hc_post_scale"), py::arg("sinkhorn_eps"),
-          py::arg("num_sinkhorn_iters"), py::arg("rmsnorm_weight"), py::arg("rmsnorm_eps"), py::arg("rmsnorm_scale"),
-          py::arg("new_residual"), py::arg("new_prev_mix"), py::arg("new_post_mix"), py::arg("new_comb_res_mix"),
-          py::arg("norm_bf16"), py::arg("write_y_bf16"), py::arg("y_fp8"), py::arg("y_sf"), py::arg("y_shared_sf"),
-          py::arg("shared_sf_block_m"), py::arg("workspace"), py::arg("splits"));
-    m.def("cdna4_bf16_gate_partials", &cdna4_bf16_gate_partials, py::arg("x"), py::arg("weight"));
+    m.def("cdna4_mega_mhc", &cdna4_mega_mhc, py::arg("x"), py::arg("residual"), py::arg("shifted_prev_mix"), py::arg("post_mix"),
+        py::arg("comb_res_mix"), py::arg("fn"), py::arg("mix_scales"), py::arg("mix_bases"), py::arg("hc_norm_eps"), py::arg("hc_pre_eps"),
+        py::arg("hc_post_scale"), py::arg("sinkhorn_eps"), py::arg("num_sinkhorn_iters"), py::arg("rmsnorm_weight"), py::arg("rmsnorm_eps"),
+        py::arg("rmsnorm_scale"), py::arg("new_residual"), py::arg("new_prev_mix"), py::arg("new_post_mix"), py::arg("new_comb_res_mix"),
+        py::arg("norm_bf16"), py::arg("write_y_bf16"), py::arg("y_fp8"), py::arg("y_sf"), py::arg("y_shared_sf"),
+        py::arg("shared_sf_block_m"), py::arg("workspace"), py::arg("splits"), py::arg("fn_panels") = std::nullopt);
+    m.def("cdna4_bf16_gate_partials", &cdna4_bf16_gate_partials, py::arg("x"), py::arg("weight"), py::arg("packed_weight") = std::nullopt,
+        py::arg("packed_layout") = 0);
     m.def("cdna4_mega_gate_routing", &cdna4_mega_gate_routing, py::arg("logits"), py::arg("bias"),
           py::arg("image_bias"), py::arg("image_token_mask"), py::arg("mask"), py::arg("fix_routing_mask"),
           py::arg("force_random"), py::arg("to_physical_map"), py::arg("logical_count"), py::arg("topk_idx"),

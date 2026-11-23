@@ -109,7 +109,7 @@ def run(rank, world_size, mma_type):
     )
     weights = prepared if prepared is not None else (raw1, raw2)
     fn = deep_gemm.fp8_fp4_mega_moe if with_sf else deep_gemm.bf16_mega_moe
-    for case in range(5):
+    for case in range(6):
         torch.manual_seed(100 * rank + case)
         tokens = capacity - (rank * 37 + case * 11) % 200
         if case == 2 and rank == world_size - 1:
@@ -126,6 +126,16 @@ def run(rank, world_size, mma_type):
         elif case == 4:
             ids.fill_(-1)
             route_weights.zero_()
+        elif case == 5:
+            codes = torch.arange(tokens, device="cuda") % (1 << topk)
+            active = (codes[:, None] & (1 << torch.arange(topk, device="cuda"))) != 0
+            ids = scores.topk(topk, dim=-1).indices.masked_fill(~active, -1)
+            route_weights = values.softmax(-1).masked_fill(~active, 0)
+            begin = buffer.layout["combine"]
+            size = topk * buffer.num_max_tokens_per_rank * hidden * 2
+            buffer.buffer[begin : begin + size].view(torch.uint8).fill_(255)
+            torch.cuda.synchronize()
+            dist.barrier()
         if with_sf:
             q, qs = per_token_cast_to_fp8(
                 x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True

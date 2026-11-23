@@ -1,7 +1,7 @@
 """Independent general-GEMM reference for AMD Mega MoE tests."""
 
 from .. import _C
-from .._hip_mega_moe import ResidentMoEPanelWeights
+from .._hip_mega_moe import ResidentMoEPanelWeights, SharedExpertPanels
 
 
 def reference_mega_moe(
@@ -17,6 +17,10 @@ def reference_mega_moe(
     fast_math=True,
 ):
     def ordinary(pair):
+        if isinstance(pair, SharedExpertPanels):
+            w, sf = pair
+            n, k = w.shape
+            return w.view(n//32,k//128,32,128).permute(0,2,1,3).reshape_as(w),sf
         if isinstance(pair, ResidentMoEPanelWeights):
             w, sf = pair
             e, n, kb = w.shape

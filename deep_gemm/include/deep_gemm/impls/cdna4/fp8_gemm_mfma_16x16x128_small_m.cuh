@@ -52,7 +52,8 @@ __device__ __forceinline__ v4i keep_first_bytes(v4i v, int valid) {
     return v;
 }
 
-template <class Cfg, class OutT> __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p) {
+template <class Cfg, class OutT> __device__ __forceinline__ void fp8_gemm_mfma_16x16x128_small_m_impl(GemmArgs p, int logical_tile = -1) {
+
 #if defined(__HIP_DEVICE_COMPILE__)
     constexpr int FM = Cfg::FM, NF = Cfg::NF, DEPTH = Cfg::DEPTH, BM = Cfg::BM, BN = Cfg::BN;
     constexpr int BK = Cfg::BK, WAVES = Cfg::WAVES;
@@ -92,8 +93,17 @@ template <class Cfg, class OutT> __device__ __forceinline__ void fp8_gemm_mfma_1
         const size_t ga = Cfg::MASKED ? (size_t)t.group : 0, gb = Cfg::B_GROUPED ? (size_t)t.group : 0;
         const __amdgpu_buffer_rsrc_t a_rsrc =
             rsrc_at(p.A + ga * p.a_group_stride + (size_t)m0 * p.lda, (uint64_t)(rows - 1) * p.lda + a_k4);
+#ifdef CDNA4_GATE_PACKED_B
+        static_assert(Cfg::BF16);
+        // p.B already points to this split. A 16-column by 32-K
+        // fragment occupies 1024 bytes in lane order.
+        constexpr bool n_first = CDNA4_GATE_PACKED_B == 1;
+        const auto b_rsrc = rsrc_at(p.B + uint64_t(n0) * (n_first ? p.ldb : 64),
+            n_first ? uint64_t(16 * (NF - 1)) * p.ldb + uint64_t(p.K) * 32 : uint64_t(p.K - 32) * p.N * 2 + uint64_t(NF) * 1024);
+#else
         const __amdgpu_buffer_rsrc_t b_rsrc =
             rsrc_at(p.B + gb * p.b_group_stride + (size_t)n0 * p.ldb, (uint64_t)(p.N - n0 - 1) * p.ldb + b_k4);
+#endif
         const __amdgpu_buffer_rsrc_t sa_rsrc = rsrc_at((const uint8_t *)(p.sfa + ga * p.sfa_group_stride + m0),
                                                        ((uint64_t)(sa_words - 1) * p.lda_sf + rows) * 4);
         const __amdgpu_buffer_rsrc_t sb_rsrc = rsrc_at((const uint8_t *)(p.sfb + gb * p.sfb_group_stride + n0),
@@ -139,10 +149,18 @@ template <class Cfg, class OutT> __device__ __forceinline__ void fp8_gemm_mfma_1
             }
 #pragma unroll
             for (int j = 0; j < NF; ++j) {
+#ifdef CDNA4_GATE_PACKED_B
+                constexpr bool n_first = CDNA4_GATE_PACKED_B == 1;
+                const uint32_t row = uint32_t(j) * (n_first ? 16 * p.ldb : 1024) + lane * 16;
+                const uint32_t half_bytes = n_first ? 1024 : p.N * 64;
+                b_frag[d][j][0] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(br, row, step * 2 * half_bytes, 0);
+                b_frag[d][j][1] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(br, row, (step * 2 + 1) * half_bytes, 0);
+#else
                 const uint32_t row = (uint32_t)(16 * j + r16) * p.ldb + 16 * g;
                 b_frag[d][j][0] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(br, row, b_koff, 0);
                 if constexpr (!Cfg::B_FP4)
                     b_frag[d][j][1] = (v4i)__builtin_amdgcn_raw_buffer_load_b128(br, row + 64, b_koff, 0);
+#endif
                 if constexpr (!Cfg::BF16)
                     b_code[d][j] = __builtin_amdgcn_raw_buffer_load_b32(sbr, (16 * j + r16) * 4, sb_off, 0);
             }
@@ -247,6 +265,22 @@ template <class Cfg, class OutT> __device__ __forceinline__ void fp8_gemm_mfma_1
             }
         }
 
+#ifdef CDNA4_DIRECT_GATE_SPLITS
+        static_assert(WAVES == 1 && Cfg::BF16 && Cfg::kType == GemmType::Normal);
+        // Each lane already owns a complete 16-byte FP32 result. No wave
+        // reduction or shared-memory transpose is required for this output.
+        for (int i = 0; i < FM; ++i) {
+            const int row = m0 + i * 16 + r16;
+            if (row >= t.m_end)
+                continue;
+#pragma unroll
+            for (int j = 0; j < NF; ++j) {
+                const int col = n0 + j * 16 + g * 4;
+                if (col < p.N)
+                    *reinterpret_cast<v4f *>(reinterpret_cast<float *>(p.D) + int64_t(row) * p.ldd + col) = acc[i][j];
+            }
+        }
+#else
         // ---- in-workgroup reduction: wave tiles added in wave order
         float *const my_tile = tiles + wave * BM * Cfg::TILE_LD;
 #pragma unroll
@@ -268,6 +302,7 @@ template <class Cfg, class OutT> __device__ __forceinline__ void fp8_gemm_mfma_1
                 s += *(const v4f *)(tiles + (w * BM + row) * Cfg::TILE_LD + col);
             store4<OutT>(out, cin, p.ldd, t.m_end, p.N, m0 + row, n0 + col, s * p.alpha, vec_ok);
         }
+#endif
     };
 
     if constexpr (Scheduler::DYNAMIC) {
@@ -292,7 +327,7 @@ template <class Cfg, class OutT> __device__ __forceinline__ void fp8_gemm_mfma_1
             __syncthreads();
         }
     } else {
-        const GroupTile t = Scheduler::tile(p, blockIdx.x);
+        const GroupTile t = Scheduler::tile(p, logical_tile >= 0 ? logical_tile : int(blockIdx.x));
         // tiles of padding rows only
         if constexpr (Cfg::kType == GemmType::MGroupedContiguous)
             if (p.grouped_layout[t.m0] < 0)

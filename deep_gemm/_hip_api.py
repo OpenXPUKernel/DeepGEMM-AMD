@@ -559,6 +559,30 @@ def fp8_gemm_nt(
         gran_k_a,
         gran_k_b,
     )
+    if (
+        os.getenv("DG_CDNA4_CHECK_COMPACT_LINEAR") == "1"
+        and c is None
+        and m in (400, 500)
+        and d.dtype == torch.bfloat16
+        and (n, k) in ((5120, 8192), (1792, 5120))
+    ):
+        reference = torch.empty_like(d)
+        _backend().cdna4_fp8_gemm_nt(
+            a_fp8,
+            sfa,
+            b_fp8,
+            sfb,
+            reference,
+            None,
+            1.0 if alpha is None else float(alpha),
+            gran_k_a,
+            gran_k_b,
+            True,
+        )
+        torch._assert_async(
+            (reference.view(torch.int16) == d.view(torch.int16)).all(),
+            "compact decode projection differs from its original split plan",
+        )
 
 
 def _transpose_operand(x):
@@ -1194,7 +1218,7 @@ def _full_rows(groups: int, rows: int, device) -> torch.Tensor:
     return _full_rows_cache[key]
 
 
-def _batched_gemm(a, sfa, b, sfb, d, c, gran_k_a=0, gran_k_b=0):
+def _batched_gemm(a, sfa, b, sfb, d, c, gran_k_a=0, gran_k_b=0, output_sf=None, prepared_b=None):
     """d[g] (+)= a[g] @ b[g]^T over [G, M, K] / [G, N, K] / [G, M, N] views."""
     groups, rows = d.size(0), d.size(1)
     _backend().cdna4_m_grouped_fp8_gemm_masked(
@@ -1209,6 +1233,12 @@ def _batched_gemm(a, sfa, b, sfb, d, c, gran_k_a=0, gran_k_b=0):
         gran_k_b,
         c=c,
         alpha=1.0,
+        **({"output_sf": output_sf} if output_sf is not None else {}),
+        **(
+            {"panels": prepared_b[0], "panel_sf": prepared_b[1]}
+            if prepared_b is not None
+            else {}
+        ),
     )
 
 
@@ -1252,13 +1282,23 @@ def einsum(expr, a, b, d, c=None, epilogue=None) -> None:
     _batched_gemm(av, None, bv, None, dv, cv)
 
 
-def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128), epilogue=None) -> None:
+def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128), epilogue=None, prepared_b=None) -> None:
     """The FP8 einsum expressions of the CUDA backend ("bhr,hdr->bhd", "bhd,hdr->bhr" and
     "bhd,bhr->hdr") with BF16 or FP32 outputs; a and b are (data, scales) pairs."""
-    if epilogue is not None or isinstance(d, (tuple, list)):
-        raise NotImplementedError(
-            "FP8 outputs and custom epilogues are not supported by the CDNA4 backend"
-        )
+    output_sf = None
+    if isinstance(d, (tuple, list)):
+        if (
+            len(d) != 2
+            or expr != "bhr,hdr->bhd"
+            or c is not None
+            or tuple(recipe) != (1, 1, 32)
+        ):
+            raise NotImplementedError(
+                "packed WV requires bhr,hdr->bhd with 32-channel scales"
+            )
+        d, output_sf = d
+    if epilogue is not None:
+        raise NotImplementedError("custom einsum epilogues are not supported")
     (a_fp8, sfa), (b_fp8, sfb) = a, b
     _check_same_device(d, a_fp8, b_fp8, sfa, sfb, *((c,) if c is not None else ()))
     av, bv, dv, cv = _einsum_views(expr, a_fp8, b_fp8, d, c)
@@ -1268,7 +1308,7 @@ def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128), epilogue=None) -> No
     sfa_p, sfb_p, gran_k_a, gran_k_b = _transform_sf_pair(
         sfa_v, sfb_v, m, bv.size(1), k, tuple(recipe), None, None, groups, groups, False
     )
-    _batched_gemm(av, sfa_p, bv, sfb_p, dv, cv, gran_k_a, gran_k_b)
+    _batched_gemm(av, sfa_p, bv, sfb_p, dv, cv, gran_k_a, gran_k_b, output_sf,prepared_b)
 
 
 def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None) -> None:
@@ -1297,6 +1337,7 @@ def bf16_mega_gate(
     unmapped_topk_idx=None,
     force_random=None,
     out=None,
+    prepared_weight=None,
 ):
     """MoE gate: top-k experts of x @ weight^T per token (sqrt-softplus scores ranked with the bias,
     weights normalized over the top-k and scaled), the shared experts after them with weight 1,
@@ -1371,13 +1412,60 @@ def bf16_mega_gate(
         and x.is_contiguous()
         and weight.is_contiguous()
     ):
-        logits = _backend().cdna4_bf16_gate_partials(x, weight)
+        if prepared_weight is None:
+            logits = _backend().cdna4_bf16_gate_partials(x, weight)
+        else:
+            mode, packed = prepared_weight
+            logits = _backend().cdna4_bf16_gate_partials(x, weight, packed, mode)
+        if (
+            logits is not None
+            and logits.ndim == 2
+            and os.environ.get("DG_GATE_CHECK_ORDERED") == "1"
+        ):
+            reference = torch.empty_like(logits)
+            bf16_gemm_nt(x, weight, reference)
+            torch._assert_async(
+                (logits.view(torch.int32) == reference.view(torch.int32)).all(),
+                "ordered gate differs from the original split projection",
+            )
+
     if logits is None:
         logits = torch.empty(
             (num_tokens, align(num_experts, 4)), dtype=torch.float32, device=x.device
         )[:, :num_experts]
         bf16_gemm_nt(x, weight, logits)
     contiguous = lambda t: None if t is None else t.contiguous()
+    check_split = (
+        logits.ndim == 3 and os.environ.get("DG_GATE_CHECK_SPLIT_READS") == "1"
+    )
+    if check_split:
+        original = torch.empty(
+            (num_tokens, num_experts), device=x.device, dtype=torch.float32
+        )
+        bf16_gemm_nt(x, weight, original)
+        expected_id = torch.empty_like(topk_idx)
+        expected_weight = torch.empty_like(topk_weights)
+        expected_logical = (
+            None if unmapped_topk_idx is None else unmapped_topk_idx.clone()
+        )
+        _backend().cdna4_mega_gate_routing(
+            original,
+            contiguous(bias),
+            contiguous(image_bias),
+            contiguous(image_token_mask),
+            contiguous(mask),
+            contiguous(fix_routing_mask),
+            contiguous(force_random),
+            contiguous(to_physical_map),
+            contiguous(logical_count),
+            expected_id,
+            expected_weight,
+            expected_logical,
+            int(num_topk),
+            shared,
+            int(ep_rank),
+            float(routed_scaling_factor),
+        )
     _backend().cdna4_mega_gate_routing(
         logits,
         contiguous(bias),
@@ -1396,6 +1484,16 @@ def bf16_mega_gate(
         int(ep_rank),
         float(routed_scaling_factor),
     )
+    if check_split:
+        torch._assert_async(
+            (topk_idx == expected_id).all(), "ordered gate split route mismatch"
+        )
+        torch._assert_async(
+            (topk_weights.view(torch.int32) == expected_weight.view(torch.int32)).all(),
+            "ordered gate split weight mismatch",
+        )
+        if expected_logical is not None:
+            torch._assert_async((unmapped_topk_idx==expected_logical).all(),"ordered gate split logical route mismatch")
     return topk_idx, topk_weights
 
 
@@ -1427,6 +1525,7 @@ def mega_mhc(
     y_routed_sf=None,
     y_shared_sf=None,
     shared_sf_block_m=0,
+    fn_panels=None,
 ) -> None:
     """Shifted (with shifted_prev_mix and new_prev_mix) or normal mHC: new_residual, the next mixes
     and the RMSNorm of the mixed residual into BF16 y_bf16 and / or FP8 y_fp8 (32-value UE8M0
@@ -1566,6 +1665,7 @@ def mega_mhc(
         int(shared_sf_block_m),
         workspace,
         splits,
+        fn_panels,
     )
 
 
@@ -1734,6 +1834,7 @@ def fp8_fp4_paged_mqa_logits(
     schedule_meta,
     max_context_len,
     indices=None,
+    return_block_max=False,
 ):
     """Paged MQA logits: q [batch, next_n, H, D], kv_cache [blocks, block_kv, 1, D + 4] (a block holds
     block_kv rows, then their scales), token (i, j) takes positions [0, context_lens[i, j]) of
@@ -1768,6 +1869,19 @@ def fp8_fp4_paged_mqa_logits(
         rounds = int(os.environ.get("DG_MQA_PAGED_ROUNDS", "0"))
         if groups or rounds:
             launch_plan = dict(token_groups=groups, column_rounds=rounds)
+    if return_block_max:
+        if q_sf is None or not _is_fp4(q_fp):
+            raise ValueError("block maxima require MXFP4 paged scores")
+        rows = batch * next_n
+        columns = (logits.shape[1] + 7) // 8
+        stride = (columns + 511) // 512 * 512
+        block_scores = torch.empty(
+            (rows, stride), device=q_fp.device, dtype=torch.bfloat16
+        )
+        block_counts = torch.empty(
+            ((rows + 3) // 4 * 4,), device=q_fp.device, dtype=torch.int32
+        )[:rows]
+        launch_plan.update(block_scores=block_scores, block_counts=block_counts)
     _backend().cdna4_mqa_logits(
         q_fp.view(batch * next_n, num_heads, -1),
         q_sf,
@@ -1806,7 +1920,7 @@ def fp8_fp4_paged_mqa_logits(
             ((logits.view(torch.int16) == reference.view(torch.int16)) | ~valid).all(),
             "paged MQA launch plan changed score bits",
         )
-    return logits
+    return (logits, block_scores, block_counts) if return_block_max else logits
 
 
 def get_sparse_mqa_logits_metadata(
@@ -1876,14 +1990,18 @@ def _sparse_logits(
         num_q, num_max_sparse_blocks * sparse_block_kv, q_sf, q_fp.device
     )
     paged = source == _MQA_PAGED_SPARSE
-    _backend().cdna4_mqa_logits(
-        q_fp,
-        q_sf,
-        kv,
-        kv_sf,
-        weights,
-        logits,
-        source,
+    sparse_mode = rounds = 0
+    if (
+        paged
+        and q_sf is not None
+        and _is_fp4(q_fp)
+        and q_fp.shape[1:] == (32, 64)
+        and sparse_block_kv == 8
+        and kv.size(1) in (64, 128)
+    ):
+        opts = os.environ.get("DG_MQA_SPARSE_BLOCK_PLAN", "0,0")
+        sparse_mode, rounds = map(int, opts.split(","))
+    args = dict(
         ks=None if paged else metadata[:num_q],
         ke=None if paged else metadata[num_q : 2 * num_q],
         context_lens=metadata[:num_q] if paged else None,
@@ -1892,6 +2010,40 @@ def _sparse_logits(
         num_max_sparse_blocks=num_max_sparse_blocks,
         sparse_block_kv=sparse_block_kv,
     )
+
+    def launch(out, mode, columns):
+        _backend().cdna4_mqa_logits(
+            q_fp,
+            q_sf,
+            kv,
+            kv_sf,
+            weights,
+            out,
+            source,
+            **args,
+            sparse_mode=mode,
+            column_rounds=columns,
+        )
+
+    launch(logits, sparse_mode, rounds)
+    if sparse_mode and os.environ.get("DG_MQA_SPARSE_BLOCK_SHADOW") == "1":
+        ref = torch.empty_like(logits)
+        launch(ref, 0, 0)
+        limits = (
+            torch.div(
+                metadata[:num_q].clamp_min(0) + sparse_block_kv - 1,
+                sparse_block_kv,
+                rounding_mode="floor",
+            ).clamp_max(num_max_sparse_blocks)
+            * sparse_block_kv
+        )
+        valid = (
+            torch.arange(logits.size(1), device=q_fp.device)[None, :] < limits[:, None]
+        )
+        torch._assert_async(
+            ((logits.view(torch.int16) == ref.view(torch.int16)) | ~valid).all(),
+            "sparse MQA scores differ on a valid candidate column",
+        )
     return logits
 
 

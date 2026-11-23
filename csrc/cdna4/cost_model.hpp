@@ -12,6 +12,7 @@
 
 constexpr int MXFP8_OUT_BF16 = 0;
 constexpr int MXFP8_OUT_FP32 = 1;
+constexpr int MXFP8_OUT_PACKED_WV = 2;
 
 namespace deep_gemm::cdna4 {
 

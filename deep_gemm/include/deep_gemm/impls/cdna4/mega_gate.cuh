@@ -192,7 +192,12 @@ __device__ __forceinline__ void mega_gate_impl(const MegaGateArgs &p, const floa
         int64_t physical = selected;
         if (p.to_physical_map && lane < slots) {
             const uint32_t replicas = (uint32_t)p.logical_count[selected];
+#ifdef DG_GATE_REPLICA_BLOCK
+            const uint32_t token_group = uint32_t(token) / DG_GATE_REPLICA_BLOCK;
+            const uint32_t replica = (p.rank_idx + token_group * 23333u + uint32_t(selected) * 17u) % replicas;
+#else
             const uint32_t replica = (p.rank_idx + (uint32_t)token * 23333u) % replicas;
+#endif
             physical = p.to_physical_map[(int64_t)selected * p.num_duplicate_experts + replica];
         }
         const float sum = wave_reduce<false>(score) + 1e-20f;
@@ -211,9 +216,38 @@ template <int EV, bool BIASED, int SPLITS> __device__ __forceinline__ void mega_
     const int token = blockIdx.x * 2 + local_row;
     const int expert = (threadIdx.x % 128) * 4;
     if (token < p.num_tokens && expert < p.num_routed_experts) {
+#ifdef DG_GATE_TOKEN_MAJOR
+        const int64_t stride = p.num_routed_experts;
+#else
         const int64_t stride = int64_t(p.num_tokens) * p.ld_logits;
+#endif
         const float *input = p.logits + int64_t(token) * p.ld_logits + expert;
         float4 value = *reinterpret_cast<const float4 *>(input);
+#ifdef DG_GATE_SPLIT_READS
+        constexpr int Group = DG_GATE_SPLIT_READS, Full = (SPLITS - 1) / Group;
+#pragma unroll 1
+        for (int batch = 0; batch < Full; ++batch) {
+            float4 rows[Group];
+#pragma unroll
+            for (int j = 0; j < Group; ++j)
+                rows[j] = *reinterpret_cast<const float4 *>(input + int64_t(1 + batch * Group + j) * stride);
+#pragma unroll
+            for (int j = 0; j < Group; ++j) {
+                value.x += rows[j].x;
+                value.y += rows[j].y;
+                value.z += rows[j].z;
+                value.w += rows[j].w;
+            }
+        }
+#pragma unroll
+        for (int split = 1 + Full * Group; split < SPLITS; ++split) {
+            const float4 row = *reinterpret_cast<const float4 *>(input + split * stride);
+            value.x += row.x;
+            value.y += row.y;
+            value.z += row.z;
+            value.w += row.w;
+        }
+#else
 #pragma unroll 1
         for (int split = 1; split < SPLITS; ++split) {
             const float4 next = *reinterpret_cast<const float4 *>(input + split * stride);
@@ -222,6 +256,7 @@ template <int EV, bool BIASED, int SPLITS> __device__ __forceinline__ void mega_
             value.z += next.z;
             value.w += next.w;
         }
+#endif
         *reinterpret_cast<float4 *>(reduced + local_row * p.num_routed_experts + expert) = value;
     }
     __syncthreads();
