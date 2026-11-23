@@ -24,7 +24,14 @@ __device__ __forceinline__ void pipeline_native_tile(deep_gemm::cdna4::GemmArgs 
 
     constexpr int BM = 128, BN = TileColumns;
 
-    constexpr int WM_ROWS = BM / (TileColumns == 512 ? 1 : 2), MF = WM_ROWS / 32;
+    // A paired tile uses all four waves for columns. A proven half-full row
+    // tile can issue two row fragments per wave with the normal MF=2 pipeline.
+#ifdef CDNA4_HALF_ROW_PAIR
+    constexpr int MappedRows = RowCap == 64 && First && PairStride != 0 ? 64 : BM;
+#else
+    constexpr int MappedRows = BM;
+#endif
+    constexpr int WM_ROWS = MappedRows / (TileColumns == 512 ? 1 : 2), MF = WM_ROWS / 32;
     static_assert(MF > 0, "every native matrix wave requires a complete row fragment");
 
     constexpr int NF = 4;

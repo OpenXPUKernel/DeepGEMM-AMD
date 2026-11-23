@@ -152,6 +152,8 @@ inline void launch(MegaMoeArgs p, const torch::Tensor &buffer, const torch::Tens
     }
 
     std::ostringstream code;
+    if (const char *mode = std::getenv("DG_MEGA_MOE_HALF_ROW_PAIR"); mode && std::string(mode) == "1")
+        code << "#define CDNA4_HALF_ROW_PAIR 1\n";
     if (const char *v = std::getenv("DG_MEGA_MOE_ACTIVE_SLABS"); weight_panels && v && std::string(v) != "0") {
         int mode = 0, projections = 0;
         char trailing = 0;
