@@ -87,8 +87,10 @@ def worker(rank, world, store, args):
     def run():
         deep_gemm.fp8_fp4_mega_moe(y, l1, l2, buffer, **kwargs)
 
-    run()
+    received = torch.zeros(local, dtype=torch.int32, device=x.device)
+    deep_gemm.fp8_fp4_mega_moe(y, l1, l2, buffer, cumulative_local_expert_recv_stats=received, **kwargs)
     torch.cuda.synchronize()
+    assert torch.equal(received.cpu().long(), counts.narrow(0, rank * local, local))
     assert torch.equal(y, expected)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
