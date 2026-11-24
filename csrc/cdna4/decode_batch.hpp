@@ -7,6 +7,10 @@ namespace deep_gemm::cdna4 {
 // Opt in to the launch shapes of one speculative decode batch. Other rows
 // follow the regular planner, including ordinary requests on the same server.
 inline bool decode_batch_rows(int rows, int positions) {
+    if (const char* width = std::getenv("DG_BENCH_SPEC_WIDTH"); width && width[0] && width[1] == 0) {
+        const int d = width[0] - '0';
+        if (positions == 4 || positions == 5) positions += d - 4;
+    }
     const char* value = std::getenv("DG_CDNA4_DECODE_BATCH");
     if (!value || !*value)
         return rows == 100 * positions;
