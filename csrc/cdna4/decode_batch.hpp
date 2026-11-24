@@ -9,8 +9,10 @@ namespace deep_gemm::cdna4 {
 inline bool decode_batch_rows(int rows, int positions) {
     const char* width = std::getenv("DG_BENCH_SPEC_WIDTH");
     if (positions == 5) {
-        if (const char* verified = std::getenv("DEEPINFER_AMD_MAX_VERIFY_DRAFTS"))
-            width = verified;
+        if (const char* fixed = std::getenv("DEEPINFER_AMD_MAX_VERIFY_DRAFTS"))
+            width = fixed;
+        else if (const char* budget = std::getenv("DEEPINFER_AMD_VERIFY_BUDGET_PER_REQUEST"))
+            width = budget;
     }
     if (width && ((width[0] >= '1' && width[0] <= '5') || width[0] == '8') && width[1] == '\0') {
         if (positions == 4 || positions == 5)
