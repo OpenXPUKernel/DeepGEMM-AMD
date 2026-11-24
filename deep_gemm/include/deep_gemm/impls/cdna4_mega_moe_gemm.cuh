@@ -52,7 +52,12 @@ __device__ __forceinline__ void pipeline_native_tile(deep_gemm::cdna4::GemmArgs 
     constexpr bool short_columns = false;
 #endif
     constexpr int NF = short_columns ? 2 : 4;
-    constexpr int AL = BM / (32), BL = (BN / (PackedB ? 64 : 32));
+#if defined(CDNA4_USE_SHORT_MFMA16) && CDNA4_SHORT_MFMA16 == 5
+    constexpr int AL = PackedB && RowCap > 0 && RowCap <= 32 ? 1 : BM / 32;
+#else
+    constexpr int AL = BM / 32;
+#endif
+    constexpr int BL = BN / (PackedB ? 64 : 32);
     constexpr int BROW = PackedB ? 64 : 128, BSTRIDE = PackedB ? K / 2 : K;
     // Each wave owns its scale DMA destinations, including unused dummy rows.
     // Widening the workgroup must not let those dummy writes alias B scales.
@@ -148,7 +153,9 @@ __device__ __forceinline__ void pipeline_native_tile(deep_gemm::cdna4::GemmArgs 
     };
     auto dma = [&](int stage, int k) { static_for<0, DMAS>([&](auto J) { dma_one(J, stage, k); }); };
 #ifdef CDNA4_USE_SHORT_MFMA16
-    if constexpr(First && PackedB && RowCap>0 && RowCap<=(CDNA4_SHORT_MFMA16==1 ? 32 : 64)){
+    if constexpr (PackedB && RowCap > 0 &&
+                  ((CDNA4_SHORT_MFMA16 == 5 && RowCap <= 32) ||
+                   (First && CDNA4_SHORT_MFMA16 != 5 && RowCap <= (CDNA4_SHORT_MFMA16 == 1 ? 32 : 64)))) {
         // Every wave now owns useful columns, including the 256-column tile
         // where the full-row geometry assigns two waves to the padded half.
         constexpr bool split_rows=CDNA4_SHORT_MFMA16==3 && RowCap==64;

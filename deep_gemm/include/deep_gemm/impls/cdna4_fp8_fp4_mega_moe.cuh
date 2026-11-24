@@ -154,6 +154,11 @@ __device__ __forceinline__ void tile(const MegaMoeKernelArgs &q, const MegaMoeRo
         if constexpr (CDNA4_ACTIVE_SLABS <= 2) {
             matrix(std::integral_constant<int, 0>{});
         } else {
+#if defined(CDNA4_USE_SHORT_MFMA16) && CDNA4_SHORT_MFMA16 == 5
+            if (b.end - b.m0 <= 16)
+                matrix(std::integral_constant<int, 16>{});
+            else
+#endif
             if (CDNA4_ACTIVE_SLABS == 4 && b.end - b.m0 <= 32)
                 matrix(std::integral_constant<int, 32>{});
             else if (b.end - b.m0 <= 64)
@@ -1079,6 +1084,12 @@ __device__ __forceinline__ void run(const MegaMoeKernelArgs &q) {
                     completion = q.l1_done + item;
 #endif
                 }
+#endif
+#if defined(CDNA4_USE_SHORT_MFMA16) && CDNA4_SHORT_MFMA16 == 5
+            // Tiny down tiles read complete K stages. All column owners of
+            // this item use the ordinary release/join before starting them.
+            if (!b.shared && b.end - b.m0 <= 32)
+                completion = nullptr;
 #endif
             if (item >= early_blocks) {
                 bool up_ahead = false;
