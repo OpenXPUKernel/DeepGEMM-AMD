@@ -557,7 +557,6 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor &a, const OptTensor &sf
                           ? set_group_m_slots(args, config, expected_m, max_m, groups, n)
                           : groups * ceil_div(max_m, config.block_m) * ceil_div(n, config.block_n);
     if (output_sf) {
-        TORCH_CHECK(config.variant == deep_gemm::cdna4::KernelVariant::mfma_16x16x128_persistent, "packed WV requires the persistent GEMM");
         args.moe_sf = output_sf->data_ptr<int32_t>();
         args.moe_sf_pitch = output_sf->stride(1);
         if (const char *shape = std::getenv("DG_CDNA4_PACKED_WV_TILE"); shape && std::string(shape) != "off") {
@@ -566,6 +565,7 @@ void cdna4_m_grouped_fp8_gemm_masked(const torch::Tensor &a, const OptTensor &sf
             launch_compact_wv(args, shape, groups, 0, c10::hip::getCurrentHIPStream(d.get_device()).stream(), b, panels, panel_sf);
             return;
         }
+        TORCH_CHECK(config.variant == deep_gemm::cdna4::KernelVariant::mfma_16x16x128_persistent, "packed WV requires the persistent GEMM");
     }
     launch_or_throw(args, config, output_sf ? MXFP8_OUT_PACKED_WV : out_dtype, d, tiles);
 }

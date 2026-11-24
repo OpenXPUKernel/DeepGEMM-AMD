@@ -8,7 +8,7 @@ namespace deep_gemm::cdna4 {
 // follow the regular planner, including ordinary requests on the same server.
 inline bool decode_batch_rows(int rows, int positions) {
     if (const char* width = std::getenv("DG_BENCH_SPEC_WIDTH");
-        width && (width[0] == '5' || width[0] == '8') && width[1] == '\0') {
+        width && ((width[0] >= '1' && width[0] <= '5') || width[0] == '8') && width[1] == '\0') {
         if (positions == 4 || positions == 5)
             positions += width[0] - '4';
     }
