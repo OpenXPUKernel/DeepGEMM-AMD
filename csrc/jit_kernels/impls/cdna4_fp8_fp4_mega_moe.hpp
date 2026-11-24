@@ -169,6 +169,11 @@ inline void launch(MegaMoeArgs p, const torch::Tensor &buffer, const torch::Tens
             "invalid active row slab schedule");
         code << "#define CDNA4_ACTIVE_SLABS " << mode << "\n#define CDNA4_ACTIVE_SLAB_PROJECTIONS " << projections << "\n";
     }
+    if (const char *v = std::getenv("DG_MEGA_MOE_SHORT_MFMA16"); weight_panels && v && std::string(v) != "0") {
+        const std::string mode(v);
+        TORCH_CHECK(mode == "1" || mode == "2" || mode == "3" || mode == "4", "invalid short MFMA16 plan");
+        code << "#define CDNA4_SHORT_MFMA16 " << mode << "\n";
+    }
     if (const char *v = std::getenv("DG_MEGA_MOE_RESERVED_TICKETS"); v) {
         const std::string mode(v);
         if (mode == "1" || mode == "2" || mode == "3" || mode == "4")

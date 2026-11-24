@@ -1,6 +1,10 @@
 #pragma once
 #include <deep_gemm/impls/cdna4/device_common.h>
 #include <deep_gemm/impls/cdna4/gemm_args.h>
+#if defined(CDNA4_SHORT_MFMA16) && !defined(CDNA4_UP_WEIGHT_AHEAD) && !defined(CDNA4_MOE_PACKED_EPILOGUE)
+#include <deep_gemm/impls/cdna4/resident_mfma16.cuh>
+#define CDNA4_USE_SHORT_MFMA16 1
+#endif
 using v16f = float __attribute__((ext_vector_type(16)));
 // Scaled MFMA tile for routed FP4 and shared FP8 experts. Paired routed
 // columns reuse activation fragments across two weight panels.
@@ -143,6 +147,26 @@ __device__ __forceinline__ void pipeline_native_tile(deep_gemm::cdna4::GemmArgs 
                 0, 0);
     };
     auto dma = [&](int stage, int k) { static_for<0, DMAS>([&](auto J) { dma_one(J, stage, k); }); };
+#ifdef CDNA4_USE_SHORT_MFMA16
+    if constexpr(First && PackedB && RowCap>0 && RowCap<=(CDNA4_SHORT_MFMA16==1 ? 32 : 64)){
+        // Every wave now owns useful columns, including the 256-column tile
+        // where the full-row geometry assigns two waves to the padded half.
+        constexpr bool split_rows=CDNA4_SHORT_MFMA16==3 && RowCap==64;
+        constexpr int WaveRows=split_rows ? 32 : RowCap;
+        constexpr int WaveCols=split_rows ? BN/2 : BN/4;
+        const int row_group=split_rows ? wave/2 : 0;
+        const int column_group=split_rows ? wave%2 : wave;
+        constexpr int half_m=WaveRows/32,half_n=WaveCols/32,quadrant=half_m*half_n;
+        auto ready=[](int){};
+        if constexpr(CDNA4_SHORT_MFMA16==4 && quadrant>=half_m+half_n && 3*quadrant>=DMAS)
+            quadrant_resident_mfma16<KT,S,DMAS,STEP,BO,SAO,SBO,WaveRows,WaveCols,PITCH>(
+                    sm,row_group,column_group,dma_one,ready);
+        else
+            resident_mfma16<KT,S,DMAS,STEP,BO,SAO,SBO,WaveRows,WaveCols,PITCH>(
+                    sm,row_group,column_group,dma,ready);
+        return;
+    }
+#endif
     v16f acc[MF][NF];
     v8i af[2][MF], bf[2][NF];
     uint32_t ac[(2)][(MF)], bc[(2)][(NF)];
