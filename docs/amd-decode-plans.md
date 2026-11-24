@@ -43,3 +43,14 @@ kernel result does not establish a complete-model speedup.
 `DG_MEGA_MOE_WAVE_SLOT_REDUCE=3` enables the ordered wave reduction on supported bounded return buffers. A wave collects the signed expert IDs for one token. A missing slot uses an out-of-bounds offset in the bounded buffer descriptor, producing zero. The kernel adds BF16 slot values in the original top-k order in FP32, adds the shared expert last, and rounds the result to BF16. Leave the setting unset to use the existing reduction.
 
 `DG_MEGA_MOE_ACTIVE_SLABS=3,1` specializes the routed up projection when at most 64 rows are live. The other matrix workers still participate in the original data publication and joins. These settings affect the AMD native resident implementation.
+
+
+For sparse expert loads, `DG_MEGA_MOE_ACTIVE_SLABS=4,3` with
+`DG_MEGA_MOE_SHORT_MFMA16=5` selects a 16- or 32-row matrix tile for either
+routed projection when the live rows fit. Larger tiles retain the existing
+matrix schedule. Short down projections consume the completed up projection.
+Use random inputs and representative routed tensors to check both the final
+outputs and receive counts before enabling a plan.
+
+Explicit compact WV tiles support short row counts on their packed output
+path. The general small-row planner remains available for ordinary BF16 output.

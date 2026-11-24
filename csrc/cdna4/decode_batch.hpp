@@ -12,8 +12,7 @@ inline bool decode_batch_rows(int rows, int positions) {
         if (const char* verified = std::getenv("DEEPINFER_AMD_MAX_VERIFY_DRAFTS"))
             width = verified;
     }
-    if (
-        width && ((width[0] >= '1' && width[0] <= '5') || width[0] == '8') && width[1] == '\0') {
+    if (width && ((width[0] >= '1' && width[0] <= '5') || width[0] == '8') && width[1] == '\0') {
         if (positions == 4 || positions == 5)
             positions += width[0] - '4';
     }

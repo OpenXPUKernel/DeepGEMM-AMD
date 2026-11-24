@@ -154,3 +154,44 @@ def test_fp8_bhd_bhr_hdr(b):
     z = z0.clone()
     deep_gemm.fp8_einsum("bhd,bhr->hdr", x_fp8, y_fp8, z, c=z, recipe=(1, 1, 128))
     assert calc_diff(z, ref) < 1e-3
+
+
+@pytest.mark.parametrize("batch,width,positions", [(8, 3, 3), (8, 5, 6), (13, 3, 3)])
+def test_short_packed_wv_output_and_scale_guards(batch, width, positions, monkeypatch):
+    monkeypatch.setenv("DG_CDNA4_DECODE_BATCH", str(batch))
+    monkeypatch.setenv("DG_BENCH_SPEC_WIDTH", str(width))
+    monkeypatch.setenv("DG_CDNA4_PACKED_WV_TILE", "64x128")
+    rows, heads, k, n = batch * positions, 8, 4096, 1024
+
+    def quantized(shape):
+        data = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        fp8, scales = per_token_cast_to_fp8(
+            data.reshape(-1, k), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+        )
+        return fp8.view(shape), scales.view(*shape[:-1], k // 128)
+
+    x = quantized((rows, heads, k))
+    weight = quantized((heads, n, k))
+    bf16 = torch.empty((rows, heads, n), device="cuda", dtype=torch.bfloat16)
+    deep_gemm.fp8_einsum("bhr,hdr->bhd", x, weight, bf16, recipe=(1, 1, 32))
+    ref, sf = per_token_cast_to_fp8(
+        bf16.flatten(1), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    storage = torch.full(
+        (rows * heads * n + 32,), 179, device="cuda", dtype=torch.uint8
+    )
+    packed = storage[16:-16].view(torch.float8_e4m3fn).reshape(rows, heads, n)
+    scale_storage = torch.full(
+        (heads * n // 128 + 2, (rows + 3) // 4 * 4 + 4),
+        -1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    actual = scale_storage[1:-1, :rows].T
+    deep_gemm.fp8_einsum("bhr,hdr->bhd", x, weight, (packed, actual), recipe=(1, 1, 32))
+    assert torch.equal(ref.view(torch.uint8), packed.flatten(1).view(torch.uint8))
+    assert torch.equal(sf, actual)
+    assert (scale_storage[[0, -1]] == -1).all() and (
+        scale_storage[:, rows:] == -1
+    ).all()
+    assert (storage[:16] == 179).all() and (storage[-16:] == 179).all()
