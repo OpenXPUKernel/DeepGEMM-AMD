@@ -166,9 +166,9 @@ def test_short_packed_wv_output_and_scale_guards(batch, width, positions, monkey
     def quantized(shape):
         data = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
         fp8, scales = per_token_cast_to_fp8(
-            data.reshape(-1, k), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+            data.reshape(-1, k), use_ue8m0=True, gran_k=32
         )
-        return fp8.view(shape), scales.view(*shape[:-1], k // 128)
+        return fp8.view(shape), scales.view(*shape[:-1], k // 32)
 
     x = quantized((rows, heads, k))
     weight = quantized((heads, n, k))
